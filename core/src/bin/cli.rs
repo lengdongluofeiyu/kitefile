@@ -1,9 +1,14 @@
 //! CLI 入口：用于测试核心引擎，无需 UI
 //!
 //! 用法：
-//!     ftcore-cli daemon              启动守护进程（发现 + 接收 + HTTP 网关）
-//!     ftcore-cli list-devices        列出已发现的设备
-//!     ftcore-cli send <ip> <path>    向对端发送文件
+//!     ftcore-cli daemon [--remote-admin]   启动守护进程（发现 + 接收 + HTTP 网关）
+//!     ftcore-cli list-devices              列出已发现的设备
+//!     ftcore-cli send <ip> <path>          向对端发送文件
+//!
+//! `--remote-admin`：把「仅本机」那一档 HTTP 接口（发文件 / 读接收目录 / 改配置）
+//! 也对局域网放开，用于开发期拿一台设备遥控另一台。默认关闭。
+//! **开着意味着局域网内任何人都能让本机外传文件并读取接收目录**，
+//! 只在可信网络里临时开。
 
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -16,7 +21,10 @@ async fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("daemon") => run_daemon().await,
+        Some("daemon") => {
+            let remote_admin = args.iter().skip(2).any(|a| a == "--remote-admin");
+            run_daemon(remote_admin).await
+        }
         Some("list-devices") => list_devices().await,
         Some("send") => {
             let ip = args.get(2).cloned().ok_or_else(|| anyhow::anyhow!("usage: send <ip> <path>"))?;
@@ -24,14 +32,15 @@ async fn main() -> anyhow::Result<()> {
             send(ip, path).await
         }
         _ => {
-            eprintln!("ftcore-cli <daemon | list-devices | send <ip> <path>>");
+            eprintln!("ftcore-cli <daemon [--remote-admin] | list-devices | send <ip> <path>>");
             Ok(())
         }
     }
 }
 
-async fn run_daemon() -> anyhow::Result<()> {
+async fn run_daemon(allow_remote_admin: bool) -> anyhow::Result<()> {
     let mut config = ftcore::EngineConfig::default();
+    config.allow_remote_admin = allow_remote_admin;
 
     // 身份持久化：id/名称复用上次的，重启后 mDNS 注册同一服务实例，
     // 对端设备表按 id 覆盖同一条记录（否则每次重启都被当成“新设备”）

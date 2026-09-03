@@ -19,7 +19,25 @@
 //! - WS   /ws/progress                   → 实时推送 WsEvent（进度 / 传入请求 / 决议完成）
 //! - GET  /                              → 静态资源（web build 产物）
 //!
-//! CORS 已开启，方便 Web 开发期跨端口调用。
+//! ## 访问分级
+//!
+//! 网关监听 0.0.0.0（对端 daemon 必须能回调本机，不能只听 127.0.0.1），
+//! 因此用一层 middleware 按 **(Method, Path)** 把接口分成两档，见 [`classify`]：
+//!
+//! - `Remote`：P2P 协商主流程 + 只读信息，局域网可访问
+//! - `LocalOnly`：控制本机的敏感操作，仅接受回环地址
+//! - 表中查不到的（method, path）组合：远程一律 403，本机放行
+//!   （fail-closed 对外、fail-open 对内：宁可远程调不通，也不能让本机 UI 挂掉）
+//!
+//! 注意维度是二元的：`/api/incoming` 上 POST（对端发 offer）属 Remote，
+//! GET（本机 UI 拉收件箱）属 LocalOnly，只按路径分级必然二选一出错。
+//!
+//! 开发期可从其他设备遥控本机：`--remote-admin` 开关会放开 LocalOnly 那一档。
+//! 默认是关的。
+//!
+//! 本机判定依赖 `ConnectInfo<SocketAddr>`，因此 serve 时必须用
+//! `into_make_service_with_connect_info`，否则 extensions 里取不到 peer 地址
+//! （取不到时按非本机处理，会让本机 UI 全部 403）。
 
 use crate::discovery::DiscoveryService;
 use crate::protocol::{HttpIncomingResponse, HttpOffer, IncomingEntry, WsEvent};
@@ -28,19 +46,21 @@ use crate::{EngineConfig, Result};
 use axum::{
     body::Body,
     extract::{
+        connect_info::ConnectInfo,
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Request, State,
     },
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
 #[derive(Clone)]
@@ -117,7 +137,7 @@ impl HttpGateway {
     pub async fn run(self, port: u16) -> Result<()> {
         self.bind_buses().await;
 
-        let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
+        let allow_remote_admin = self.state.config.allow_remote_admin;
 
         let app = Router::new()
             .route("/api/whoami", get(whoami))
@@ -137,17 +157,139 @@ impl HttpGateway {
             .route("/api/config/device-name", post(set_device_name))
             .route("/ws/progress", get(ws_progress))
             .route("/", get(root_handler))
-            .layer(cors)
+            // route_layer 只对「已注册的路由」生效，404 / 405 的请求根本不会
+            // 走到 middleware——所以不存在"未分级路径被误放行"的口子。
+            //（换成 .layer() 则会对所有请求生效，包括 404，反而多一个面。）
+            .route_layer(middleware::from_fn(move |req: Request, next: Next| async move {
+                access_guard(req, next, allow_remote_admin).await
+            }))
             .with_state(self.state);
 
         let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
             .await
             .map_err(|e| crate::CoreError::Gateway(e.to_string()))?;
+        if allow_remote_admin {
+            warn!(
+                "remote admin ON: 局域网内任何设备都可调用本机的管理接口 \
+                 （发文件 / 读接收目录 / 改配置）"
+            );
+        }
         info!(port, "http gateway listening");
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| crate::CoreError::Gateway(e.to_string()))?;
+        // 必须走 into_make_service_with_connect_info：否则 extensions 里取不到
+        // peer 地址，access_guard 会把所有请求都当成远程处理。
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(|e| crate::CoreError::Gateway(e.to_string()))?;
         Ok(())
+    }
+}
+
+/// 接口的访问档位
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessPolicy {
+    /// 仅本机（回环地址）可调用
+    LocalOnly,
+    /// 局域网内可调用（对端 daemon / 只读信息）
+    Remote,
+}
+
+/// 路径模板匹配：`:name` 段匹配任意单段，其余逐段按字面相等。
+/// 段数不同直接不匹配（`/api/files` 不会被误配成 `/api/files/:name`）。
+pub fn path_matches(pattern: &str, path: &str) -> bool {
+    let pat: Vec<&str> = pattern.trim_matches('/').split('/').collect();
+    let act: Vec<&str> = path.trim_matches('/').split('/').collect();
+    pat.len() == act.len()
+        && pat
+            .iter()
+            .zip(act.iter())
+            .all(|(p, a)| p.starts_with(':') || p == a)
+}
+
+/// 按 **(Method, Path)** 二元组分级。返回 `None` 表示表中未列出。
+///
+/// 维度必须是二元组而非只看路径：`/api/incoming` 的 POST（对端发 offer）
+/// 与 GET（本机 UI 拉收件箱）分属两档，只按路径分级必然二选一出错。
+pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
+    use AccessPolicy::{LocalOnly, Remote};
+
+    // 跨机调用点已逐一核实，只有四处，全部落在 Remote 这一档：
+    //   transfer.rs:768 /api/incoming（发 offer）
+    //   transfer.rs:864 /api/verify/:file_id（补发 sha256）
+    //   transfer.rs:317 /api/cancel/:file_id（接收方取消时通知发送方）
+    //   gateway.rs:437  /api/incoming-resp（发送方回包）
+    // 新增路由时若不在此登记，远程调用一律 403（fail-closed）。
+    const TABLE: &[(Method, &str, AccessPolicy)] = &[
+        // ---- 允许远程：P2P 协商主流程 + 只读信息 ----
+        (Method::POST, "/api/incoming", Remote),
+        (Method::POST, "/api/incoming-resp", Remote),
+        (Method::POST, "/api/verify/:file_id", Remote),
+        (Method::POST, "/api/cancel/:file_id", Remote),
+        (Method::GET, "/api/whoami", Remote),
+        // ---- 仅本机：会控制本机的操作 ----
+        (Method::POST, "/api/send", LocalOnly),
+        (Method::GET, "/api/transfers", LocalOnly),
+        (Method::GET, "/api/files", LocalOnly),
+        (Method::GET, "/api/files/:name", LocalOnly),
+        (Method::GET, "/api/incoming", LocalOnly),
+        (Method::POST, "/api/incoming/:id/accept", LocalOnly),
+        (Method::POST, "/api/incoming/:id/reject", LocalOnly),
+        (Method::GET, "/api/config", LocalOnly),
+        (Method::POST, "/api/config/receive-dir", LocalOnly),
+        (Method::POST, "/api/config/device-name", LocalOnly),
+        // 没有远程调用方，收归本机（N4）；遥控场景由 --remote-admin 整体放开
+        (Method::GET, "/api/devices", LocalOnly),
+        (Method::GET, "/ws/progress", LocalOnly),
+        // 首页（当前只是一行提示文本）。显式登记是为了让分级表保持闭合：
+        // 表里缺一条，远程访问就会落到"未列入"分支，日志里的措辞会误导排查。
+        // 将来若在这里挂上 Web 前端的静态资源，需要改判为 Remote。
+        (Method::GET, "/", LocalOnly),
+    ];
+
+    TABLE
+        .iter()
+        .find(|(m, p, _)| m == method && path_matches(p, path))
+        .map(|(_, _, policy)| *policy)
+}
+
+/// 访问分级 middleware
+///
+/// 两条放行路径：请求来自回环地址，或开了 `--remote-admin`。
+/// 其余按 [`classify`] 判档：Remote 放行，LocalOnly 与"表中未列出"一律 403。
+async fn access_guard(req: Request, next: Next, allow_remote_admin: bool) -> Response {
+    // 取不到 peer 地址时按「非本机」处理：宁可误拒，也不能让分级静默失效。
+    // 若哪天忘了注入 ConnectInfo，症状是本机 UI 全部 403——动静很大，藏不住。
+    let is_local = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip().is_loopback())
+        .unwrap_or(false);
+
+    if is_local || allow_remote_admin {
+        return next.run(req).await;
+    }
+
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    // 把「要不要拒、为什么拒」先算出来，避免在 match 里重复判定、
+    // 也避免为了穷尽 Option 而写出不可达分支。
+    let deny_reason = match classify(&method, &path) {
+        Some(AccessPolicy::Remote) => None,
+        Some(AccessPolicy::LocalOnly) => Some("该接口仅限本机访问"),
+        None => Some("该接口未列入访问分级表"),
+    };
+    match deny_reason {
+        None => next.run(req).await,
+        Some(why) => {
+            warn!(%method, %path, "拒绝非本机请求：{why}");
+            (
+                StatusCode::FORBIDDEN,
+                format!("{why}。若需从其他设备控制本机，请用 --remote-admin 启动守护进程。"),
+            )
+                .into_response()
+        }
     }
 }
 

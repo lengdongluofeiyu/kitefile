@@ -53,6 +53,17 @@ pub struct EngineConfig {
     pub chunk_size: usize,
     /// 接收目录
     pub receive_dir: std::path::PathBuf,
+    /// 是否允许来自其他设备的「管理类」HTTP 调用（默认 false）
+    ///
+    /// 网关把接口分成两档：
+    /// - 仅本机：`/api/send`、`/api/files`、`/api/transfers`、`/api/config*` 等控制本机的操作
+    /// - 允许远程：P2P 协商必需的 `/api/incoming`、`/api/incoming-resp`、
+    ///   `/api/verify/:id`、`/api/cancel/:id` 以及只读的 `/api/whoami`
+    ///
+    /// 置为 true 时「仅本机」那一档也对局域网放开，用于移动端把对端 IP 当遥控器
+    /// 的开发场景。**默认关闭**：开着意味着局域网内任何人都能让本机外传文件、
+    /// 读取接收目录。
+    pub allow_remote_admin: bool,
 }
 
 impl Default for EngineConfig {
@@ -67,6 +78,7 @@ impl Default for EngineConfig {
             parallel_streams,
             chunk_size: 16 * 1024 * 1024,
             receive_dir: crate::platform::default_receive_dir(),
+            allow_remote_admin: false,
         }
     }
 }

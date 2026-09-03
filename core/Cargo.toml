@@ -25,7 +25,8 @@ mdns-sd = "0.11"
 
 # HTTP gateway (for web frontend)
 axum = { version = "0.7", features = ["multipart", "ws", "macros"] }
-tower-http = { version = "0.6", features = ["cors", "fs"] }
+# 注：原先引 tower-http 只为 CorsLayer。阶段 2 移除 CORS 后已零使用，故一并删除。
+# 将来若要把 Web 前端静态资源挂到 "/"，再按需加回 tower-http 的 fs feature。
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -18,17 +18,19 @@
 | 1 | `.gitattributes` | ✅ 44 行，`*.ps1 text eol=crlf` | `.gitattributes:6` | 完成 |
 | 1 | 构建闸门 | ✅ 已提交 | `build-all.ps1:109-131`，位于 `Stop-FtcoreProcesses`(135) 之前 | 完成 |
 | 1 | 闸门必须绿 | ✅ 全绿 | `cargo test` 25 passed / 0 failed；两端 `flutter analyze` 均无问题 | 完成（N15 已解除） |
-| 2 | 删 CORS | ❌ 未动 | `gateway.rs:120` `CorsLayer::new().allow_origin(Any)` | 未开始 |
-| 2 | 接口分级 | ❌ 未动 | `gateway.rs:123-139` 无任何 middleware | 未开始 |
+| 2 | 删 CORS | ✅ 已删 | `gateway.rs` 不再出现 `CorsLayer`；`tower-http` 依赖一并移除 | 完成 |
+| 2 | 接口分级 | ✅ 已加 | `gateway.rs::classify` 按 (Method, Path) 分档 + `access_guard` middleware，用 `route_layer` 挂载 | 完成 |
+| 2 | ConnectInfo 注入 | ✅ 已改 | `run()` 改用 `into_make_service_with_connect_info::<SocketAddr>()` | 完成（N1 解除） |
+| 2 | `--remote-admin` | ✅ 已有 | `EngineConfig::allow_remote_admin`（默认 false）+ `cli.rs daemon --remote-admin` | 完成 |
 | 3a | `unbounded` → `channel(256)` | ❌ 未动 | `transfer.rs:683` `mpsc::unbounded_channel()` | 未开始 |
 | 3b | 假注释改正 | ❌ 未动 | `transfer.rs:6,7` / `storage.rs:7` 原文照旧 | 未开始 |
 | 3c | cache 淘汰 | ❌ 未动 | `transfer.rs:215` 无上限无顺序队列 | 未开始 |
-| 3d | 死代码清理 | ❌ 未动 | `protocol.rs:22+` 五个变体；`Cargo.toml:36,48,50` 三个依赖 | 未开始 |
+| 3d | 死代码清理 | 🟡 部分 | `tower-http` 已在阶段 2 移除；`protocol.rs` 五个变体、另两个依赖未动 | 部分完成 |
 | 3e | `static mut` → `OnceLock` | ❌ 未动 | `ffi.rs:33,169,190,213` 四处 | 未开始 |
 | 4 | 连接复用 | ❌ 未动 | `transfer.rs:993` connect 在 while 内 | 未开始 |
 | 5a–5e | — | ❌ 全部未动 | 无 token / 无加密 / 无共享包 / 无手动 IP / 无粒度细化 | 未开始 |
 
-**一句话：阶段 1 已完整落地、闸门验证全绿；阶段 2 起全部为零。**
+**一句话：阶段 1、2 已落地，闸门全绿（31 项测试 + 两端分析）；阶段 3 起为零，其中 3d 已部分完成。**
 
 ---
 
@@ -393,6 +395,39 @@ $env:TMP  = $env:TEMP
 4. 远程 `GET /api/files` → 403
 5. **新增**：未注入 ConnectInfo 时请求被拒（防 N1 回归）
 6. **新增**：枚举所有 route，断言均已分类（防漏配裸奔）
+
+**状态**：✅ 已完成并提交。测试 31 项全绿（新增 6 项）。
+
+**落地记录（与定稿的三处偏差，都是动手时发现的）**
+
+1. **用 `route_layer` 而非 `layer`，顺带把 N10 闭合了。**
+   `route_layer` 只对「已注册的路由」生效，404 / 405 的请求根本不进 middleware，
+   所以压根不存在"未匹配路径该怎么判"这个问题——N10 不必再定默认策略。
+   （换成 `.layer()` 反而会把 404 也卷进来，平白多一个面。）
+
+2. **分级表补上 `GET /`，让表保持闭合。**
+   原先表里没有首页路由，远程访问 `/` 会落进"未列入"分支，日志报
+   "该接口未列入访问分级表"，措辞误导排查。现在 18 条已注册路由全部登记在册，
+   `test_classify_covers_all_routes` 逐一断言，**新增路由忘了登记会先在这里红**。
+   首页当前判 LocalOnly，并注明"将来挂静态资源需改判 Remote"。
+
+3. **ConnectInfo 取不到时按「非本机」处理**（fail-closed）。
+   若哪天忘了注入，症状是本机 UI 全部 403——动静很大，藏不住，不会静默放过。
+
+4. **403 响应体里带 `--remote-admin` 提示**，用户被拦时能自助排查，不必翻日志。
+
+5. **移除了 `tower-http` 依赖**：它当初只为 CorsLayer 而引，删掉 CORS 后零使用。
+
+**顺带修掉的两个既存问题（都不是阶段 2 的改动引起的）**
+
+- `test_receiver_cancel_notifies_sender` 是个**时序 race**：
+  原参数 300KB / 8192B 只有 37 个块，回环上几毫秒就传完，cancel 打过去时槽位
+  已清理 → 404。C 盘写满那阵子磁盘 IO 慢、传输耗时够长才"看着是好的"，
+  IO 一恢复就暴露。现改为 4MB / 1KB = 4096 块，叠加停等（每块等一次 ChunkAck）
+  把传输窗口拉到数百毫秒；等待条件也从"记录出现"收紧为"status == InProgress"。
+  取证方式：临时打印 B 侧 transfers，看到 `"status":"Completed"`、`chunks_done:37/37` 坐实。
+- 同用例末尾断言的文件名写成了 `cancel.bin`，而源文件叫 `big.bin`，
+  断言恒真、等于没在检查"取消后不应落盘"。已修正。
 
 ---
 

@@ -81,6 +81,18 @@ async fn start_stack(
     chunk_size: usize,
     parallel: usize,
 ) -> Arc<TransferEngine> {
+    start_stack_with(gw_port, tr_port, recv_dir, chunk_size, parallel, false).await
+}
+
+/// 同 start_stack，但可指定是否放开「仅本机」接口（用于验证访问分级）
+async fn start_stack_with(
+    gw_port: u16,
+    tr_port: u16,
+    recv_dir: &std::path::Path,
+    chunk_size: usize,
+    parallel: usize,
+    allow_remote_admin: bool,
+) -> Arc<TransferEngine> {
     let config = EngineConfig {
         device_name: format!("test-{}", gw_port),
         gateway_port: gw_port,
@@ -88,6 +100,7 @@ async fn start_stack(
         parallel_streams: parallel,
         chunk_size,
         receive_dir: recv_dir.to_path_buf(),
+        allow_remote_admin,
     };
     let discovery = shared_discovery();
     let transfer = Arc::new(TransferEngine::new(
@@ -117,11 +130,23 @@ async fn start_stack(
 
 /// 极简 HTTP 客户端：返回 (status, body_bytes)
 async fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, Vec<u8>) {
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    http_to("127.0.0.1", port, method, path, body).await
+}
+
+/// 指定目标地址的版本：访问分级按来源 IP 判定，要模拟"非本机"请求
+/// 就得连到本机的局域网 IP（此时服务端看到的 peer 不是回环地址）。
+async fn http_to(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> (u16, Vec<u8>) {
+    let mut stream = tokio::net::TcpStream::connect((host, port)).await.unwrap();
     let body_bytes = body.map(|b| b.as_bytes().to_vec()).unwrap_or_default();
     let req = format!(
-        "{} {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        method, path, port, body_bytes.len()
+        "{} {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        method, path, host, port, body_bytes.len()
     );
     stream.write_all(req.as_bytes()).await.unwrap();
     stream.write_all(&body_bytes).await.unwrap();
@@ -599,8 +624,10 @@ async fn test_cancel_while_pending() {
     .await;
     assert!(find_transfer(&v, &file_id).is_some());
 
-    // B 未产生文件
-    assert!(!dir_b.join("cancel.bin").exists());
+    // B 未产生文件（取消后不应落盘）
+    // 注：这里原先写的是 cancel.bin，与本用例的源文件 big.bin 对不上，
+    // 断言恒真、等于没检查，已修正。
+    assert!(!dir_b.join("big.bin").exists());
 
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
@@ -614,11 +641,17 @@ async fn test_receiver_cancel_notifies_sender() {
     let dir_a = temp_dir("rcancel-a");
     let dir_b = temp_dir("rcancel-b");
 
-    // A 用小 chunk、单流 → 传输较慢，保证取消发生在传输中
-    let _a = start_stack(18016, 18116, &dir_a, 8192, 1).await;
-    let _b = start_stack(18017, 18117, &dir_b, 8192, 1).await;
+    // A 用小 chunk、单流 → 传输较慢，保证取消发生在传输中。
+    //
+    // 这里踩过一次坑：原先是 300KB / 8192 字节 = 37 个块，回环上几毫秒就传完了，
+    // cancel 打过去时槽位已被清理、返回 404。C 盘写满那阵子磁盘 IO 慢，
+    // 传输耗时够长才"看起来是好的"，IO 一恢复就暴露了。
+    // 现在 4MB / 1KB = 4096 个块，叠加停等（每块等一次 ChunkAck），
+    // 传输窗口有几百毫秒以上，取消能稳定落在传输进行中。
+    let _a = start_stack(18016, 18116, &dir_a, 1024, 1).await;
+    let _b = start_stack(18017, 18117, &dir_b, 1024, 1).await;
 
-    let content = make_content(300_000);
+    let content = make_content(4 * 1024 * 1024);
     let src = dir_a.join("big.bin");
     std::fs::write(&src, &content).unwrap();
 
@@ -650,9 +683,13 @@ async fn test_receiver_cancel_notifies_sender() {
     .await;
     assert_eq!(status, 200);
 
-    // 等 B 侧接收进度出现（接收槽已建立）
+    // 等 B 侧进入「传输中」再取消。
+    // 不能只等"记录出现"：记录里也可能已经是 Completed，而对已完成的传输
+    // 调 cancel 返回 404 是正确行为（槽位已清理，没什么可取消的）。
     let _ = wait_for_json(18017, "/api/transfers", 15, |v| {
-        find_transfer(v, &file_id).is_some()
+        find_transfer(v, &file_id)
+            .map(|t| t["status"].as_str() == Some("InProgress"))
+            .unwrap_or(false)
     })
     .await;
 
@@ -764,4 +801,206 @@ async fn read_ws_event(
             Err(_) => panic!("ws read timeout"),
         }
     }
+}
+
+// ============ 访问分级（阶段 2） ============
+
+use ftcore::gateway::{classify, path_matches, AccessPolicy};
+
+/// 取一个非回环的本机 IPv4 地址。
+///
+/// UDP connect 只查路由表、不发包，用它问内核"去外部时本机用哪个地址"。
+/// 拿不到（无网络 / 只有回环）时返回 None，调用方跳过测试。
+fn non_loopback_ip() -> Option<String> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:80").ok()?; // TEST-NET-1，保留地址，不会真的连出去
+    match s.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) if !v4.is_loopback() => Some(v4.to_string()),
+        _ => None,
+    }
+}
+
+/// 分级表的纯逻辑验证，不依赖网络环境。
+///
+/// 这张表与 `gateway.rs` 里 Router 注册的路由一一对应——**新增路由必须同步
+/// 登记**，否则远程调用会被 403（fail-closed），这个测试会先一步失败提醒你。
+#[test]
+fn test_classify_covers_all_routes() {
+    let all: &[(axum::http::Method, &str, AccessPolicy)] = &[
+        // 允许远程：P2P 协商主流程 + 只读信息
+        (axum::http::Method::POST, "/api/incoming", AccessPolicy::Remote),
+        (axum::http::Method::POST, "/api/incoming-resp", AccessPolicy::Remote),
+        (
+            axum::http::Method::POST,
+            "/api/verify/:file_id",
+            AccessPolicy::Remote,
+        ),
+        (
+            axum::http::Method::POST,
+            "/api/cancel/:file_id",
+            AccessPolicy::Remote,
+        ),
+        (axum::http::Method::GET, "/api/whoami", AccessPolicy::Remote),
+        // 仅本机
+        (axum::http::Method::POST, "/api/send", AccessPolicy::LocalOnly),
+        (
+            axum::http::Method::GET,
+            "/api/transfers",
+            AccessPolicy::LocalOnly,
+        ),
+        (axum::http::Method::GET, "/api/files", AccessPolicy::LocalOnly),
+        (
+            axum::http::Method::GET,
+            "/api/files/:name",
+            AccessPolicy::LocalOnly,
+        ),
+        (
+            axum::http::Method::GET,
+            "/api/incoming",
+            AccessPolicy::LocalOnly,
+        ),
+        (
+            axum::http::Method::POST,
+            "/api/incoming/:id/accept",
+            AccessPolicy::LocalOnly,
+        ),
+        (
+            axum::http::Method::POST,
+            "/api/incoming/:id/reject",
+            AccessPolicy::LocalOnly,
+        ),
+        (axum::http::Method::GET, "/api/config", AccessPolicy::LocalOnly),
+        (
+            axum::http::Method::POST,
+            "/api/config/receive-dir",
+            AccessPolicy::LocalOnly,
+        ),
+        (
+            axum::http::Method::POST,
+            "/api/config/device-name",
+            AccessPolicy::LocalOnly,
+        ),
+        (
+            axum::http::Method::GET,
+            "/api/devices",
+            AccessPolicy::LocalOnly,
+        ),
+        (
+            axum::http::Method::GET,
+            "/ws/progress",
+            AccessPolicy::LocalOnly,
+        ),
+        (axum::http::Method::GET, "/", AccessPolicy::LocalOnly),
+    ];
+
+    for (m, p, want) in all {
+        assert_eq!(classify(m, p), Some(*want), "分级不符：{m} {p}");
+    }
+}
+
+/// 分级的维度是 (Method, Path) 二元组而非只看路径：
+/// 同一个 `/api/incoming` 上，POST（对端发 offer）与 GET（本机拉收件箱）
+/// 分属两档。只按路径分级必然二选一出错，这条测试锁住这个语义。
+#[test]
+fn test_classify_distinguishes_method_on_same_path() {
+    assert_eq!(
+        classify(&axum::http::Method::POST, "/api/incoming"),
+        Some(AccessPolicy::Remote)
+    );
+    assert_eq!(
+        classify(&axum::http::Method::GET, "/api/incoming"),
+        Some(AccessPolicy::LocalOnly)
+    );
+}
+
+/// 未登记的 (method, path) 一律 None → 远程 403（fail-closed）。
+#[test]
+fn test_classify_unknown_is_none() {
+    assert_eq!(classify(&axum::http::Method::PUT, "/api/send"), None);
+    assert_eq!(classify(&axum::http::Method::DELETE, "/api/files/x"), None);
+    assert_eq!(classify(&axum::http::Method::GET, "/api/not-exist"), None);
+}
+
+#[test]
+fn test_path_matches() {
+    assert!(path_matches("/api/verify/:file_id", "/api/verify/abc-123"));
+    assert!(path_matches("/api/files/:name", "/api/files/a.bin"));
+    // 段数不同：不能让 `/api/files` 误配成 `/api/files/:name`
+    assert!(!path_matches("/api/files", "/api/files/a.bin"));
+    assert!(!path_matches("/api/files/:name", "/api/files/a/b"));
+    // 尾部斜杠不影响
+    assert!(path_matches("/api/send/", "/api/send"));
+}
+
+/// 端到端：从非回环地址访问本机网关，验证分级真的在拦。
+#[tokio::test]
+async fn test_remote_access_blocked_by_policy() {
+    use axum::http::Method as M;
+
+    require_sockets!("test_remote_access_blocked_by_policy");
+    let Some(ip) = non_loopback_ip() else {
+        eprintln!("SKIP test_remote_access_blocked_by_policy: 无可用非回环地址");
+        return;
+    };
+    if tokio::net::TcpStream::connect((ip.as_str(), 18030)).await.is_err() {
+        eprintln!("SKIP test_remote_access_blocked_by_policy: 无法从 {ip} 连到网关");
+        return;
+    }
+
+    let dir = temp_dir("remote-policy");
+    let _s = start_stack(18030, 18130, &dir, 65536, 2).await;
+
+    // Remote 档：放行
+    let (status, _) = http_to(&ip, 18030, "GET", "/api/whoami", None).await;
+    assert_eq!(status, 200, "whoami 是只读信息，应允许远程访问");
+
+    // LocalOnly 档：拒绝，且提示里带开关名，方便用户自助排查
+    let (status, body) = http_to(&ip, 18030, "GET", "/api/transfers", None).await;
+    assert_eq!(status, 403, "transfers 应拒绝远程访问");
+    assert!(
+        String::from_utf8_lossy(&body).contains("--remote-admin"),
+        "403 响应应提示 --remote-admin，实际：{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // 同一路径不同方法，档位不同
+    let (status, _) = http_to(&ip, 18030, "GET", "/api/incoming", None).await;
+    assert_eq!(status, 403, "GET /api/incoming 是本机 UI 拉收件箱");
+    let (status, _) = http_to(&ip, 18030, "POST", "/api/incoming", Some("{}")).await;
+    assert_ne!(status, 403, "POST /api/incoming 是对端发 offer 的入口，不能拒");
+
+    // 本机访问不被误伤（回环地址一律放行）
+    let (status, _) = http(18030, "GET", "/api/transfers", None).await;
+    assert_eq!(status, 200, "本机访问不应受分级影响");
+
+    // 顺带确认表里两条路径参数型路由确实按通配生效
+    assert_eq!(classify(&M::POST, "/api/cancel/xyz"), Some(AccessPolicy::Remote));
+    assert_eq!(classify(&M::POST, "/api/verify/xyz"), Some(AccessPolicy::Remote));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--remote-admin` 打开后，LocalOnly 那一档也对局域网放行。
+#[tokio::test]
+async fn test_remote_admin_opens_local_only_routes() {
+    require_sockets!("test_remote_admin_opens_local_only_routes");
+    let Some(ip) = non_loopback_ip() else {
+        eprintln!("SKIP test_remote_admin_opens_local_only_routes: 无可用非回环地址");
+        return;
+    };
+    if tokio::net::TcpStream::connect((ip.as_str(), 18031)).await.is_err() {
+        eprintln!("SKIP test_remote_admin_opens_local_only_routes: 无法从 {ip} 连到网关");
+        return;
+    }
+
+    let dir = temp_dir("remote-admin-on");
+    let _s = start_stack_with(18031, 18131, &dir, 65536, 2, true).await;
+
+    let (status, _) = http_to(&ip, 18031, "GET", "/api/transfers", None).await;
+    assert_eq!(status, 200, "开了 --remote-admin 后应放行");
+
+    let (status, _) = http_to(&ip, 18031, "GET", "/api/files", None).await;
+    assert_eq!(status, 200);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
