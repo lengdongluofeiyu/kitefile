@@ -436,8 +436,12 @@ async fn test_full_transfer_flow() {
     .await;
     let incoming_id = v[0]["incoming_id"].as_str().unwrap().to_string();
     assert_eq!(v[0]["file_id"].as_str(), Some(file_id.as_str()));
-    // offer 声明了 sha256
-    assert!(v[0]["sha256"].as_str().is_some());
+    // sha256 延后补发：发送方后台并行计算，offer 不等它（大文件弹窗即时出现）。
+    // 因此 offer 里 sha256 为空、sha256_deferred = true；真正的值在全部 chunk ACK
+    // 后由 POST /api/verify/:file_id 补发，接收方校验通过才 finalize。
+    // 本用例末尾"文件落盘且内容一致"即证明补发 + 校验链路工作正常。
+    assert_eq!(v[0]["sha256_deferred"].as_bool(), Some(true));
+    assert!(v[0]["sha256"].is_null(), "延后模式下 offer 不带 sha256");
 
     // B 接受
     let (status, _) = http(

@@ -9,6 +9,10 @@
 # 所有产物输出到 e:\zheten2.0\filetransfer\dist\
 #
 # 缓存全部走 E 盘，不占用 C 盘空间。
+#
+# 构建前会跑前置检查（cargo test / flutter analyze），任一项失败即 exit 1 且不产出 dist，
+# 避免编译不过的代码被打包进发布产物。用 -SkipRust / -SkipWindows / -SkipAndroid
+# 可同时跳过对应的检查与构建环节。
 
 [CmdletBinding()]
 param(
@@ -39,7 +43,17 @@ $env:JAVA_HOME         = 'C:\jdk22'
 $env:ANDROID_HOME      = 'E:\zheten2.0\.deps\android-sdk'
 $env:ANDROID_SDK_ROOT  = 'E:\zheten2.0\.deps\android-sdk'
 $env:GRADLE_USER_HOME  = 'E:\zheten2.0\.deps\gradle'
+# TEMP/TMP 必须一起重定向：rustc 与 MSVC link.exe 默认把临时文件、.pdb 写进 %TEMP%
+# （用户目录下，C 盘）。C 盘写满时的症状是 rustc ICE（encode_metadata 里 expect 失败）
+# 加 LNK1201（写 pdb 失败），看起来像编译器 bug，实际是磁盘空间不足。
+$env:TEMP              = 'E:\zheten2.0\.deps\tmp'
+$env:TMP               = $env:TEMP
 $env:PATH              = "$env:CARGO_HOME\bin;$env:JAVA_HOME\bin;$env:ANDROID_HOME\cmdline-tools\latest\bin;$env:ANDROID_HOME\platform-tools;$env:PATH"
+
+# 临时目录不存在就建一个（首次在新机器上跑时）
+if (-not (Test-Path $env:TEMP)) {
+    New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
+}
 
 # ===== 工具函数 =====
 function Write-Step([string]$msg) { Write-Host "`n[*] $msg" -ForegroundColor Cyan }
@@ -94,6 +108,38 @@ if ($Clean -and (Test-Path $DistDir)) {
 New-Item -ItemType Directory -Force -Path $DistDir, $DistWindows, $DistAndroid | Out-Null
 $buildTime = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 Write-Ok "dist 目录就绪"
+
+# ===== 0.5 构建前置检查（闸门）=====
+# 位置必须在 Stop-FtcoreProcesses 之前，原因有二：
+#   1) 测试不占用产物文件锁，不需要杀进程；
+#   2) 闸门是要「拦住坏代码」，而杀进程会打断用户正在运行的 daemon——
+#      若闸门失败却已经把人家的 daemon 杀了，属于无谓的副作用。
+# 任一项失败即 exit 1 且不产出 dist（退出码由 Invoke-Build 内部处理）。
+if (-not $SkipRust) {
+    Invoke-Build '前置检查 cargo test (core)' {
+        Push-Location $CoreDir
+        cargo test 2>&1 | Out-Host
+        Pop-Location
+    }
+}
+if (-not $SkipWindows) {
+    Invoke-Build '前置检查 flutter analyze (desktop)' {
+        Push-Location $DesktopDir
+        flutter pub get 2>&1 | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "flutter pub get 失败 (desktop)" }
+        flutter analyze 2>&1 | Out-Host
+        Pop-Location
+    }
+}
+if (-not $SkipAndroid) {
+    Invoke-Build '前置检查 flutter analyze (mobile)' {
+        Push-Location $MobileDir
+        flutter pub get 2>&1 | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "flutter pub get 失败 (mobile)" }
+        flutter analyze 2>&1 | Out-Host
+        Pop-Location
+    }
+}
 
 # 停止运行中的 daemon / 桌面端（产物文件被锁会导致拷贝失败）
 Stop-FtcoreProcesses
