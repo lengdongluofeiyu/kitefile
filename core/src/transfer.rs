@@ -58,10 +58,50 @@ pub struct TransferProgress {
 }
 
 /// 传输句柄，可用于取消与订阅进度
+/// 单个传输的进度通道容量。
+///
+/// 用有界而非无界：InProgress 是高频帧（每块一条），UI 若不消费，
+/// 无界通道会一路堆到 OOM。
+const PROGRESS_CHANNEL_CAP: usize = 256;
+
+/// 终态进度（Failed / Canceled / Completed）的最长等待时间。
+const TERMINAL_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 推送一条进度帧。
+///
+/// 两类帧必须区别对待，这就是本函数存在的全部理由：
+/// - **InProgress**：高频（每块一条）。用 `try_send`，通道满就直接丢。
+///   绝不能在这里 await——UI 不消费时，无界通道吃光内存、有界通道拖死
+///   传输主循环，两种都是事故。丢几帧无所谓：进度是瞬时快照，后到的会覆盖。
+/// - **其余状态**：必须送达。丢一帧终态，UI 就永远停在 99%。
+///   用带超时的 `send`：超时说明压根没人消费，记一条 warn 后放弃，
+///   不能让收尾消息把任务永久挂住。
+async fn push_progress(tx: &mpsc::Sender<TransferProgress>, p: TransferProgress) {
+    let terminal = !matches!(p.status, TransferStatus::InProgress);
+    if terminal {
+        let file_id = p.file_id.clone();
+        let status = p.status.clone();
+        if tokio::time::timeout(TERMINAL_PROGRESS_TIMEOUT, tx.send(p))
+            .await
+            .is_err()
+        {
+            warn!(
+                file_id = %file_id,
+                ?status,
+                "终态进度 {}s 未送达，UI 可能停在中间态",
+                TERMINAL_PROGRESS_TIMEOUT.as_secs()
+            );
+        }
+    } else if let Err(e) = tx.try_send(p) {
+        // 通道满：丢弃这一帧。进度是瞬时快照，下一帧会覆盖它。
+        tracing::debug!(error = %e, "进度通道已满，丢弃一帧 InProgress");
+    }
+}
+
 pub struct TransferHandle {
     pub file_id: String,
     cancel_tx: watch::Sender<bool>,
-    progress_rx: mpsc::UnboundedReceiver<TransferProgress>,
+    progress_rx: mpsc::Receiver<TransferProgress>,
 }
 
 impl TransferHandle {
@@ -680,7 +720,7 @@ impl TransferEngine {
         let parallel = self.parallel_streams;
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+        let (progress_tx, progress_rx) = mpsc::channel(PROGRESS_CHANNEL_CAP);
         // 保留一份 cancel 订阅，供发送任务结束时判断最终状态是 Canceled 还是 Completed
         let cancel_check = cancel_rx.clone();
 
@@ -708,7 +748,7 @@ impl TransferEngine {
             incoming: false,
                 file_path: None,
         };
-        let _ = progress_tx.send(initial);
+        push_progress(&progress_tx, initial).await;
 
         let engine = self.clone();
         let file_id_for_spawn = file_id.clone();
@@ -744,7 +784,7 @@ impl TransferEngine {
             let offer_json = match serde_json::to_string(&offer) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = progress_tx.send(TransferProgress {
+                    push_progress(&progress_tx, TransferProgress {
                         file_id: file_id_for_spawn.clone(),
                         file_name: file_name_for_err.clone(),
                         file_size,
@@ -756,7 +796,7 @@ impl TransferEngine {
                         error: Some(format!("serialize offer: {}", e)),
                         incoming: false,
                 file_path: None,
-                    });
+                    }).await;
                     return;
                 }
             };
@@ -771,7 +811,7 @@ impl TransferEngine {
             .await;
 
             if let Err(e) = post_result {
-                let _ = progress_tx.send(TransferProgress {
+                push_progress(&progress_tx, TransferProgress {
                     file_id: file_id_for_spawn.clone(),
                     file_name: file_name_for_err.clone(),
                     file_size,
@@ -783,7 +823,7 @@ impl TransferEngine {
                     error: Some(format!("post offer: {}", e)),
                     incoming: false,
                 file_path: None,
-                });
+                }).await;
                 engine.cleanup_send_state(&file_id_for_spawn).await;
                 return;
             }
@@ -801,7 +841,7 @@ impl TransferEngine {
             };
 
             if !resp.accepted {
-                let _ = progress_tx.send(TransferProgress {
+                push_progress(&progress_tx, TransferProgress {
                     file_id: file_id_for_spawn.clone(),
                     file_name: file_name_for_err.clone(),
                     file_size,
@@ -813,7 +853,7 @@ impl TransferEngine {
                     error: resp.reason.clone(),
                     incoming: false,
                 file_path: None,
-                });
+                }).await;
                 engine.cleanup_send_state(&file_id_for_spawn).await;
                 return;
             }
@@ -916,7 +956,7 @@ impl TransferEngine {
                     },
                 }
             };
-            let _ = progress_tx.send(final_progress);
+            push_progress(&progress_tx, final_progress).await;
         });
 
         Ok(TransferHandle {
@@ -939,7 +979,7 @@ impl TransferEngine {
         chunk_size: usize,
         parallel: usize,
         cancel_rx: watch::Receiver<bool>,
-        progress_tx: mpsc::UnboundedSender<TransferProgress>,
+        progress_tx: mpsc::Sender<TransferProgress>,
     ) -> Result<()> {
         let file_id_prefix = file_id_prefix_u64(&file_id);
         let bytes_done = Arc::new(AtomicU64::new(0));
@@ -1007,7 +1047,7 @@ impl TransferEngine {
                     let bd = bytes_done.load(Ordering::Relaxed);
                     let cd = chunks_done.load(Ordering::Relaxed);
                     let elapsed = start.elapsed().as_secs_f64().max(0.001);
-                    let _ = progress_tx.send(TransferProgress {
+                    push_progress(&progress_tx, TransferProgress {
                         file_id: file_id_for_err.clone(),
                         file_name: file_name_for_err.clone(),
                         file_size: file_size_for_err,
@@ -1019,7 +1059,7 @@ impl TransferEngine {
                         error: None,
                         incoming: false,
                 file_path: None,
-                    });
+                    }).await;
 
                     chunk_id += parallel as u64;
                 }
