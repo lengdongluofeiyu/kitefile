@@ -1,0 +1,1184 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:window_manager/window_manager.dart';
+
+/// FTCore 桌面端
+///
+/// 架构：Flutter UI（dart）→ HTTP 调用本机 Rust 守护进程（127.0.0.1:7878）
+/// Rust 守护进程在桌面端启动时由 main() 自动拉起（生产环境）；
+/// 用户也可手动在 `core/` 目录运行 `cargo run --bin ftcore-cli daemon`。
+///
+/// 跨平台策略：
+/// - Windows / macOS：window_manager 控制窗口
+/// - iOS（预留）：使用同 UI 但隐藏窗口控制
+/// - Android（移动端走 mobile 项目）：纯 UI
+
+const String kDaemonHttp = 'http://127.0.0.1:7878';
+const String kDaemonWs = 'ws://127.0.0.1:7878/ws/progress';
+
+/// 全局守护进程管理器（单例）
+final DaemonManager daemonManager = DaemonManager();
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
+    await windowManager.ensureInitialized();
+    WindowOptions windowOptions = const WindowOptions(
+      size: Size(900, 700),
+      minimumSize: Size(500, 400),
+      title: 'FTCore',
+    );
+    windowManager.waitUntilReadyToShow(windowOptions, () async {
+      await windowManager.show();
+      await windowManager.focus();
+    });
+  }
+
+  // 启动时自动拉起 Rust 守护进程（非阻塞：UI 立即显示，daemon 在后台 ready）
+  daemonManager.ensureRunning();
+
+  runApp(const FTCoreApp());
+}
+
+/// 守护进程管理器
+///
+/// 职责：
+/// - 启动时检查 http://127.0.0.1:7878/api/whoami 是否响应
+///   - 已响应：说明已有 daemon（用户手动启过 / 上次未退出），直接复用
+///   - 未响应：spawn 一个 ftcore-cli.exe daemon 子进程
+/// - 子进程用 detached 模式：UI 崩溃不会拖死 daemon，正在传的文件不会断
+/// - 窗口关闭时显式 kill 子进程（避免孤儿进程占用端口）
+class DaemonManager {
+  static const int _port = 7878;
+  Process? _process;
+  bool _spawned = false;
+  bool _isReady = false;
+
+  /// 是否由本进程启动了 daemon（用于判断关闭时是否需要 kill）
+  bool get spawnedByUs => _spawned;
+
+  /// daemon 是否已就绪
+  bool get isReady => _isReady;
+
+  /// 确保 daemon 在运行。返回 true 表示已就绪（可能本次启动需要等待几秒）。
+  Future<void> ensureRunning() async {
+    // 1. 先检查是否已经有 daemon 在跑
+    if (await _isAlive()) {
+      _isReady = true;
+      return;
+    }
+
+    // 2. 没在跑 → 找 ftcore-cli.exe 并 spawn
+    final exePath = await _findDaemonExe();
+    if (exePath == null) {
+      debugPrint('[DaemonManager] ftcore-cli.exe 未找到，请将 dist/windows/ 一起分发');
+      return;
+    }
+
+    try {
+      _process = await Process.start(
+        exePath,
+        const ['daemon'],
+        mode: ProcessStartMode.detached,
+        // 守护进程有自己的日志输出，UI 端不接管 stdout/stderr
+        runInShell: false,
+      );
+      _spawned = true;
+      _process!.stdout.listen((_) {}); // 消费 stdout 防止管道阻塞
+      _process!.stderr.listen((_) {});
+      debugPrint('[DaemonManager] spawned daemon PID=${_process!.pid} from $exePath');
+    } catch (e) {
+      debugPrint('[DaemonManager] spawn failed: $e');
+      return;
+    }
+
+    // 3. 轮询等待 daemon 的 HTTP 接口就绪（最多 8 秒）
+    for (var i = 0; i < 80; i++) {
+      await Future.delayed(const Duration(milliseconds: 100));
+      if (await _isAlive()) {
+        _isReady = true;
+        debugPrint('[DaemonManager] daemon ready after ${(i + 1) * 100}ms');
+        return;
+      }
+    }
+    debugPrint('[DaemonManager] daemon failed to become ready within 8s');
+  }
+
+  /// 关闭 daemon（应用退出时调用）
+  Future<void> stop() async {
+    if (_process != null && _spawned) {
+      try {
+        _process!.kill(ProcessSignal.sigterm);
+        debugPrint('[DaemonManager] killed daemon PID=${_process!.pid}');
+      } catch (e) {
+        debugPrint('[DaemonManager] kill failed: $e');
+      }
+      _process = null;
+      _spawned = false;
+      _isReady = false;
+    }
+  }
+
+  /// 检查 daemon 是否响应
+  Future<bool> _isAlive() async {
+    try {
+      final r = await httpGet('http://127.0.0.1:$_port/api/whoami')
+          .timeout(const Duration(milliseconds: 500));
+      return r.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 查找 ftcore-cli.exe 路径
+  /// 1. 与本程序同目录（dist/windows/ 部署模式）
+  /// 2. 开发模式：相对路径到 core/target/release/
+  /// 3. 开发模式：core/target/debug/
+  Future<String?> _findDaemonExe() async {
+    final exeDir = File(Platform.resolvedExecutable).parent;
+    final candidates = <String>[
+      // 1. 与 desktop exe 同目录（生产部署：dist/windows/）
+      '${exeDir.path}${Platform.pathSeparator}ftcore-cli.exe',
+      // 2. 开发模式：desktop/build/... 上溯 5 级到 filetransfer/core/target/release/
+      //    （不依赖绝对路径，仓库放任意盘符都能找到）
+      for (var d = exeDir; d.path.length > 3; d = d.parent)
+        '${d.path}${Platform.pathSeparator}core${Platform.pathSeparator}target${Platform.pathSeparator}release${Platform.pathSeparator}ftcore-cli.exe',
+      for (var d = exeDir; d.path.length > 3; d = d.parent)
+        '${d.path}${Platform.pathSeparator}core${Platform.pathSeparator}target${Platform.pathSeparator}debug${Platform.pathSeparator}ftcore-cli.exe',
+      // 3. 同目录上一级（备选）
+      '${exeDir.parent.path}${Platform.pathSeparator}ftcore-cli.exe',
+    ];
+    for (final p in candidates) {
+      final f = File(p);
+      if (await f.exists()) {
+        return p;
+      }
+    }
+    return null;
+  }
+}
+
+class FTCoreApp extends StatelessWidget {
+  const FTCoreApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'FTCore',
+      theme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        colorSchemeSeed: const Color(0xFF3B82F6),
+      ),
+      home: const HomePage(),
+    );
+  }
+}
+
+// ============ 数据模型 ============
+
+@immutable
+class Device {
+  final String id;
+  final String name;
+  final String ip;
+  final int transferPort;
+  final int gatewayPort;
+  final String platform;
+  const Device({
+    required this.id,
+    required this.name,
+    required this.ip,
+    required this.transferPort,
+    required this.gatewayPort,
+    required this.platform,
+  });
+
+  factory Device.fromJson(Map<String, dynamic> j) => Device(
+        id: j['id'] as String,
+        name: j['name'] as String,
+        ip: j['ip'] as String,
+        transferPort: (j['transfer_port'] as num).toInt(),
+        gatewayPort: (j['gateway_port'] as num).toInt(),
+        platform: j['platform'] as String,
+      );
+}
+
+@immutable
+class WhoAmI {
+  final String id;
+  final String name;
+  final String platform;
+  final int gatewayPort;
+  final int transferPort;
+  const WhoAmI({
+    required this.id,
+    required this.name,
+    required this.platform,
+    required this.gatewayPort,
+    required this.transferPort,
+  });
+
+  factory WhoAmI.fromJson(Map<String, dynamic> j) => WhoAmI(
+        id: j['id'] as String,
+        name: j['name'] as String,
+        platform: j['platform'] as String,
+        gatewayPort: (j['gateway_port'] as num).toInt(),
+        transferPort: (j['transfer_port'] as num).toInt(),
+      );
+}
+
+enum TransferStatus { pending, inProgress, completed, failed, canceled }
+
+TransferStatus _parseStatus(String s) {
+  switch (s) {
+    case 'Pending':
+      return TransferStatus.pending;
+    case 'InProgress':
+      return TransferStatus.inProgress;
+    case 'Completed':
+      return TransferStatus.completed;
+    case 'Failed':
+      return TransferStatus.failed;
+    case 'Canceled':
+      return TransferStatus.canceled;
+    default:
+      return TransferStatus.pending;
+  }
+}
+
+@immutable
+class TransferProgress {
+  final String fileId;
+  final String fileName;
+  final int fileSize;
+  final int bytesTransferred;
+  final int chunksDone;
+  final int chunksTotal;
+  final int speedBps;
+  final TransferStatus status;
+  final String? error;
+  final bool incoming;
+  /// 接收完成后的最终保存路径（仅接收方 Completed 时有值）
+  final String? filePath;
+  const TransferProgress({
+    required this.fileId,
+    required this.fileName,
+    required this.fileSize,
+    required this.bytesTransferred,
+    required this.chunksDone,
+    required this.chunksTotal,
+    required this.speedBps,
+    required this.status,
+    required this.error,
+    this.incoming = false,
+    this.filePath,
+  });
+
+  factory TransferProgress.fromJson(Map<String, dynamic> j) => TransferProgress(
+        fileId: j['file_id'] as String,
+        fileName: j['file_name'] as String,
+        fileSize: (j['file_size'] as num).toInt(),
+        bytesTransferred: (j['bytes_transferred'] as num).toInt(),
+        chunksDone: (j['chunks_done'] as num).toInt(),
+        chunksTotal: (j['chunks_total'] as num).toInt(),
+        speedBps: (j['speed_bps'] as num).toInt(),
+        status: _parseStatus(j['status'] as String),
+        error: j['error'] as String?,
+        incoming: j['incoming'] as bool? ?? false,
+        filePath: j['file_path'] as String?,
+      );
+}
+
+/// 接收方收到的传入请求（与 Rust IncomingEntry 对应）
+@immutable
+class IncomingEntry {
+  final String incomingId;
+  final String fileId;
+  final String fileName;
+  final int fileSize;
+  final String? sha256;
+  final String fromId;
+  final String fromName;
+  final String fromIp;
+  final int fromGatewayPort;
+  final int fromTransferPort;
+  const IncomingEntry({
+    required this.incomingId,
+    required this.fileId,
+    required this.fileName,
+    required this.fileSize,
+    required this.sha256,
+    required this.fromId,
+    required this.fromName,
+    required this.fromIp,
+    required this.fromGatewayPort,
+    required this.fromTransferPort,
+  });
+
+  factory IncomingEntry.fromJson(Map<String, dynamic> j) => IncomingEntry(
+        incomingId: j['incoming_id'] as String,
+        fileId: j['file_id'] as String,
+        fileName: j['file_name'] as String,
+        fileSize: (j['file_size'] as num).toInt(),
+        sha256: j['sha256'] as String?,
+        fromId: j['from_id'] as String,
+        fromName: j['from_name'] as String,
+        fromIp: j['from_ip'] as String,
+        fromGatewayPort: (j['from_gateway_port'] as num).toInt(),
+        fromTransferPort: (j['from_transfer_port'] as num).toInt(),
+      );
+}
+
+// ============ 主页 ============
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> with WindowListener {
+  WhoAmI? _me;
+  List<Device> _devices = [];
+  final Map<String, TransferProgress> _progress = {};
+  final Map<String, IncomingEntry> _pendingIncoming = {};
+  /// 已经为该 fileId 弹过完成提示，避免重复弹窗
+  final Set<String> _notifiedComplete = {};
+  WebSocket? _ws;
+  Timer? _refreshTimer;
+  bool _daemonOnline = false;
+  Timer? _startupPollTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    windowManager.addListener(this);
+    _initDaemon();
+  }
+
+  @override
+  void dispose() {
+    _ws?.close();
+    _refreshTimer?.cancel();
+    _startupPollTimer?.cancel();
+    windowManager.removeListener(this);
+    super.dispose();
+  }
+
+  /// 窗口关闭时弹窗询问是否同时退出守护进程
+  ///
+  /// 选择「完全退出」：杀掉 daemon 子进程，端口释放
+  /// 选择「仅关闭 UI」：daemon 留在后台，其他设备仍可发现本机并发起传输
+  @override
+  void onWindowClose() async {
+    final shouldExit = await _showExitDialog();
+    if (shouldExit) {
+      await daemonManager.stop();
+    }
+    await windowManager.destroy();
+  }
+
+  Future<bool> _showExitDialog() async {
+    if (!mounted) return true;
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        title: const Text('关闭 FTCore'),
+        content: const Text(
+          '是否同时退出守护进程？\n\n'
+          '· 选「仅关闭 UI」：守护进程留在后台，其他设备仍能发现本机并向本机传输文件。\n'
+          '· 选「完全退出」：守护进程一同退出，本机不再被其他设备发现。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('仅关闭 UI'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('完全退出'),
+          ),
+        ],
+      ),
+    );
+    return result ?? true;
+  }
+
+  Future<void> _initDaemon() async {
+    // 等待 daemonManager 拉起的 daemon 就绪（最多再轮询 10s）
+    _startupPollTimer = Timer.periodic(const Duration(seconds: 1), (t) async {
+      if (t.tick > 10) {
+        t.cancel();
+        return;
+      }
+      await _fetchWhoAmI();
+      if (_daemonOnline) {
+        t.cancel();
+        _refreshDevices();
+        _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) => _refreshDevices());
+        _connectWs();
+      }
+    });
+    // 同时立即试一次（万一 daemon 已经 ready）
+    await _fetchWhoAmI();
+    if (_daemonOnline) {
+      _startupPollTimer?.cancel();
+      _refreshDevices();
+      _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) => _refreshDevices());
+      _connectWs();
+    }
+  }
+
+  Future<void> _fetchWhoAmI() async {
+    try {
+      final r = await httpGet('$kDaemonHttp/api/whoami');
+      final me = WhoAmI.fromJson(jsonDecode(r) as Map<String, dynamic>);
+      setState(() {
+        _me = me;
+        _daemonOnline = true;
+      });
+    } catch (_) {
+      setState(() => _daemonOnline = false);
+    }
+  }
+
+  Future<void> _refreshDevices() async {
+    try {
+      final r = await httpGet('$kDaemonHttp/api/devices');
+      final list = (jsonDecode(r) as List).cast<Map<String, dynamic>>();
+      setState(() {
+        _devices = list.map(Device.fromJson).toList();
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _connectWs() async {
+    try {
+      _ws = await WebSocket.connect(kDaemonWs);
+      _ws!.listen((data) {
+        if (data is String) {
+          _handleWsMessage(jsonDecode(data) as Map<String, dynamic>);
+        }
+      });
+    } catch (_) {
+      // retry later
+      Future.delayed(const Duration(seconds: 5), _connectWs);
+    }
+  }
+
+  /// WebSocket 消息分发：progress / incoming / incoming_resolved
+  void _handleWsMessage(Map<String, dynamic> j) {
+    final type = j['event_type'] as String?;
+    switch (type) {
+      case 'progress':
+        final p = TransferProgress.fromJson(j);
+        setState(() => _progress[p.fileId] = p);
+        // 接收方收到完成事件 → 弹窗提示
+        if (p.incoming &&
+            p.status == TransferStatus.completed &&
+            !_notifiedComplete.contains(p.fileId)) {
+          _notifiedComplete.add(p.fileId);
+          _showReceivedDialog(p);
+        }
+        break;
+      case 'incoming':
+        final entry = IncomingEntry.fromJson(j);
+        // 同一 incoming_id 只弹一次窗
+        if (!_pendingIncoming.containsKey(entry.incomingId) && mounted) {
+          _pendingIncoming[entry.incomingId] = entry;
+          _showIncomingDialog(entry);
+        }
+        break;
+      case 'incoming_resolved':
+        final id = j['incoming_id'] as String;
+        setState(() => _pendingIncoming.remove(id));
+        break;
+      default:
+        break;
+    }
+  }
+
+  /// 接收文件弹窗：显示来源、文件名、大小，让用户选择接受/拒绝
+  void _showIncomingDialog(IncomingEntry entry) {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.download_rounded, size: 24),
+            SizedBox(width: 8),
+            Text('收到文件传输请求'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _kv('来自', entry.fromName),
+            _kv('地址', '${entry.fromIp}:${entry.fromTransferPort}'),
+            const SizedBox(height: 8),
+            _kv('文件名', entry.fileName),
+            _kv('大小', formatBytes(entry.fileSize)),
+            if (entry.sha256 != null && entry.sha256!.isNotEmpty)
+              _kv('SHA256', '${entry.sha256!.substring(0, 12)}…'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _rejectIncoming(entry.incomingId);
+            },
+            child: const Text('拒绝'),
+          ),
+          FilledButton.icon(
+            icon: const Icon(Icons.download),
+            label: const Text('接受'),
+            onPressed: () {
+              Navigator.pop(context);
+              _acceptIncoming(entry.incomingId);
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _acceptIncoming(String id) async {
+    try {
+      await httpPost('$kDaemonHttp/api/incoming/$id/accept', body: '');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('已接受，等待对方开始传输…')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('接受失败: $e')),
+      );
+    }
+  }
+
+  Future<void> _rejectIncoming(String id) async {
+    try {
+      await httpPost('$kDaemonHttp/api/incoming/$id/reject', body: '');
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('拒绝失败: $e')),
+      );
+    }
+  }
+
+  /// 接收完成弹窗
+  void _showReceivedDialog(TransferProgress p) {
+    showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.check_circle, color: Colors.green, size: 24),
+            SizedBox(width: 8),
+            Text('文件接收完成'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _kv('文件', p.fileName),
+            _kv('大小', formatBytes(p.fileSize)),
+            if (p.filePath != null) ...[
+              const SizedBox(height: 8),
+              const Text('保存位置: ',
+                  style: TextStyle(color: Colors.grey, fontSize: 13)),
+              SelectableText(p.filePath!,
+                  style: const TextStyle(fontSize: 13)),
+            ],
+          ],
+        ),
+        actions: [
+          if (p.filePath != null)
+            TextButton.icon(
+              icon: const Icon(Icons.folder_open, size: 16),
+              label: const Text('所在文件夹'),
+              onPressed: () => revealInFileManager(p.filePath!),
+            ),
+          if (p.filePath != null)
+            FilledButton.icon(
+              icon: const Icon(Icons.open_in_new, size: 16),
+              label: const Text('打开文件'),
+              onPressed: () => openFile(p.filePath!),
+            ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 设置弹窗：查看/修改设备名 + 接收目录
+  Future<void> _showSettingsDialog() async {
+    String? currentDir;
+    String? currentName;
+    try {
+      final r = await httpGet('$kDaemonHttp/api/config');
+      final j = jsonDecode(r) as Map<String, dynamic>;
+      currentDir = j['receive_dir'] as String?;
+      currentName = j['device_name'] as String?;
+    } catch (_) {}
+    if (!mounted) return;
+
+    final nameController = TextEditingController(text: currentName ?? '');
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text('设置'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('设备名称', style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: nameController,
+                        decoration: const InputDecoration(
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                          hintText: '本机在设备列表中显示的名字',
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton(
+                      onPressed: () async {
+                        final name = nameController.text.trim();
+                        if (name.isEmpty) return;
+                        try {
+                          await httpPost(
+                            '$kDaemonHttp/api/config/device-name',
+                            body: jsonEncode({'device_name': name}),
+                          );
+                          setDialogState(() => currentName = name);
+                          if (ctx.mounted) {
+                            ScaffoldMessenger.of(ctx).showSnackBar(
+                              SnackBar(content: Text('设备名称已更新：$name')),
+                            );
+                          }
+                        } catch (e) {
+                          if (ctx.mounted) {
+                            ScaffoldMessenger.of(ctx).showSnackBar(
+                              SnackBar(content: Text('设置失败: $e')),
+                            );
+                          }
+                        }
+                      },
+                      child: const Text('保存'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '重启后名称保留；对端设备列表会立即显示新名字。',
+                  style: const TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+                const Divider(height: 24),
+                const Text('接收文件保存位置',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                SelectableText(
+                  currentDir ?? '（守护进程未运行，无法读取当前设置）',
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: currentDir == null ? Colors.orange : Colors.grey,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  icon: const Icon(Icons.folder_open),
+                  label: const Text('更改保存位置'),
+                  onPressed: () async {
+                    // Windows 原生目录选择对话框
+                    final dir = await FilePicker.platform.getDirectoryPath(
+                      dialogTitle: '选择接收文件的保存目录',
+                      lockParentWindow: true,
+                    );
+                    if (dir == null) return;
+                    try {
+                      final r = await httpPost(
+                        '$kDaemonHttp/api/config/receive-dir',
+                        body: jsonEncode({'receive_dir': dir}),
+                      );
+                      final nd =
+                          (jsonDecode(r) as Map<String, dynamic>)['receive_dir'] as String?;
+                      setDialogState(() => currentDir = nd ?? dir);
+                      if (ctx.mounted) {
+                        ScaffoldMessenger.of(ctx).showSnackBar(
+                          SnackBar(content: Text('保存位置已更新：$dir')),
+                        );
+                      }
+                    } catch (e) {
+                      if (ctx.mounted) {
+                        ScaffoldMessenger.of(ctx).showSnackBar(
+                          SnackBar(content: Text('设置失败: $e')),
+                        );
+                      }
+                    }
+                  },
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '默认：系统 Downloads/ftcore/。更改后，之后接收的文件将保存到新位置。',
+                  style: const TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('关闭'),
+            ),
+          ],
+        ),
+      ),
+    );
+    nameController.dispose();
+  }
+
+  Future<void> _sendFile(Device target, String path) async {
+    try {
+      final r = await httpPost('$kDaemonHttp/api/send', body: jsonEncode({
+        'target_ip': target.ip,
+        'target_port': target.transferPort,
+        'target_gateway_port': target.gatewayPort,
+        'file_path': path,
+      }));
+      final fileId = (jsonDecode(r) as Map<String, dynamic>)['file_id'] as String;
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已发起传输: $fileId')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('发起失败: $e')),
+      );
+    }
+  }
+
+  Future<void> _cancel(String fileId) async {
+    // 404 = 传输已结束/不存在，静默忽略
+    try {
+      await httpPost('$kDaemonHttp/api/cancel/$fileId', body: '');
+    } catch (_) {}
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('FTCore'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings_outlined),
+            tooltip: '设置',
+            onPressed: _showSettingsDialog,
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: _daemonOnline
+                      ? Colors.green.withValues(alpha: 0.2)
+                      : Colors.orange.withValues(alpha: 0.2),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  _daemonOnline ? '守护进程已连接' : '守护进程未运行',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: _daemonOnline ? Colors.green : Colors.orange,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          _meSection(),
+          const SizedBox(height: 16),
+          _devicesSection(),
+          const SizedBox(height: 16),
+          _transfersSection(),
+        ],
+      ),
+    );
+  }
+
+  Widget _meSection() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('本机', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            if (_me == null)
+              const Text('正在拉起守护进程… 若持续未就绪，请检查 ftcore-cli.exe 是否在程序目录。')
+            else
+              Wrap(
+                spacing: 16,
+                runSpacing: 8,
+                children: [
+                  _kv('名称', _me!.name),
+                  _kv('平台', _me!.platform),
+                  _kv('HTTP', ':${_me!.gatewayPort}'),
+                  _kv('传输', ':${_me!.transferPort}'),
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _devicesSection() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('设备列表 (${_devices.length})', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            if (_devices.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Text('未发现设备，请确认对端已启动并处于同一局域网。'),
+              )
+            else
+              Column(
+                children: _devices.map((d) {
+                  return ListTile(
+                    title: Text(d.name),
+                    subtitle: Text('${d.platform} · ${d.ip}:${d.transferPort}'),
+                    trailing: const Icon(Icons.send),
+                    onTap: () => _showSendDialog(d),
+                  );
+                }).toList(),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _transfersSection() {
+    final items = _progress.values.toList()
+      ..sort((a, b) => a.status == TransferStatus.inProgress ? -1 : 1);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('传输进度 (${items.length})', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            if (items.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Text('暂无传输任务'),
+              )
+            else
+              Column(
+                children: items.map(_transferTile).toList(),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _transferTile(TransferProgress p) {
+    final pct = p.fileSize > 0 ? p.bytesTransferred / p.fileSize : 0.0;
+    final statusText = {
+      TransferStatus.pending: '等待',
+      TransferStatus.inProgress: '进行中',
+      TransferStatus.completed: '已完成',
+      TransferStatus.failed: '失败',
+      TransferStatus.canceled: '已取消',
+    }[p.status]!;
+    final statusColor = {
+      TransferStatus.completed: Colors.green,
+      TransferStatus.failed: Colors.red,
+      TransferStatus.inProgress: Colors.blue,
+      TransferStatus.canceled: Colors.orange,
+      TransferStatus.pending: Colors.grey,
+    }[p.status]!;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(child: Text(p.fileName, overflow: TextOverflow.ellipsis)),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: statusColor.withValues(alpha: 0.2),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(statusText,
+                    style: TextStyle(color: statusColor, fontSize: 12)),
+              ),
+              if (p.status == TransferStatus.inProgress)
+                IconButton(
+                  icon: const Icon(Icons.close, size: 16),
+                  onPressed: () => _cancel(p.fileId),
+                ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          LinearProgressIndicator(value: pct),
+          const SizedBox(height: 4),
+          Text(
+            '${formatBytes(p.bytesTransferred)} / ${formatBytes(p.fileSize)}'
+            '${p.status == TransferStatus.inProgress ? ' · ${formatSpeed(p.speedBps)}' : ''}'
+            '${p.error != null ? ' · ${p.error}' : ''}',
+            style: const TextStyle(fontSize: 12, color: Colors.grey),
+          ),
+          // 接收完成的条目：显示保存路径 + 打开文件 / 所在文件夹
+          if (p.status == TransferStatus.completed &&
+              p.incoming &&
+              p.filePath != null) ...[
+            const SizedBox(height: 4),
+            Text('已保存: ${p.filePath}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 11, color: Colors.grey)),
+            Row(
+              children: [
+                TextButton.icon(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                  ),
+                  icon: const Icon(Icons.open_in_new, size: 14),
+                  label: const Text('打开文件'),
+                  onPressed: () => openFile(p.filePath!),
+                ),
+                TextButton.icon(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                  ),
+                  icon: const Icon(Icons.folder_open, size: 14),
+                  label: const Text('所在文件夹'),
+                  onPressed: () => revealInFileManager(p.filePath!),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _kv(String k, String v) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text('$k: ', style: const TextStyle(color: Colors.grey, fontSize: 13)),
+        Text(v, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+      ],
+    );
+  }
+
+  /// 系统文件选择器选文件（多选）→ 确认列表 → 逐个发送
+  void _showSendDialog(Device d) {
+    _pickAndSend(d);
+  }
+
+  Future<void> _pickAndSend(Device d) async {
+    // 1. Windows 原生文件对话框（支持多选）
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.any,
+      allowMultiple: true,
+      dialogTitle: '选择要发送的文件',
+      lockParentWindow: true, // 对话框模态于主窗口
+    );
+    if (!mounted) return;
+
+    // 用户取消
+    if (result == null || result.files.isEmpty) return;
+
+    // 2. 过滤出有真实路径的文件
+    final picks = result.files.where((f) => f.path != null).toList();
+    if (picks.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('无法获取所选文件的路径')),
+      );
+      return;
+    }
+
+    // 3. 确认列表（多选时展示全部，确认后逐个发送）
+    showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('发送到 ${d.name}'),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('目标: ${d.ip}:${d.transferPort}',
+                  style: const TextStyle(fontSize: 13, color: Colors.grey)),
+              const SizedBox(height: 8),
+              Text('已选 ${picks.length} 个文件：',
+                  style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              ...picks.map(
+                (f) => Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.insert_drive_file,
+                          size: 16, color: Colors.grey),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          '${f.name}（${formatBytes(f.size)}）',
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 13),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(context);
+              // 逐个发送（每个文件独立传输任务，进度列表分别展示）
+              for (final f in picks) {
+                _sendFile(d, f.path!);
+              }
+            },
+            child: Text('发送 (${picks.length})'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============ 工具函数 ============
+
+/// 用系统默认程序打开文件
+Future<void> openFile(String path) async {
+  try {
+    if (Platform.isWindows) {
+      await Process.run('explorer.exe', [path]);
+    } else if (Platform.isMacOS) {
+      await Process.run('open', [path]);
+    } else {
+      await Process.run('xdg-open', [path]);
+    }
+  } catch (_) {}
+}
+
+/// 在文件管理器中定位并选中文件
+Future<void> revealInFileManager(String path) async {
+  try {
+    if (Platform.isWindows) {
+      // explorer /select,<path>：打开所在目录并选中该文件
+      await Process.run('explorer.exe', ['/select,$path']);
+    } else if (Platform.isMacOS) {
+      await Process.run('open', ['-R', path]);
+    } else {
+      await Process.run('xdg-open', [File(path).parent.path]);
+    }
+  } catch (_) {}
+}
+
+String formatBytes(int bytes) {
+  if (bytes == 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  final i = (bytes.bitLength - 1) ~/ 10;
+  final idx = i < units.length ? i : units.length - 1;
+  return '${(bytes / (1 << (10 * idx))).toStringAsFixed(2)} ${units[idx]}';
+}
+
+String formatSpeed(int bps) => '${formatBytes(bps)}/s';
+
+// ============ 简易 HTTP 客户端 ============
+// 不依赖 dio/http，避免额外依赖；如需更复杂功能再引入。
+
+Future<String> httpGet(String url) async {
+  final uri = Uri.parse(url);
+  final client = HttpClient();
+  try {
+    final r = await client.getUrl(uri);
+    final resp = await r.close();
+    final body = await resp.transform(utf8.decoder).join();
+    if (resp.statusCode >= 400) {
+      throw Exception('HTTP ${resp.statusCode}: $body');
+    }
+    return body;
+  } finally {
+    client.close(force: true);
+  }
+}
+
+Future<String> httpPost(String url, {required String body}) async {
+  final uri = Uri.parse(url);
+  final client = HttpClient();
+  try {
+    final r = await client.postUrl(uri);
+    r.headers.contentType = ContentType.json;
+    r.add(Uint8List.fromList(utf8.encode(body)));
+    final resp = await r.close();
+    final respBody = await resp.transform(utf8.decoder).join();
+    if (resp.statusCode >= 400) {
+      throw Exception('HTTP ${resp.statusCode}: $respBody');
+    }
+    return respBody;
+  } finally {
+    client.close(force: true);
+  }
+}

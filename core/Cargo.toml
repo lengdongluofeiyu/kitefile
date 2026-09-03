@@ -1,0 +1,64 @@
+[package]
+name = "ftcore"
+version = "0.1.0"
+edition = "2021"
+description = "LAN file transfer core engine (discovery + transfer + HTTP gateway)"
+license = "MIT"
+
+[lib]
+name = "ftcore"
+path = "src/lib.rs"
+# cdylib 用于 Flutter / 原生端通过 FFI 直接调用
+# rlib 用于纯 Rust 依赖（CLI、单元测试）
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "ftcore-cli"
+path = "src/bin/cli.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# mDNS service discovery
+mdns-sd = "0.11"
+
+# HTTP gateway (for web frontend)
+axum = { version = "0.7", features = ["multipart", "ws", "macros"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Hashing / checksums
+sha2 = "0.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+parking_lot = "0.12"
+dashmap = "6"
+if-addrs = "0.13"
+tokio-util = { version = "0.7", features = ["io"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+sha2 = "0.10"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

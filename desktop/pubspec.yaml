@@ -1,0 +1,24 @@
+name: ftcore_desktop
+description: "FTCore 局域网文件传输 - 桌面端（Windows / macOS）"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  window_manager: ^0.4.3
+  # 系统文件选择器（Windows 原生对话框，支持多选）
+  file_picker: ^8.3.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

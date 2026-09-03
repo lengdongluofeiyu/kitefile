@@ -1,0 +1,41 @@
+# ===== Rust 构建产物（数 GB）=====
+target/
+**/*.rs.bk
+*.pdb
+
+# ===== 发布产物 =====
+# 含 exe / dll / apk，二进制一旦进历史就无法彻底清除
+dist/
+
+# ===== 传输临时文件 =====
+# 接收中的半成品（.part），不属于源码
+*.part
+
+# ===== Node 依赖 =====
+node_modules/
+
+# ===== Android / Gradle 构建中间产物 =====
+.gradle/
+.cxx/
+local.properties
+# local.properties 含本机 SDK 绝对路径，绝不能入库
+
+# ===== 编辑器 / IDE =====
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
+
+# ===== 日志 =====
+*.log
+
+# ===== 依赖锁文件：必须提交 =====
+# 本项目是应用（core 含 bin target），锁文件保证构建可复现。
+# 显式否定，防止将来新增 *.lock 类规则时误伤。
+!Cargo.lock
+!pubspec.lock

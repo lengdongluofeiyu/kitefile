@@ -1,0 +1,44 @@
+# 换行与编码统一策略：由本文件全权决定，不依赖 core.autocrlf
+# （仓库已设 core.autocrlf=false，见 README / 构建说明）
+
+# PowerShell 脚本在 Windows 上必须是 CRLF，
+# 否则执行器与部分编辑器的 BOM 处理会出问题（曾出现重复 BOM）
+*.ps1 text eol=crlf
+
+# 源码与配置统一 LF 入库，检出时按宿主平台换行
+*.rs   text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.dart text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.css  text eol=lf
+*.html text eol=lf
+*.kt   text eol=lf
+*.java text eol=lf
+*.xml  text eol=lf
+*.gradle text eol=lf
+*.sh   text eol=lf
+
+# 二进制文件：禁止任何转换与 diff
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.apk  binary
+*.aab  binary
+*.exe  binary
+*.dll  binary
+*.so   binary
+*.dylib binary
+*.pdf  binary
+*.mp4  binary
+*.zip  binary
+*.ttf  binary
+*.otf  binary

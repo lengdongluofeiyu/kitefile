@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider 可共享的路径范围：外部存储（公共目录 + 应用专属目录） -->
+<paths>
+    <external-path name="external_storage" path="." />
+    <files-path name="internal_files" path="." />
+</paths>
