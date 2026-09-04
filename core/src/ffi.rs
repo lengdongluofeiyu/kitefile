@@ -14,7 +14,7 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::runtime::Runtime;
 use tracing::{error, warn};
 
@@ -30,8 +30,35 @@ pub struct FfiContext {
 }
 
 // 全局单例（FFI 简化为单例；如需多实例可改为返回句柄）
-static mut CONTEXT: Option<Arc<FfiContext>> = None;
+//
+// 用 Mutex 而不是 `static mut`：后者在多线程下读写是数据竞争（Rust 2024 起
+// 连"取一个共享引用"都会告警），而守护进程里的 gateway 线程与调用方线程
+// 会同时碰这个变量。OnceLock 在这里不适用——`ftcore_shutdown` 需要把它置回
+// None，而 OnceLock 只能写一次。
+static CONTEXT: Mutex<Option<Arc<FfiContext>>> = Mutex::new(None);
 static INIT_LOCK: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// 取锁，被毒化时也照常使用里面的数据。
+///
+/// FFI 边界上**不能 panic**（跨 FFI unwind 是未定义行为）。前一个持锁者
+/// panic 会把 Mutex 毒化，默认的 `unwrap()` 会跟着 panic 并穿过 FFI 边界，
+/// 所以这里把毒化的锁恢复成可用状态再继续——本模块保护的都是"缓存型"数据，
+/// 残缺的旧值也比崩溃好。
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 把字符串存进静态槽位并返回裸指针。
+///
+/// 返回的指针只在**下一次调用同一个 FFI 函数之前**有效——槽位会被覆盖，
+/// 这是这些接口的既定契约（见各函数的文档注释）。
+/// 槽位本身是静态的，所以指针不会悬垂；用 Mutex 是为了让覆盖动作不再有数据竞争。
+fn store(ptr_slot: &'static Mutex<Option<CString>>, s: CString) -> *const c_char {
+    let mut guard = lock(ptr_slot);
+    *guard = Some(s);
+    // guard 在这里 drop，但 CString 仍活在同一个静态槽位里，指针保持有效
+    guard.as_ref().map_or(std::ptr::null(), |s| s.as_ptr())
+}
 
 /// 初始化引擎。device_name / receive_dir 为 null 时使用默认值。
 /// （Android 上建议由调用方传入应用专属外部存储目录，如
@@ -149,10 +176,10 @@ pub unsafe extern "C" fn ftcore_init(
         // 保持 runtime 不被销毁
         std::mem::forget(runtime);
 
-        CONTEXT = Some(ctx);
+        *lock(&CONTEXT) = Some(ctx);
     });
 
-    if unsafe { CONTEXT.is_some() } {
+    if lock(&CONTEXT).is_some() {
         0
     } else {
         -1
@@ -166,8 +193,9 @@ pub unsafe extern "C" fn ftcore_init(
 /// 仅在 ftcore_init 成功后调用
 #[no_mangle]
 pub unsafe extern "C" fn ftcore_whoami_json() -> *const c_char {
-    static mut LAST: Option<CString> = None;
-    let ctx = match CONTEXT.as_ref() {
+    static LAST: Mutex<Option<CString>> = Mutex::new(None);
+    // clone 出 Arc 就立刻释放锁，不要持着锁去做 JSON 序列化
+    let ctx = match lock(&CONTEXT).clone() {
         Some(c) => c,
         None => return std::ptr::null(),
     };
@@ -179,24 +207,22 @@ pub unsafe extern "C" fn ftcore_whoami_json() -> *const c_char {
         "gateway_port": ctx.config.gateway_port,
         "transfer_port": ctx.config.transfer_port,
     });
-    let s = CString::new(me.to_string()).unwrap_or_default();
-    LAST = Some(s);
-    LAST.as_ref().unwrap().as_ptr()
+    store(&LAST, CString::new(me.to_string()).unwrap_or_default())
 }
 
 /// 获取当前已发现的设备列表 JSON 数组
 #[no_mangle]
 pub unsafe extern "C" fn ftcore_list_devices_json() -> *const c_char {
-    static mut LAST: Option<CString> = None;
-    let ctx = match CONTEXT.as_ref() {
+    static LAST: Mutex<Option<CString>> = Mutex::new(None);
+    let ctx = match lock(&CONTEXT).clone() {
         Some(c) => c,
         None => return std::ptr::null(),
     };
     let devices = ctx.discovery.list_devices();
-    let s = CString::new(serde_json::to_string(&devices).unwrap_or_default())
-        .unwrap_or_default();
-    LAST = Some(s);
-    LAST.as_ref().unwrap().as_ptr()
+    store(
+        &LAST,
+        CString::new(serde_json::to_string(&devices).unwrap_or_default()).unwrap_or_default(),
+    )
 }
 
 /// 发起发送
@@ -210,11 +236,11 @@ pub unsafe extern "C" fn ftcore_send_file(
     target_port: u16,
     file_path: *const c_char,
 ) -> *const c_char {
-    static mut LAST: Option<CString> = None;
+    static LAST: Mutex<Option<CString>> = Mutex::new(None);
     if target_ip.is_null() || file_path.is_null() {
         return std::ptr::null();
     }
-    let ctx = match CONTEXT.as_ref() {
+    let ctx = match lock(&CONTEXT).clone() {
         Some(c) => c,
         None => return std::ptr::null(),
     };
@@ -277,13 +303,11 @@ pub unsafe extern "C" fn ftcore_send_file(
         _ => return std::ptr::null(),
     };
 
-    let s = CString::new(file_id).unwrap_or_default();
-    LAST = Some(s);
-    LAST.as_ref().unwrap().as_ptr()
+    store(&LAST, CString::new(file_id).unwrap_or_default())
 }
 
 /// 释放引擎资源（应用退出时调用）
 #[no_mangle]
 pub unsafe extern "C" fn ftcore_shutdown() {
-    CONTEXT = None;
+    *lock(&CONTEXT) = None;
 }

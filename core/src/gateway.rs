@@ -122,15 +122,14 @@ impl HttpGateway {
         }
     }
 
-    /// gateway 启动前注入 progress + ws_event 广播到 transfer engine
+    /// gateway 启动前把 progress 广播注入 transfer engine
+    ///
+    /// WsEvent 广播**不注入**——它由 gateway 自己持有并直接发送
+    /// （见 `incoming_offer` / `decide_incoming`），engine 侧不需要第二份 bus。
     pub async fn bind_buses(&self) {
         self.state
             .transfer
             .set_progress_bus(self.state.progress_bus.clone())
-            .await;
-        self.state
-            .transfer
-            .set_ws_event_bus(self.state.ws_event_bus.clone())
             .await;
     }
 

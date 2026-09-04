@@ -18,7 +18,9 @@
 //! 跨平台实现：使用 `Seek + Read`，不依赖平台专属零拷贝 API。
 //! 后续可按平台用 cfg 切到 sendfile/TransmitFile 等优化。
 
-use crate::protocol::{HttpIncomingResponse, HttpOffer, IncomingEntry, WsEvent, DataFrameHeader};
+use crate::protocol::{
+    DataFrameHeader, HttpIncomingResponse, HttpOffer, IncomingEntry,
+};
 use crate::storage::StorageManager;
 use crate::Result;
 use parking_lot::Mutex;
@@ -336,8 +338,6 @@ pub struct TransferEngine {
     prefix_to_file_id: TokioMutex<HashMap<u64, String>>,
     /// 进度广播 bus（gateway 注入；None 时 send_file 仍能用，只是不广播）
     progress_bus: TokioMutex<Option<Arc<broadcast::Sender<TransferProgress>>>>,
-    /// WebSocket 事件 bus（gateway 注入）
-    ws_event_bus: TokioMutex<Option<Arc<broadcast::Sender<WsEvent>>>>,
     /// 全量进度快照：file_id → 最近一条进度（GET /api/transfers 用）。
     /// 有条目上限，超出后按插入顺序淘汰，见 [`ProgressCache`]。
     progress_cache: Arc<Mutex<ProgressCache>>,
@@ -366,7 +366,6 @@ impl TransferEngine {
             storage: Arc::new(StorageManager::new(receive_dir)),
             prefix_to_file_id: TokioMutex::new(HashMap::new()),
             progress_bus: TokioMutex::new(None),
-            ws_event_bus: TokioMutex::new(None),
             progress_cache: Arc::new(Mutex::new(ProgressCache::new(PROGRESS_CACHE_CAP))),
             recv_speed_state: TokioMutex::new(HashMap::new()),
             incoming_endpoints: TokioMutex::new(HashMap::new()),
@@ -376,11 +375,6 @@ impl TransferEngine {
     /// gateway 启动后注入 progress 广播
     pub async fn set_progress_bus(&self, bus: Arc<broadcast::Sender<TransferProgress>>) {
         *self.progress_bus.lock().await = Some(bus);
-    }
-
-    /// gateway 启动后注入 WsEvent 广播
-    pub async fn set_ws_event_bus(&self, bus: Arc<broadcast::Sender<WsEvent>>) {
-        *self.ws_event_bus.lock().await = Some(bus);
     }
 
     async fn broadcast_progress(&self, p: TransferProgress) {
@@ -469,12 +463,6 @@ impl TransferEngine {
             info!(%file_id, "transfer canceled");
         }
         found
-    }
-
-    async fn broadcast_ws_event(&self, ev: WsEvent) {
-        if let Some(bus) = self.ws_event_bus.lock().await.clone() {
-            let _ = bus.send(ev);
-        }
     }
 
     /// 发送任务结束后清理注册表（inflight / 等回包 oneshot）
@@ -1200,12 +1188,12 @@ async fn send_chunk(mut stream: TcpStream, header: &DataFrameHeader, data: &[u8]
         {
             Ok(())
         }
+        // ChunkAck 是目前唯一的变体，所以这里已经穷尽，不再需要 `_` 兜底。
+        // 将来若新增控制消息，编译器会因 match 非穷尽而报错——
+        // 这正是想要的：逼着你去想新消息当 chunk ack 收到时该怎么办。
         crate::protocol::ControlMessage::ChunkAck { chunk_id, ok, .. } => Err(
             crate::CoreError::Transfer(format!("chunk {} rejected by receiver (ok={})", chunk_id, ok)),
         ),
-        _ => Err(crate::CoreError::Transfer(
-            "unexpected control message as chunk ack".into(),
-        )),
     }
 }
 
