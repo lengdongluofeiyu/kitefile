@@ -23,7 +23,7 @@ use crate::storage::StorageManager;
 use crate::Result;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -73,6 +73,86 @@ const PROGRESS_CHANNEL_CAP: usize = 256;
 
 /// 终态进度（Failed / Canceled / Completed）的最长等待时间。
 const TERMINAL_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 全量进度快照的条目上限（`GET /api/transfers` 的数据源）。
+///
+/// daemon 是常驻进程，不设限的话每传一个文件都会在这里留一条终态进度，
+/// 传上千个文件就积上千条永不释放的记录。
+const PROGRESS_CACHE_CAP: usize = 200;
+
+/// 有上限的进度快照：HashMap + 插入顺序队列。
+///
+/// 淘汰时优先丢**已终态**的最早条目——老任务的终态进度通常已经没人看了；
+/// 全是进行中时退化为丢最早一条。宁可让最老的任务从列表里消失，
+/// 也不能让新进度写不进来。
+struct ProgressCache {
+    cap: usize,
+    map: HashMap<String, TransferProgress>,
+    /// 插入顺序；只有 file_id 首次出现时才入队
+    order: VecDeque<String>,
+}
+
+impl ProgressCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, p: TransferProgress) {
+        let file_id = p.file_id.clone();
+        // 已存在的 file_id 只是更新进度，不改动它的插入顺序
+        if self.map.insert(file_id.clone(), p).is_some() {
+            return;
+        }
+        self.order.push_back(file_id);
+
+        // evict_one 返回 false 表示再也淘汰不掉（理论上不会发生），
+        // 此时必须退出，否则是一个死循环。
+        while self.map.len() > self.cap && self.evict_one() {}
+    }
+
+    /// 淘汰一条，成功返回 true
+    fn evict_one(&mut self) -> bool {
+        // 优先挑一个终态条目淘汰
+        let terminal = self.order.iter().position(|id| {
+            self.map
+                .get(id)
+                .map(|p| is_terminal(&p.status))
+                .unwrap_or(false)
+        });
+        if let Some(idx) = terminal {
+            if let Some(id) = self.order.remove(idx) {
+                self.map.remove(&id);
+                return true;
+            }
+        }
+
+        // 全是进行中：退化为淘汰最早一条。
+        // 这里的 continue（即继续 pop）是刻意的：队列里可能残留已失效的 id，
+        // 一旦写成 break，整个淘汰就停摆，快照再也降不下来。
+        while let Some(id) = self.order.pop_front() {
+            if self.map.remove(&id).is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn snapshot(&self) -> Vec<TransferProgress> {
+        self.map.values().cloned().collect()
+    }
+}
+
+/// 终态：不会再发生变化的进度
+fn is_terminal(s: &TransferStatus) -> bool {
+    matches!(
+        s,
+        TransferStatus::Completed | TransferStatus::Failed | TransferStatus::Canceled
+    )
+}
 
 /// 推送一条进度帧。
 ///
@@ -258,8 +338,9 @@ pub struct TransferEngine {
     progress_bus: TokioMutex<Option<Arc<broadcast::Sender<TransferProgress>>>>,
     /// WebSocket 事件 bus（gateway 注入）
     ws_event_bus: TokioMutex<Option<Arc<broadcast::Sender<WsEvent>>>>,
-    /// 全量进度快照：file_id → 最近一条进度（GET /api/transfers 用）
-    progress_cache: Arc<Mutex<HashMap<String, TransferProgress>>>,
+    /// 全量进度快照：file_id → 最近一条进度（GET /api/transfers 用）。
+    /// 有条目上限，超出后按插入顺序淘汰，见 [`ProgressCache`]。
+    progress_cache: Arc<Mutex<ProgressCache>>,
     /// 接收方速率统计：file_id → (首 chunk 时间, 上次已收字节数)
     recv_speed_state: TokioMutex<HashMap<String, (Instant, u64)>>,
     /// 已接受的 incoming：file_id → (发送方 IP, 发送方 gateway 端口)
@@ -286,7 +367,7 @@ impl TransferEngine {
             prefix_to_file_id: TokioMutex::new(HashMap::new()),
             progress_bus: TokioMutex::new(None),
             ws_event_bus: TokioMutex::new(None),
-            progress_cache: Arc::new(Mutex::new(HashMap::new())),
+            progress_cache: Arc::new(Mutex::new(ProgressCache::new(PROGRESS_CACHE_CAP))),
             recv_speed_state: TokioMutex::new(HashMap::new()),
             incoming_endpoints: TokioMutex::new(HashMap::new()),
         }
@@ -310,13 +391,13 @@ impl TransferEngine {
 
     /// 发布一条进度：写入全量快照 + 广播给订阅方
     pub async fn publish_progress(&self, p: TransferProgress) {
-        self.progress_cache.lock().insert(p.file_id.clone(), p.clone());
+        self.progress_cache.lock().insert(p.clone());
         self.broadcast_progress(p).await;
     }
 
     /// 当前所有传输的最近进度（GET /api/transfers 数据源）
     pub fn list_transfers(&self) -> Vec<TransferProgress> {
-        self.progress_cache.lock().values().cloned().collect()
+        self.progress_cache.lock().snapshot()
     }
 
     /// 取消一个传输（file_id 可能是本机作为发送方或接收方的任务）
@@ -1201,4 +1282,93 @@ async fn http_post_json(host: &str, port: u16, path: &str, body: &str) -> std::i
         .find("\r\n\r\n")
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no header/body sep"))?;
     Ok(response_str[body_start + 4..].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    //! [`ProgressCache`] 的淘汰策略走单元测试：不碰网络、不碰 tokio，
+    //! 而这些边界（无终态可淘汰时的退化、重复 file_id 不入队）用集成测试
+    //! 很难构造出来。
+    use super::*;
+
+    fn prog(id: &str, status: TransferStatus) -> TransferProgress {
+        TransferProgress {
+            file_id: id.to_string(),
+            file_name: format!("{id}.bin"),
+            file_size: 100,
+            bytes_transferred: 0,
+            chunks_done: 0,
+            chunks_total: 1,
+            speed_bps: 0,
+            status,
+            error: None,
+            incoming: false,
+            file_path: None,
+        }
+    }
+
+    #[test]
+    fn cache_keeps_everything_below_cap() {
+        let mut c = ProgressCache::new(3);
+        c.insert(prog("a", TransferStatus::InProgress));
+        c.insert(prog("b", TransferStatus::InProgress));
+        assert_eq!(c.snapshot().len(), 2);
+    }
+
+    /// 超上限后总数压回 cap，且最新一条必然还在
+    #[test]
+    fn cache_trims_to_cap_and_keeps_newest() {
+        let mut c = ProgressCache::new(3);
+        for id in ["a", "b", "c", "d", "e"] {
+            c.insert(prog(id, TransferStatus::InProgress));
+        }
+        assert_eq!(c.snapshot().len(), 3);
+        assert!(c.map.contains_key("e"), "刚插入的不该被淘汰");
+        assert!(!c.map.contains_key("a"), "最早的应被淘汰");
+    }
+
+    /// 优先淘汰终态：终态条目即使比进行中的条目新，也先被丢掉
+    #[test]
+    fn cache_prefers_evicting_terminal_entries() {
+        let mut c = ProgressCache::new(2);
+        c.insert(prog("old-running", TransferStatus::InProgress));
+        c.insert(prog("done", TransferStatus::Completed));
+        c.insert(prog("new-running", TransferStatus::InProgress));
+
+        assert!(c.map.contains_key("old-running"), "进行中的老条目应保留");
+        assert!(!c.map.contains_key("done"), "终态应优先被淘汰");
+        assert!(c.map.contains_key("new-running"));
+    }
+
+    /// 全是进行中时必须仍能降回上限，不能卡死在超限状态
+    #[test]
+    fn cache_falls_back_to_oldest_when_nothing_is_terminal() {
+        let mut c = ProgressCache::new(2);
+        for id in ["a", "b", "c", "d"] {
+            c.insert(prog(id, TransferStatus::Pending));
+        }
+        assert_eq!(c.snapshot().len(), 2, "无终态可淘汰时也必须降回上限");
+        assert!(c.map.contains_key("d"));
+        assert!(!c.map.contains_key("a"));
+    }
+
+    /// 同一 file_id 反复更新只入队一次，否则队列膨胀且淘汰顺序错乱
+    #[test]
+    fn repeated_file_id_is_not_requeued() {
+        let mut c = ProgressCache::new(10);
+        for _ in 0..5 {
+            c.insert(prog("same", TransferStatus::InProgress));
+        }
+        assert_eq!(c.order.len(), 1, "同一 file_id 只应入队一次");
+        assert_eq!(c.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn is_terminal_matches_only_final_states() {
+        assert!(is_terminal(&TransferStatus::Completed));
+        assert!(is_terminal(&TransferStatus::Failed));
+        assert!(is_terminal(&TransferStatus::Canceled));
+        assert!(!is_terminal(&TransferStatus::Pending));
+        assert!(!is_terminal(&TransferStatus::InProgress));
+    }
 }
