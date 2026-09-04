@@ -4,7 +4,12 @@
 //! - 每个传输任务在 receive_dir 下创建 `<file_id>.part` 临时文件
 //! - 各 chunk 通过定位写（seek + write）写入正确偏移
 //! - 全部 chunk 完成 + 校验通过后，原子重命名为最终文件名
-//! - 失败可保留 .part 用于断点续传
+//! - 中止（abort）时保留 .part 文件
+//!
+//! TODO: 保留 .part **不等于**支持断点续传。槽位与 chunk 完成位图只存在于
+//! 内存，进程重启即丢失，重启后这些 .part 无法被识别、也无人认领。
+//! 要真正续传，得先把槽位元数据落盘（含 chunk_size、位图、原 file_id），
+//! 详见方案 N2 / N3。在此之前 .part 只作为失败排查的现场。
 
 use crate::Result;
 use std::collections::HashMap;
@@ -278,7 +283,11 @@ impl StorageManager {
         Ok(())
     }
 
-    /// 中止接收：移除槽位，保留 .part 文件（断点续传预留）
+    /// 中止接收：移除槽位（不再接受该文件的 chunk），**保留 .part 文件**。
+    ///
+    /// 注意这里只移除内存里的槽位，不删磁盘文件。保留下来是为了事后排查
+    /// 传输失败的原因（落盘内容、偏移都对不对）。
+    /// 它不是断点续传的基础——位图随槽位一起没了，重启后无从续起，见文件头 TODO。
     pub async fn abort(&self, file_id: &str) -> Option<ReceiveSlot> {
         self.slots.lock().await.remove(file_id)
     }

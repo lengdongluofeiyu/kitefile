@@ -3,9 +3,16 @@
 //! 设计要点：
 //! 1. 文件分块（chunk_size 默认 16MB），并行流数量默认 = min(CPU, 8)
 //! 2. 每条数据流负责不同的 chunk，独立 TCP 连接
-//! 3. 背压：使用 bounded channel 限制内存占用
-//! 4. 校验：每 chunk xxhash3 校验 + 整文件 sha256
-//! 5. 断点续传：维护每文件已完成的 chunk_id 集合，重启后只传未完成的
+//! 3. 背压：进度事件走**有界** channel（容量见 `PROGRESS_CHANNEL_CAP`）。
+//!    进行中的进度用 `try_send`（满了就丢，不阻塞发送主循环），
+//!    终态用 `send().await` 确保送达——否则 UI 会永远停在 99%。
+//! 4. 校验：目前只有「整文件 sha256」一道。发送方边传边算，传完后经
+//!    `POST /api/verify/:file_id` 补发给接收方，由接收方 finalize 时比对。
+//!    TODO: chunk 级校验尚未实现——`DataFrameHeader` 只有 4 个字段，
+//!    没有 checksum 位。现状下单块数据损坏只有整文件 sha256 能发现，
+//!    而发现之后只能整体重传。阶段 5b 上加密后，认证标签会顺带补上这一层。
+//! 5. TODO: 断点续传尚未实现。chunk 完成位图只在内存里，进程重启即丢失，
+//!    发送方也没有获知旧 file_id 的渠道。详见方案 N2 / N3。
 //! 6. 接收方需先弹窗确认（HTTP offer/accept 握手）才开始 TCP 数据流
 //!
 //! 跨平台实现：使用 `Seek + Read`，不依赖平台专属零拷贝 API。

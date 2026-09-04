@@ -1,15 +1,25 @@
 //! 传输协议：握手消息 + 数据帧格式
 //!
-//! 协议设计：
-//! 1. 控制通道（单条 TCP）：发送 offer/ack/resume 等控制消息（JSON 行）
-//! 2. 数据通道（N 条 TCP，并行）：传输分块二进制
+//! 协议分两条通道：
+//! 1. **控制通道 = HTTP**（复用 7878 网关）。offer / accept / reject / cancel /
+//!    verify 都是普通 HTTP 请求，没有自定义的 TCP 控制连接——握手要双向跨机
+//!    调用，走 HTTP 能直接复用网关已有的路由与访问分级。
+//!    完整时序见 [`HttpOffer`] 的文档注释。
+//! 2. **数据通道 = N 条并行 TCP**（默认 7879），只传分块二进制，见 [`DataFrameHeader`]。
 //!
-//! 握手示例：
+//! 握手请求体示例（`POST /api/incoming`，字段以 [`HttpOffer`] 为准）：
 //! ```json
-//! {"version":1,"type":"offer","file_name":"a.mp4","file_size":10737418240,
-//!  "file_id":"uuid","chunk_size":16777216,"chunk_count":640,
-//!  "sha256":"abc...","resume_token":null}
+//! {"file_id":"uuid","file_name":"a.mp4","file_size":10737418240,
+//!  "sha256":null,"sha256_deferred":true,
+//!  "from_id":"dev-1","from_name":"laptop","from_ip":"192.168.1.5",
+//!  "from_gateway_port":7878,"from_transfer_port":7879}
 //! ```
+//!
+//! 两点容易看错，说明一下：
+//! - `sha256` 常为 null 且 `sha256_deferred=true`：整文件哈希由发送方边传边算，
+//!   全部 chunk 发完后经 `POST /api/verify/:file_id` 补发，大文件的弹窗不等它。
+//! - 请求体里**没有** `chunk_size`：分块大小目前是发送方的本地配置，不随 offer
+//!   协商。两端配置不一致会静默产生错位数据，详见方案 N2。
 
 use serde::{Deserialize, Serialize};
 
