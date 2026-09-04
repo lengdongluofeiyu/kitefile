@@ -370,12 +370,34 @@ $env:TMP  = $env:TEMP
 
 ### 阶段 2 · Gateway 止血
 
-| 项 | 内容 |
+**状态**：✅ 已完成并提交。31 项测试全绿，两端 `flutter analyze` 均无问题。
+
+**已落地的四项**
+
+| 项 | 落地位置 |
 |---|---|
-| 2.1 | **改 `axum::serve` 注入 `ConnectInfo<SocketAddr>`**（N1，先做，否则后面全白搭） |
-| 2.2 | 删掉整个 `CorsLayer`（`gateway.rs:120`、`.layer(cors)`、`Any` import） |
-| 2.3 | 加 `allow_remote_admin` 配置（默认 false）+ `--remote-admin` 命令行开关 |
-| 2.4 | 分级 middleware，按 **(Method, Path)** 匹配；取不到 ConnectInfo → 拒绝 |
+| 2.1 ConnectInfo 注入（N1） | `run()` 改用 `into_make_service_with_connect_info::<SocketAddr>()` |
+| 2.2 删 CORS | `CorsLayer` 及其 import 全删；`tower-http` 依赖零使用后一并移除 |
+| 2.3 `allow_remote_admin` | `EngineConfig::allow_remote_admin`（默认 false）+ `cli.rs daemon --remote-admin` |
+| 2.4 分级 middleware | `classify()` + `access_guard()`，经 `route_layer` 挂载 |
+
+#### 三个实现上的判断（与原文案略有出入，说明一下）
+
+**1. 用 `route_layer` 而不是 `.layer()`。**
+`route_layer` 只对**已注册的路由**生效，404 / 405 的请求根本不进 middleware。
+换成 `.layer()` 会对所有请求生效（含 404），反而多一个面。
+这顺带把 N10「表外请求默认策略」收敛掉了：未注册方法（如 `PUT /api/send`）
+在路由层就被 405 挡下，到不了 middleware。
+
+**2. 分级表保持闭合。**
+原文案的分级表没列 `GET /`。已补上并标 LocalOnly——当前它只返回一行提示文本，
+但显式登记能让"表里缺一条"和"新增路由忘了登记"区分开：
+前者是设计选择，后者是真遗漏，日志里的措辞不该把两者混为一谈。
+将来若在这里挂 Web 前端静态资源，需要改判为 Remote。
+
+**3. 403 响应体带上了开关名。**
+被拒时返回 `"该接口仅限本机访问。若需从其他设备控制本机，请用 --remote-admin 启动守护进程。"`。
+局域网里排查问题的人不一定能看到服务端的 `warn!` 日志，提示得跟着响应走。
 
 **修订后的分级表**（含 N4 修正）
 

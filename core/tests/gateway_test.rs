@@ -942,13 +942,16 @@ async fn test_remote_access_blocked_by_policy() {
         eprintln!("SKIP test_remote_access_blocked_by_policy: 无可用非回环地址");
         return;
     };
-    if tokio::net::TcpStream::connect((ip.as_str(), 18030)).await.is_err() {
-        eprintln!("SKIP test_remote_access_blocked_by_policy: 无法从 {ip} 连到网关");
-        return;
-    }
-
+    // 探测必须在 start_stack 之后：网关还没监听时 connect 必然失败，
+    // 放在前面会让这个测试永远走 SKIP 分支，等于没跑。
     let dir = temp_dir("remote-policy");
     let _s = start_stack(18030, 18130, &dir, 65536, 2).await;
+
+    if tokio::net::TcpStream::connect((ip.as_str(), 18030)).await.is_err() {
+        eprintln!("SKIP test_remote_access_blocked_by_policy: 无法从 {ip} 连到网关");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
 
     // Remote 档：放行
     let (status, _) = http_to(&ip, 18030, "GET", "/api/whoami", None).await;
@@ -988,13 +991,14 @@ async fn test_remote_admin_opens_local_only_routes() {
         eprintln!("SKIP test_remote_admin_opens_local_only_routes: 无可用非回环地址");
         return;
     };
-    if tokio::net::TcpStream::connect((ip.as_str(), 18031)).await.is_err() {
-        eprintln!("SKIP test_remote_admin_opens_local_only_routes: 无法从 {ip} 连到网关");
-        return;
-    }
-
     let dir = temp_dir("remote-admin-on");
     let _s = start_stack_with(18031, 18131, &dir, 65536, 2, true).await;
+
+    if tokio::net::TcpStream::connect((ip.as_str(), 18031)).await.is_err() {
+        eprintln!("SKIP test_remote_admin_opens_local_only_routes: 无法从 {ip} 连到网关");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
 
     let (status, _) = http_to(&ip, 18031, "GET", "/api/transfers", None).await;
     assert_eq!(status, 200, "开了 --remote-admin 后应放行");
