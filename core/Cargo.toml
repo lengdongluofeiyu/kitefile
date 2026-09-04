@@ -34,7 +34,9 @@ serde_json = "1"
 
 # Hashing / checksums
 sha2 = "0.10"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# 注：xxhash-rust（xxh3）已移除——它从未被真正调用过。文件头注释里
+# 「每 chunk xxhash3 校验」描述的是一个并不存在的功能（见阶段 3b）。
+# chunk 级校验若要做，阶段 5b 会随加密的认证标签一起补上。
 
 # Logging
 tracing = "0.1"
@@ -46,9 +48,10 @@ anyhow = "1"
 
 # Utilities
 uuid = { version = "1", features = ["v4"] }
-bytes = "1"
+# 注：bytes 与 dashmap 已移除，src/ 下零使用（当初按"大概会用到"先加的）。
+# 判断依赖是否真的在用，别用裸字符串 grep——`to_le_bytes` 这类方法名
+# 会让 "bytes" 看起来像在用。要按 `bytes::` / `Bytes` / `dashmap::` 匹配。
 parking_lot = "0.12"
-dashmap = "6"
 if-addrs = "0.13"
 tokio-util = { version = "0.7", features = ["io"] }
 

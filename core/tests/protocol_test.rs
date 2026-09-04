@@ -30,44 +30,62 @@ fn test_dataframe_header_too_short() {
 
 #[test]
 fn test_control_message_roundtrip() {
-    let msgs = vec![
-        ControlMessage::Offer {
-            version: 1,
-            file_name: "a.mp4".into(),
-            file_size: 1024,
-            file_id: "uuid-1".into(),
-            chunk_size: 16 * 1024 * 1024,
-            chunk_count: 1,
-            sha256: "abc".into(),
-            resume_token: None,
-        },
+    // 数据通道上目前只有 ChunkAck 一种消息，握手全部走 HTTP。
+    let acks = vec![
         ControlMessage::ChunkAck {
             file_id: "uuid-1".into(),
             chunk_id: 7,
             ok: true,
         },
-        ControlMessage::Cancel {
-            file_id: "uuid-1".into(),
-            reason: "user canceled".into(),
+        // ok=false：接收方告知这一块没写成功，发送方据此判失败
+        ControlMessage::ChunkAck {
+            file_id: "uuid-2".into(),
+            chunk_id: 0,
+            ok: false,
         },
     ];
-    for m in &msgs {
+    for m in &acks {
         let line = m.to_line().unwrap();
-        assert!(line.ends_with('\n'));
+        assert!(line.ends_with('\n'), "行协议必须以换行结尾");
         let back = ControlMessage::from_line(&line).unwrap();
+        // 往返要连 chunk_id、ok 一起对上——只比 file_id 的话，
+        // 这两个字段的序列化 bug 会溜过去。
         match (m, back) {
-            (ControlMessage::Offer { file_id: a, .. }, ControlMessage::Offer { file_id: b, .. })
-            | (
-                ControlMessage::ChunkAck { file_id: a, .. },
-                ControlMessage::ChunkAck { file_id: b, .. },
-            )
-            | (
-                ControlMessage::Cancel { file_id: a, .. },
-                ControlMessage::Cancel { file_id: b, .. },
-            ) => assert_eq!(a, &b),
-            _ => panic!("variant mismatch"),
+            (
+                ControlMessage::ChunkAck {
+                    file_id: a,
+                    chunk_id: ca,
+                    ok: oa,
+                },
+                ControlMessage::ChunkAck {
+                    file_id: b,
+                    chunk_id: cb,
+                    ok: ob,
+                },
+            ) => {
+                assert_eq!(a, &b);
+                assert_eq!(ca, &cb);
+                assert_eq!(oa, &ob);
+            }
         }
     }
+}
+
+/// 线格式锁：`{"type":"chunk_ack",...}` 是跨版本契约，
+/// 改了 serde 的 tag / rename 配置就会让新旧版本互相解析不了。
+#[test]
+fn test_chunk_ack_wire_format() {
+    let line = ControlMessage::ChunkAck {
+        file_id: "f".into(),
+        chunk_id: 3,
+        ok: true,
+    }
+    .to_line()
+    .unwrap();
+    assert!(
+        line.contains("\"type\":\"chunk_ack\""),
+        "线格式变了会影响跨版本兼容：{line}"
+    );
 }
 
 #[test]

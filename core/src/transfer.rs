@@ -699,29 +699,6 @@ impl TransferEngine {
         Ok(())
     }
 
-    /// 接收方 daemon 收到发送方 POST /api/incoming 时调用
-    pub async fn handle_incoming_offer(&self, offer: HttpOffer) -> IncomingEntry {
-        let entry = self.incoming.register(offer);
-        // 推 WebSocket 事件给 UI
-        self.broadcast_ws_event(WsEvent::Incoming {
-            entry: entry.clone(),
-        })
-        .await;
-
-        // 同步等待 UI 决策（30 秒超时自动 reject）
-        let incoming_id = entry.incoming_id.clone();
-        let accepted = self.incoming.wait_decision(&incoming_id).await;
-
-        // 推 IncomingResolved 让 UI 关闭弹窗
-        self.broadcast_ws_event(WsEvent::IncomingResolved {
-            incoming_id: incoming_id.clone(),
-            accepted: accepted.unwrap_or(false),
-        })
-        .await;
-
-        entry
-    }
-
     /// UI 决策后调用
     pub async fn decide_incoming(&self, incoming_id: &str, accept: bool) -> Option<IncomingEntry> {
         let entry = self.incoming.decide(incoming_id, accept).await?;

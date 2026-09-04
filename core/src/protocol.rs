@@ -27,50 +27,26 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const SERVICE_TYPE: &str = "_ftcore._tcp.local.";
 
 /// 控制消息
+///
+/// 数据通道上目前只跑一种：接收方给发送方的 chunk 确认（[`ControlMessage::ChunkAck`]）。
+/// 握手（offer / accept / reject / cancel / verify）全部走 HTTP，见文件头说明。
+///
+/// 保留 enum 而不是退化成裸 struct，是为了将来加消息类型时不用改函数签名。
+/// 这里原先还有 Offer / Accept / Reject / Complete / Cancel 五个变体，
+/// 对应"单条 TCP 控制通道"的早期设计，从未被调用过（含 resume_token），已删除。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
-    /// 发送方 → 接收方：发起传输提议
-    Offer {
-        version: u32,
-        file_name: String,
-        file_size: u64,
-        file_id: String,
-        chunk_size: usize,
-        chunk_count: u64,
-        sha256: String,
-        resume_token: Option<String>,
-    },
-    /// 接收方 → 发送方：接受提议
-    Accept {
-        file_id: String,
-        transfer_port: u16,
-        parallel_streams: usize,
-    },
-    /// 接收方 → 发送方：拒绝
-    Reject {
-        file_id: String,
-        reason: String,
-    },
     /// 接收方 → 发送方：单个 chunk 接收确认
     ChunkAck {
         file_id: String,
         chunk_id: u64,
         ok: bool,
     },
-    /// 发送方 → 接收方：整文件完成
-    Complete {
-        file_id: String,
-    },
-    /// 任意一方：取消传输
-    Cancel {
-        file_id: String,
-        reason: String,
-    },
 }
 
 impl ControlMessage {
-    /// 序列化为一行 JSON（以 \n 结尾），用于控制通道
+    /// 序列化为一行 JSON（以 \n 结尾），用于数据通道上的 ChunkAck
     pub fn to_line(&self) -> anyhow::Result<String> {
         let mut s = serde_json::to_string(self)?;
         s.push('\n');
