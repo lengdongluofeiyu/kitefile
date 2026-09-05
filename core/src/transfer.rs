@@ -1064,12 +1064,15 @@ impl TransferEngine {
             let bytes_done = bytes_done.clone();
             let chunks_done = chunks_done.clone();
             let file_path = file_path.clone();
-            let cancel_rx = cancel_rx.clone();
+            // mut：send_chunk 需要 &mut 来订阅取消信号（watch::Receiver::changed 要 &mut self）
+            let mut cancel_rx = cancel_rx.clone();
             let file_id_for_err = file_id.clone();
             let file_name_for_err = file_name.clone();
             let file_size_for_err = file_size;
 
             let handle = tokio::spawn(async move {
+                // 按块大小算一次，循环里复用
+                let ack_timeout = ack_timeout_for(chunk_size);
                 let mut chunk_id = stream_idx as u64;
                 while chunk_id < chunk_count {
                     if *cancel_rx.borrow() {
@@ -1109,7 +1112,7 @@ impl TransferEngine {
                         data_len: buf.len() as u32,
                         _reserved: 0,
                     };
-                    send_chunk(stream, &header, &buf).await?;
+                    send_chunk(stream, &header, &buf, ack_timeout, &mut cancel_rx).await?;
 
                     bytes_done.fetch_add(buf.len() as u64, Ordering::Relaxed);
                     chunks_done.fetch_add(1, Ordering::Relaxed);
@@ -1162,12 +1165,29 @@ impl TransferEngine {
     }
 }
 
+/// chunk ACK 的超时时间：按块大小给，而不是一刀切。
+///
+/// 固定值会让慢设备误判——老安卓机写 eMMC、接收目录挂在 USB2.0 移动硬盘上时，
+/// 16MB 可能写超过 20s。**误判失败 = 功能不可用，多等几秒只是体感。**
+///
+/// 参考值：16MB → 21s，64MB → 69s，小于 1MB → 6s。
+fn ack_timeout_for(chunk_size: usize) -> Duration {
+    let mb = (chunk_size as u64) / (1024 * 1024);
+    Duration::from_secs(5 + mb.max(1))
+}
+
 /// 发送单个 chunk：写 header + data → 等待接收方落盘 ACK。
 ///
 /// 数据写入 TCP 缓冲 ≠ 对端已收到并写入磁盘。
 /// 只有读到接收方的 ChunkAck（chunk_id 匹配且 ok=true）才算发送成功，
-/// 否则（连接断开 / 超时 / ACK 异常）视为失败，由上层把整次传输标记为 Failed。
-async fn send_chunk(mut stream: TcpStream, header: &DataFrameHeader, data: &[u8]) -> Result<()> {
+/// 否则（连接断开 / 超时 / ACK 异常 / 用户取消）视为失败。
+async fn send_chunk(
+    mut stream: TcpStream,
+    header: &DataFrameHeader,
+    data: &[u8],
+    ack_timeout: Duration,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<()> {
     stream
         .write_all(&header.to_bytes())
         .await
@@ -1181,17 +1201,31 @@ async fn send_chunk(mut stream: TcpStream, header: &DataFrameHeader, data: &[u8]
         .await
         .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
 
-    // 等待接收方 ACK（写盘完成才回 ACK；出错时对端不发 ACK、直接断开）
-    // read_until 属于 AsyncBufReadExt，需要包一层 BufReader
+    // 等待接收方 ACK（写盘完成才回 ACK；出错时对端不发 ACK、直接断开）。
+    // read_until 属于 AsyncBufReadExt，需要包一层 BufReader。
+    //
+    // 这里三路并发，谁先到算谁：
+    //   1. 读到 ACK —— 正常路径
+    //   2. 超时     —— 判定对端失联
+    //   3. 取消     —— 立即返回
+    //
+    // 第 3 路是这段代码的重点，也是本阶段最重要的修复：
+    // 光把超时从 60s 缩到 20s，用户点取消后界面仍要等满整个窗口才动，
+    // 那是功能缺陷而不是体感问题。
+    // **超时值只决定多久判定对端失联，select! 才决定取消多久生效——两件事正交。**
     let mut reader = tokio::io::BufReader::new(stream);
     let mut ack_line = Vec::new();
-    let n = tokio::time::timeout(
-        Duration::from_secs(60),
-        reader.read_until(b'\n', &mut ack_line),
-    )
-    .await
-    .map_err(|_| crate::CoreError::Transfer("timeout waiting chunk ack".into()))?
-    .map_err(|e| crate::CoreError::Transfer(format!("read chunk ack: {}", e)))?;
+    let n = tokio::select! {
+        r = tokio::time::timeout(ack_timeout, reader.read_until(b'\n', &mut ack_line)) => {
+            r.map_err(|_| crate::CoreError::Transfer(format!(
+                "timeout waiting chunk ack ({}s)", ack_timeout.as_secs()
+            )))?
+            .map_err(|e| crate::CoreError::Transfer(format!("read chunk ack: {}", e)))?
+        }
+        _ = cancel_rx.changed() => {
+            return Err(crate::CoreError::Transfer("canceled".into()));
+        }
+    };
     if n == 0 {
         return Err(crate::CoreError::Transfer(
             "connection closed before chunk ack".into(),
@@ -1352,5 +1386,65 @@ mod tests {
         assert!(is_terminal(&TransferStatus::Canceled));
         assert!(!is_terminal(&TransferStatus::Pending));
         assert!(!is_terminal(&TransferStatus::InProgress));
+    }
+
+    /// 超时按块大小给：16MB→21s，64MB→69s，小于 1MB→6s。
+    ///
+    /// 固定值会让慢设备（老安卓 eMMC、USB2.0 硬盘）被误判失败，
+    /// 而误判失败是功能不可用，多等几秒只是体感。
+    #[test]
+    fn ack_timeout_scales_with_chunk_size() {
+        assert_eq!(ack_timeout_for(16 * 1024 * 1024).as_secs(), 21);
+        assert_eq!(ack_timeout_for(64 * 1024 * 1024).as_secs(), 69);
+        assert_eq!(ack_timeout_for(64 * 1024).as_secs(), 6, "小于 1MB 按 1MB 算");
+        assert_eq!(ack_timeout_for(1024).as_secs(), 6);
+    }
+
+    /// 取消必须是**立即**生效的，而不是等满 ACK 超时窗口。
+    ///
+    /// 这条测试锁住本阶段最重要的修复：对端故意永不回 ACK，
+    /// 此时若没有 `select!` 取消分支，调用会一直卡到超时（这里是 30s）才返回，
+    /// 用户点了取消界面却纹丝不动——那是功能缺陷，不是体感问题。
+    #[tokio::test]
+    async fn send_chunk_cancel_takes_effect_immediately() {
+        // 起一个接受连接但**永不回 ACK** 的对端，模拟"对端卡住"
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            // 持有连接不读写，让发送方永远等不到 ACK
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let header = DataFrameHeader {
+            file_id_prefix: 1,
+            chunk_id: 0,
+            data_len: 4,
+            _reserved: 0,
+        };
+
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = cancel_tx.send(true);
+        });
+
+        let start = Instant::now();
+        let r = send_chunk(
+            stream,
+            &header,
+            b"test",
+            Duration::from_secs(30), // 故意给一个很长的超时
+            &mut cancel_rx,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(r.is_err(), "取消后应返回错误而不是成功");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "取消应在 2 秒内生效，实际耗时 {elapsed:?}——说明又在等超时窗口了"
+        );
     }
 }
