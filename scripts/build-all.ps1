@@ -25,6 +25,39 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# ===== BOM 自愈 =====
+# 本文件已两次出现「重复 BOM」（开头叠了两个 EF BB BF），会让部分工具把首行解析错。
+# 根因**尚未定位**——已实测排除两种常见嫌疑：
+#   1) PowerShell 5.1 的 Set-Content / Out-File（Get-Content 会识别并剥离原 BOM，
+#      写出来仍是单个 BOM，不会叠加）
+#   2) 常规编辑器写入（同样的单 BOM 结果）
+# 所以这里不做阻断式报错（那只会每次卡住构建、逼人手动修），
+# 而是自动修掉并留痕：构建照常进行，问题记在警告里，将来排查有线索。
+$BomBytes = [byte[]](0xEF, 0xBB, 0xBF)
+$SelfPath = $MyInvocation.MyCommand.Path
+if ($SelfPath -and (Test-Path $SelfPath)) {
+    $AllBytes = [System.IO.File]::ReadAllBytes($SelfPath)
+    $BomCount = 0
+    while ((($BomCount + 1) * 3) -le $AllBytes.Length) {
+        $IsBom = $true
+        for ($i = 0; $i -lt 3; $i++) {
+            if ($AllBytes[($BomCount * 3) + $i] -ne $BomBytes[$i]) { $IsBom = $false; break }
+        }
+        if (-not $IsBom) { break }
+        $BomCount++
+    }
+    if ($BomCount -eq 0) {
+        Write-Host '[BOM] 警告：脚本缺少 BOM，中文注释可能被 PowerShell 5.1 按 ANSI 解码而乱码' -ForegroundColor Yellow
+    }
+    elseif ($BomCount -gt 1) {
+        Write-Host "[BOM] 检测到 $BomCount 个重复 BOM，已自动修复为 1 个" -ForegroundColor Yellow
+        Write-Host '[BOM] 来源未知（已排除 Set-Content 与常规编辑器写入）；若反复出现请记录触发操作' -ForegroundColor Yellow
+        $Keep = New-Object byte[] ($AllBytes.Length - (($BomCount - 1) * 3))
+        [Array]::Copy($AllBytes, ($BomCount - 1) * 3, $Keep, 0, $Keep.Length)
+        [System.IO.File]::WriteAllBytes($SelfPath, $Keep)
+    }
+}
+
 # ===== 路径与配置 =====
 $ScriptRoot   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot  = Split-Path -Parent $ScriptRoot
