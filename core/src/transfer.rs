@@ -228,6 +228,8 @@ impl IncomingManager {
             file_id: offer.file_id.clone(),
             file_name: offer.file_name,
             file_size: offer.file_size,
+            // 透传发送方的分块大小：后面建槽要用它，不能用本地配置
+            chunk_size: offer.chunk_size,
             sha256: offer.sha256,
             sha256_deferred: offer.sha256_deferred,
             from_id: offer.from_id,
@@ -691,6 +693,18 @@ impl TransferEngine {
     pub async fn decide_incoming(&self, incoming_id: &str, accept: bool) -> Option<IncomingEntry> {
         let entry = self.incoming.decide(incoming_id, accept).await?;
         if accept {
+            // 分块大小**必须**用发送方声明的值。用本地配置的话，两端配置不一致
+            // 会让 chunk 偏移整体错位，而每个块都会"成功"落盘，
+            // 只有最后的整文件 sha256 能发现，为时已晚（N2）。
+            // 对端是旧版本（未携带该字段）时回退本地配置并告警。
+            let chunk_size = entry.chunk_size.unwrap_or_else(|| {
+                warn!(
+                    file_id = %entry.file_id,
+                    local_chunk_size = self.chunk_size,
+                    "对端未携带 chunk_size（旧版本？），回退到本地配置；两端不一致会导致数据错位"
+                );
+                self.chunk_size
+            });
             // 接受：在 storage 中创建接收槽，登记 file_id_prefix 映射
             let _ = self
                 .storage
@@ -698,7 +712,7 @@ impl TransferEngine {
                     entry.file_id.clone(),
                     entry.file_name.clone(),
                     entry.file_size,
-                    self.chunk_size,
+                    chunk_size,
                     entry.sha256.clone(),
                     entry.sha256_deferred,
                 )
@@ -826,6 +840,9 @@ impl TransferEngine {
                 file_id: file_id_for_spawn.clone(),
                 file_name: file_name_for_err.clone(),
                 file_size,
+                // 把本端的分块大小告诉接收方：它必须用这个值建槽，
+                // 否则两端切片不一致会静默损坏数据（N2）
+                chunk_size: Some(chunk_size),
                 sha256: None,
                 sha256_deferred: true,
                 from_id: self_id.clone(),

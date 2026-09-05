@@ -87,6 +87,15 @@ pub struct HttpOffer {
     pub file_id: String,
     pub file_name: String,
     pub file_size: u64,
+    /// 发送方的分块大小。**接收方建槽必须用这个值，不能用本地配置**——
+    /// 两端配置不一致会让 chunk 偏移整体错位，而每个块都会"成功"落盘，
+    /// 只有最后的整文件 sha256 能发现，为时已晚（方案 N2）。
+    ///
+    /// 用 `Option` 而非 `#[serde(default)]`：旧版本 daemon 发来的 offer 没有这个字段，
+    /// 若给默认值 0，接收方会拿 0 去算偏移和 chunk_count（除零 / 全错位），
+    /// 比"字段缺失"本身危险得多。None 表示对端没说，接收方回退本地配置并告警。
+    #[serde(default)]
+    pub chunk_size: Option<usize>,
     /// 整文件 sha256（hex；可空）
     pub sha256: Option<String>,
     /// true = sha256 由发送方边传边算，全部 chunk 发完后通过
@@ -114,6 +123,10 @@ pub struct IncomingEntry {
     pub file_id: String,
     pub file_name: String,
     pub file_size: u64,
+    /// 发送方声明的分块大小（透传自 `HttpOffer::chunk_size`）。
+    /// 接受时用它建槽，不能用接收方本地配置——理由同 `HttpOffer::chunk_size`。
+    #[serde(default)]
+    pub chunk_size: Option<usize>,
     pub sha256: Option<String>,
     #[serde(default)]
     pub sha256_deferred: bool,

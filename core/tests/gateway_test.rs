@@ -1008,3 +1008,94 @@ async fn test_remote_admin_opens_local_only_routes() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// N2 回归：两端 chunk_size 配置不同时，接收方必须按**发送方**的值建槽。
+///
+/// 这是唯一一条能在合入前抓住「静默数据损坏」的测试。
+/// 两端各按本地配置切片 / 建槽时，每个 chunk 都会"成功"落盘，
+/// 偏移却是错的，只有最后的整文件 sha256 能发现——为时已晚。
+#[tokio::test]
+async fn test_chunk_size_negotiated_across_peers() {
+    require_sockets!("test_chunk_size_negotiated_across_peers");
+    let dir_a = temp_dir("chunksz-a");
+    let dir_b = temp_dir("chunksz-b");
+
+    // 关键：两端配置故意不同。A 按 64KB 切片，B 本地却是 1MB。
+    let _a = start_stack(18040, 18140, &dir_a, 65536, 2).await;
+    let _b = start_stack(18041, 18141, &dir_b, 1_048_576, 2).await;
+
+    let content = make_content(150_000);
+    let src = dir_a.join("mismatch.bin");
+    std::fs::write(&src, &content).unwrap();
+
+    let send_body = json!({
+        "target_ip": "127.0.0.1",
+        "target_port": 18141,
+        "target_gateway_port": 18041,
+        "file_path": src.to_string_lossy(),
+    })
+    .to_string();
+    let (status, body) = http(18040, "POST", "/api/send", Some(&send_body)).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let resp: Value = serde_json::from_slice(&body).unwrap();
+    let file_id = resp["file_id"].as_str().unwrap().to_string();
+
+    let v = wait_for_json(18041, "/api/incoming", 15, |v| {
+        v.as_array().map(|a| !a.is_empty()).unwrap_or(false)
+    })
+    .await;
+    let incoming_id = v[0]["incoming_id"].as_str().unwrap().to_string();
+    // 协议层：offer 必须携带发送方的 chunk_size，且接收方看得到
+    assert_eq!(
+        v[0]["chunk_size"].as_u64(),
+        Some(65536),
+        "待决条目里应是发送方声明的 chunk_size，而不是接收方本地的 1MB"
+    );
+
+    let (status, _) = http(
+        18041,
+        "POST",
+        &format!("/api/incoming/{incoming_id}/accept"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let v = wait_for_json(18041, "/api/transfers", 30, |v| {
+        find_transfer(v, &file_id)
+            .map(|t| t["status"].as_str() == Some("Completed"))
+            .unwrap_or(false)
+    })
+    .await;
+    let t = find_transfer(&v, &file_id).unwrap();
+    // 槽位按发送方的 64KB 建 → 3 块；若按本地 1MB 建则只有 1 块，
+    // 后面两个 chunk 会越界，这正是修复前的表现
+    assert_eq!(
+        t["chunks_total"].as_u64(),
+        Some(3),
+        "槽位必须按发送方的 chunk_size 建"
+    );
+
+    let got = std::fs::read(dir_b.join("mismatch.bin")).unwrap();
+    assert_eq!(got, content, "两端 chunk_size 不一致时，数据仍必须完整一致");
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// 旧版本对端发来的 offer 没有 chunk_size 字段时，应回退本地配置而不是崩掉。
+///
+/// 用 `Option` 而非 `#[serde(default)]` 就是为此：默认值 0 会让接收方
+/// 拿 0 去算偏移和 chunk_count（除零 / 全错位），比"字段缺失"本身危险得多。
+#[test]
+fn test_offer_without_chunk_size_deserializes() {
+    let body = r#"{
+        "file_id":"f1","file_name":"a.bin","file_size":1024,
+        "sha256":null,"sha256_deferred":true,
+        "from_id":"d1","from_name":"n1","from_ip":"127.0.0.1",
+        "from_gateway_port":7878,"from_transfer_port":7879
+    }"#;
+    let offer: ftcore::protocol::HttpOffer = serde_json::from_str(body).unwrap();
+    assert_eq!(offer.chunk_size, None, "旧版本 offer 没有该字段，应为 None");
+    assert_eq!(offer.file_size, 1024);
+}
