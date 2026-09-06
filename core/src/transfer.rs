@@ -1103,16 +1103,32 @@ impl TransferEngine {
                     .map_err(|e| crate::CoreError::Transfer(e.to_string()))?
                     .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
 
-                    let stream = TcpStream::connect((target_ip.as_str(), target_port))
-                        .await
-                        .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
                     let header = DataFrameHeader {
                         file_id_prefix,
                         chunk_id,
                         data_len: buf.len() as u32,
                         _reserved: 0,
                     };
-                    send_chunk(stream, &header, &buf, ack_timeout, &mut cancel_rx).await?;
+                    // 带重试的发送。三种结局：
+                    //   Ok       —— 继续下一块
+                    //   Canceled —— 静默收尾，最终状态由外层判为 Canceled
+                    //   Failed   —— 中止整条流；do_send 会把任一流的错误当整体失败
+                    match send_chunk_with_retry(
+                        &target_ip,
+                        target_port,
+                        &header,
+                        &buf,
+                        ack_timeout,
+                        &mut cancel_rx,
+                    )
+                    .await
+                    {
+                        ChunkOutcome::Ok => {}
+                        ChunkOutcome::Canceled => return Ok::<(), crate::CoreError>(()),
+                        ChunkOutcome::Failed(e) => {
+                            return Err(crate::CoreError::Transfer(e));
+                        }
+                    }
 
                     bytes_done.fetch_add(buf.len() as u64, Ordering::Relaxed);
                     chunks_done.fetch_add(1, Ordering::Relaxed);
@@ -1176,30 +1192,64 @@ fn ack_timeout_for(chunk_size: usize) -> Duration {
     Duration::from_secs(5 + mb.max(1))
 }
 
+/// 单块发送的结果。
+///
+/// 分成"可以再试"和"别试了"两类，是为了让重试循环不做无用功：
+/// 网络抖一下重发就好；但对端已经明确说"这块我没写好"，
+/// 通常是磁盘满或没权限，再试三次只是让用户多等几十秒。
+enum ChunkResult {
+    /// 发送成功（收到 chunk_id 匹配且 ok=true 的 ACK）
+    Ok,
+    /// 瞬时故障：连不上 / 写到一半断开 / 等 ACK 超时 / 连接被提前关闭。
+    /// 重发这一块是有意义的。
+    Retryable(String),
+    /// 不必重试：对端明确拒绝（ok=false）。重发不会改变结果。
+    Fatal(String),
+    /// 用户取消。既不是成功也不是故障，调用方应静默收尾。
+    ///
+    /// 单独成一个变体而不是塞进 `Fatal("canceled")`：
+    /// 否则调用方只能靠比较错误字符串来区分"取消"和"真失败"，
+    /// 而取消走的是 Canceled 终态、失败走 Failed，混在一起必然出 bug。
+    Canceled,
+}
+
+/// 单块最多尝试几次（含首次）。
+const CHUNK_MAX_ATTEMPTS: u32 = 3;
+
+/// 重试前的等待：首次立即，之后 200ms、500ms。
+/// 局域网不需要长退避——长退避只会让传输看起来卡死。
+const CHUNK_RETRY_BACKOFF_MS: [u64; 3] = [0, 200, 500];
+
+// 曾经在这里放过一个 MAX_CONSECUTIVE_CHUNK_FAILURES（连续 N 块失败才放弃），
+// 实现时删掉了，理由是它隐含了"失败就跳过这一块继续传"——而那是错的：
+// 少一块，接收方 `received_chunks` 永远凑不齐，.part 不会 finalize，
+// 发送方在 /api/verify 处必然失败。晚失败不如早失败，还省了一整个文件的传输时间。
+// 所以重试耗尽即中止整条流（进而中止整个传输，见 do_send 的错误合并）。
+
 /// 发送单个 chunk：写 header + data → 等待接收方落盘 ACK。
 ///
 /// 数据写入 TCP 缓冲 ≠ 对端已收到并写入磁盘。
-/// 只有读到接收方的 ChunkAck（chunk_id 匹配且 ok=true）才算发送成功，
-/// 否则（连接断开 / 超时 / ACK 异常 / 用户取消）视为失败。
+/// 只有读到接收方的 ChunkAck（chunk_id 匹配且 ok=true）才算发送成功。
+///
+/// 返回 [`ChunkResult`] 而不是 `Result`，是为了让调用方能区分
+/// "网络抖了可以重发"和"对端明确拒绝，重发没用"——
+/// 用统一的字符串错误类型，调用方只能瞎猜。
 async fn send_chunk(
     mut stream: TcpStream,
     header: &DataFrameHeader,
     data: &[u8],
     ack_timeout: Duration,
     cancel_rx: &mut watch::Receiver<bool>,
-) -> Result<()> {
-    stream
-        .write_all(&header.to_bytes())
-        .await
-        .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
-    stream
-        .write_all(data)
-        .await
-        .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+) -> ChunkResult {
+    if let Err(e) = stream.write_all(&header.to_bytes()).await {
+        return ChunkResult::Retryable(format!("write header: {}", e));
+    }
+    if let Err(e) = stream.write_all(data).await {
+        return ChunkResult::Retryable(format!("write data: {}", e));
+    }
+    if let Err(e) = stream.flush().await {
+        return ChunkResult::Retryable(format!("flush: {}", e));
+    }
 
     // 等待接收方 ACK（写盘完成才回 ACK；出错时对端不发 ACK、直接断开）。
     // read_until 属于 AsyncBufReadExt，需要包一层 BufReader。
@@ -1215,37 +1265,121 @@ async fn send_chunk(
     // **超时值只决定多久判定对端失联，select! 才决定取消多久生效——两件事正交。**
     let mut reader = tokio::io::BufReader::new(stream);
     let mut ack_line = Vec::new();
-    let n = tokio::select! {
-        r = tokio::time::timeout(ack_timeout, reader.read_until(b'\n', &mut ack_line)) => {
-            r.map_err(|_| crate::CoreError::Transfer(format!(
-                "timeout waiting chunk ack ({}s)", ack_timeout.as_secs()
-            )))?
-            .map_err(|e| crate::CoreError::Transfer(format!("read chunk ack: {}", e)))?
-        }
+    let timeout_result = tokio::select! {
+        r = tokio::time::timeout(ack_timeout, reader.read_until(b'\n', &mut ack_line)) => r,
         _ = cancel_rx.changed() => {
-            return Err(crate::CoreError::Transfer("canceled".into()));
+            // 用户取消：不重试，直接结束
+            return ChunkResult::Canceled;
         }
     };
+    let n = match timeout_result {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return ChunkResult::Retryable(format!("read chunk ack: {}", e)),
+        Err(_) => {
+            return ChunkResult::Retryable(format!(
+                "timeout waiting chunk ack ({}s)",
+                ack_timeout.as_secs()
+            ))
+        }
+    };
+    // 对端直接断开。注意接收端写盘失败时也是"不发 ACK、直接断开"，
+    // 发送端无从区分，所以按可重试处理——真要是持久故障，
+    // 这种失败返回得很快（不会各等满一次超时），三次很快耗尽。
     if n == 0 {
-        return Err(crate::CoreError::Transfer(
-            "connection closed before chunk ack".into(),
-        ));
+        return ChunkResult::Retryable("connection closed before chunk ack".into());
     }
-    let ack = crate::protocol::ControlMessage::from_line(&String::from_utf8_lossy(&ack_line))
-        .map_err(|e| crate::CoreError::Transfer(format!("parse chunk ack: {}", e)))?;
+    let ack = match crate::protocol::ControlMessage::from_line(&String::from_utf8_lossy(&ack_line))
+    {
+        Ok(a) => a,
+        Err(e) => return ChunkResult::Retryable(format!("parse chunk ack: {}", e)),
+    };
     match ack {
         crate::protocol::ControlMessage::ChunkAck { chunk_id, ok, .. }
             if chunk_id == header.chunk_id && ok =>
         {
-            Ok(())
+            ChunkResult::Ok
         }
         // ChunkAck 是目前唯一的变体，所以这里已经穷尽，不再需要 `_` 兜底。
         // 将来若新增控制消息，编译器会因 match 非穷尽而报错——
         // 这正是想要的：逼着你去想新消息当 chunk ack 收到时该怎么办。
-        crate::protocol::ControlMessage::ChunkAck { chunk_id, ok, .. } => Err(
-            crate::CoreError::Transfer(format!("chunk {} rejected by receiver (ok={})", chunk_id, ok)),
+        //
+        // ok=false 是**对端明确拒绝**（写盘失败 / 无权限），
+        // 归入 Fatal：重发同一块不会让磁盘突然有空间。
+        crate::protocol::ControlMessage::ChunkAck { chunk_id, ok, .. } => ChunkResult::Fatal(
+            format!("chunk {} rejected by receiver (ok={})", chunk_id, ok),
         ),
     }
+}
+
+/// 重试循环结束后，单块的最终结局。
+///
+/// 和 [`ChunkResult`] 的区别：这一层已经把"可重试"消化掉了——
+/// 能重试的都试过了还失败，跟"对端明确拒绝"一样是没救，统一进 `Failed`。
+#[derive(Debug)]
+enum ChunkOutcome {
+    Ok,
+    /// 用户取消，调用方应静默收尾（最终状态是 Canceled，不是 Failed）
+    Canceled,
+    /// 重试耗尽，或对端明确拒绝
+    Failed(String),
+}
+
+/// 发送单个 chunk，可重试的失败最多重试到 [`CHUNK_MAX_ATTEMPTS`] 次。
+///
+/// **每次尝试都新建一条 TCP 连接**（当前不做连接复用），所以重试是幂等的：
+/// `chunk_id` 不变，接收端按 `chunk_id × chunk_size` 算偏移覆盖写同一块区，
+/// `received_chunks[chunk_id]` 也只是把已置位的布尔再置一次。
+/// 即使上一块其实已经落盘、只是 ACK 在路上丢了，重发也只是原样再写一遍。
+///
+/// 反过来，这也意味着**不能跳过失败的块继续传**：少一块，接收端永远凑不齐，
+/// `.part` 不会 finalize，最后 /api/verify 必然失败。所以重试耗尽就中止。
+async fn send_chunk_with_retry(
+    target_ip: &str,
+    target_port: u16,
+    header: &DataFrameHeader,
+    data: &[u8],
+    ack_timeout: Duration,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> ChunkOutcome {
+    let mut last_err = String::from("no attempt made");
+    for attempt in 0..CHUNK_MAX_ATTEMPTS {
+        // 退避期间也要响应取消：否则用户在重试间隔点取消，
+        // 要等退避走完才会被下一次尝试的 select! 捕获。
+        let backoff_ms = CHUNK_RETRY_BACKOFF_MS
+            .get(attempt as usize)
+            .copied()
+            .unwrap_or(500);
+        if backoff_ms > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                _ = cancel_rx.changed() => return ChunkOutcome::Canceled,
+            }
+        }
+
+        let stream = match TcpStream::connect((target_ip, target_port)).await {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = format!("connect {}:{}: {}", target_ip, target_port, e);
+                warn!(chunk = header.chunk_id, attempt, error = %e, "connect failed, will retry");
+                continue;
+            }
+        };
+
+        match send_chunk(stream, header, data, ack_timeout, cancel_rx).await {
+            ChunkResult::Ok => return ChunkOutcome::Ok,
+            ChunkResult::Canceled => return ChunkOutcome::Canceled,
+            // 对端明确拒绝（ok=false）：再试不会让磁盘突然有空间
+            ChunkResult::Fatal(e) => return ChunkOutcome::Failed(e),
+            ChunkResult::Retryable(e) => {
+                warn!(chunk = header.chunk_id, attempt, error = %e, "chunk send failed, will retry");
+                last_err = e;
+            }
+        }
+    }
+    ChunkOutcome::Failed(format!(
+        "chunk {} failed after {} attempts: {}",
+        header.chunk_id, CHUNK_MAX_ATTEMPTS, last_err
+    ))
 }
 
 /// 通过 UDP connect 让 OS 路由决策选出「通往 target 的本机源 IP」。
@@ -1441,10 +1575,207 @@ mod tests {
         .await;
         let elapsed = start.elapsed();
 
-        assert!(r.is_err(), "取消后应返回错误而不是成功");
+        assert!(
+            matches!(r, ChunkResult::Canceled),
+            "取消后应返回 Canceled，实际是别的结局"
+        );
         assert!(
             elapsed < Duration::from_secs(2),
             "取消应在 2 秒内生效，实际耗时 {elapsed:?}——说明又在等超时窗口了"
+        );
+    }
+
+    /// ok=false 是"对端明确拒绝"，必须归为不可重试。
+    ///
+    /// 否则重试循环会为一次磁盘写满白等三次（按 16MB 块算约 63 秒），
+    /// 最后还是失败——这段时间用户只看到进度条卡住。
+    #[tokio::test]
+    async fn ack_ok_false_is_fatal_not_retryable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // 读掉请求（24B header + 4B data），然后回一个 ok=false 的 ACK
+            let mut buf = vec![0u8; 24 + 4];
+            let _ = tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await;
+            let ack = crate::protocol::ControlMessage::ChunkAck {
+                file_id: "f".into(),
+                chunk_id: 0,
+                ok: false,
+            };
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, ack.to_line().unwrap().as_bytes()).await;
+            let _ = tokio::io::AsyncWriteExt::flush(&mut stream).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let header = DataFrameHeader {
+            file_id_prefix: 1,
+            chunk_id: 0,
+            data_len: 4,
+            _reserved: 0,
+        };
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let r = send_chunk(
+            stream,
+            &header,
+            b"test",
+            Duration::from_secs(5),
+            &mut cancel_rx,
+        )
+        .await;
+        assert!(
+            matches!(r, ChunkResult::Fatal(_)),
+            "ok=false 必须是 Fatal（不可重试），实际是别的结局"
+        );
+    }
+
+    /// 重试循环：可重试的失败应当被重试到上限，且耗尽后返回 Failed。
+    ///
+    /// 这里用一个"连不上"的地址（端口 0）来制造可重试失败——
+    /// 它比构造"写到一半断开"稳定得多，而且同样能验证重试次数与退避。
+    #[tokio::test]
+    async fn retry_exhausts_then_fails() {
+        let header = DataFrameHeader {
+            file_id_prefix: 1,
+            chunk_id: 7,
+            data_len: 4,
+            _reserved: 0,
+        };
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let start = Instant::now();
+        let out = send_chunk_with_retry(
+            "127.0.0.1",
+            0, // 端口 0 无法连接
+            &header,
+            b"test",
+            Duration::from_millis(300),
+            &mut cancel_rx,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        match out {
+            ChunkOutcome::Failed(msg) => {
+                assert!(msg.contains("after 3 attempts"), "错误信息应带上尝试次数：{msg}");
+                assert!(msg.contains("chunk 7"), "错误信息应带上块号：{msg}");
+            }
+            other => panic!("连不上的情况应当重试耗尽后 Failed，实际是 {other:?}"),
+        }
+        // 退避 0 + 200 + 500 = 700ms。
+        // 下界是这条测试的**关键**：只断言上界的话，"一次都不重试"也能通过
+        // （连不上返回得极快），测试就成了空测试。
+        assert!(
+            elapsed >= Duration::from_millis(700),
+            "三次尝试含 700ms 退避，实际 {elapsed:?}——是不是根本没重试？"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "三次尝试（含 700ms 退避）应在 3 秒内结束，实际 {elapsed:?}"
+        );
+    }
+
+    /// 重试的价值在于**能救回来**：第一次失败、第二次成功 → 整块成功。
+    ///
+    /// 这是 4.3 存在的全部理由。前面几条测的都是"失败时行为正确"，
+    /// 而这条测的是"网络抖一下，传输不会整体失败"。
+    #[tokio::test]
+    async fn retry_recovers_when_second_attempt_succeeds() {
+        let conn_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conn_count_in_task = conn_count.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // 第一次：收下数据就断开，不发 ACK —— 模拟 ACK 在路上丢了
+            let (mut s, _) = listener.accept().await.unwrap();
+            conn_count_in_task.fetch_add(1, Ordering::SeqCst);
+            let mut buf = vec![0u8; DataFrameHeader::SIZE + 4];
+            let _ = tokio::io::AsyncReadExt::read_exact(&mut s, &mut buf).await;
+            drop(s);
+
+            // 第二次：正常回 ACK
+            let (mut s2, _) = listener.accept().await.unwrap();
+            conn_count_in_task.fetch_add(1, Ordering::SeqCst);
+            let mut buf = vec![0u8; DataFrameHeader::SIZE + 4];
+            let _ = tokio::io::AsyncReadExt::read_exact(&mut s2, &mut buf).await;
+            let ack = crate::protocol::ControlMessage::ChunkAck {
+                file_id: "f".into(),
+                chunk_id: 3,
+                ok: true,
+            };
+            let _ = tokio::io::AsyncWriteExt::write_all(
+                &mut s2,
+                ack.to_line().unwrap().as_bytes(),
+            )
+            .await;
+            let _ = tokio::io::AsyncWriteExt::flush(&mut s2).await;
+            // 撑住连接，避免提前关闭干扰断言
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+
+        let header = DataFrameHeader {
+            file_id_prefix: 1,
+            chunk_id: 3,
+            data_len: 4,
+            _reserved: 0,
+        };
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let out = send_chunk_with_retry(
+            "127.0.0.1",
+            addr.port(),
+            &header,
+            b"test",
+            Duration::from_secs(2),
+            &mut cancel_rx,
+        )
+        .await;
+
+        assert!(
+            matches!(out, ChunkOutcome::Ok),
+            "第一次 ACK 丢失后应重试并成功，实际是 {out:?}"
+        );
+        assert_eq!(
+            conn_count.load(Ordering::SeqCst),
+            2,
+            "应当恰好建了 2 次连接（1 次失败 + 1 次成功）"
+        );
+    }
+
+    /// 取消在重试**间隔**里也要生效：
+    /// 如果退避用的是裸 sleep，用户在间隔点取消就得等退避走完才响应。
+    #[tokio::test]
+    async fn cancel_during_retry_backoff_takes_effect() {
+        let header = DataFrameHeader {
+            file_id_prefix: 1,
+            chunk_id: 0,
+            data_len: 4,
+            _reserved: 0,
+        };
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = cancel_tx.send(true);
+        });
+
+        let start = Instant::now();
+        let out = send_chunk_with_retry(
+            "127.0.0.1",
+            0,
+            &header,
+            b"test",
+            Duration::from_millis(300),
+            &mut cancel_rx,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(out, ChunkOutcome::Canceled),
+            "退避期间取消应返回 Canceled"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "退避期间取消应立即生效，实际 {elapsed:?}——退避是不是用了裸 sleep？"
         );
     }
 }
