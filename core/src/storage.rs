@@ -27,6 +27,56 @@ fn sha256_of_file(path: &Path) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// 把对端给的文件名收敛成"纯文件名"，挡住路径穿越。
+///
+/// 文件名来自 offer，是**可信度为零的输入**。`Path::join` 有两个坑：
+///   1. 遇到绝对路径（`/etc/passwd`、`C:\x`）会直接丢弃前面的基目录
+///   2. `..` 成分会往上跳目录
+/// 两者合起来意味着对端可以指定接收目录之外的任意写入位置。
+///
+/// `Path::file_name()` 天然去掉了目录成分和 `.` / `..`，
+/// 对 `..`、空串、Windows 盘符前缀（`C:`）返回 None，正好兜底成 "unnamed"。
+fn safe_file_name(file_name: &str) -> String {
+    let cleaned = Path::new(file_name)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if cleaned.is_empty() {
+        "unnamed".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// 第 n 个候选文件名：`n=0` 是原名，`n>=1` 是 `stem (n).ext`
+///
+/// 拆成纯函数是为了能零成本单测——冲突改名最容易写错的就是扩展名切分
+/// （`archive.tar.gz` 该变成 `archive.tar (1).gz` 而不是 `archive (1).tar.gz`）。
+fn conflict_name(file_name: &str, n: u32) -> String {
+    if n == 0 {
+        return file_name.to_string();
+    }
+    let p = Path::new(file_name);
+    let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+    match p.extension() {
+        Some(ext) => format!("{} ({}).{}", stem, n, ext.to_string_lossy()),
+        // 无扩展名（含 `.bashrc` 这类隐藏文件）：整体当 stem
+        None => format!("{} ({})", stem, n),
+    }
+}
+
+/// 找目录下第一个不存在的候选路径（`a.mp4` → `a (1).mp4` → `a (2).mp4` …）
+fn unique_final_path(dir: &Path, file_name: &str) -> Option<PathBuf> {
+    const MAX_CANDIDATES: u32 = 1000;
+    for n in 0..MAX_CANDIDATES {
+        let candidate = dir.join(conflict_name(file_name, n));
+        if !candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// 单个接收任务的状态
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReceiveSlot {
@@ -131,7 +181,10 @@ impl StorageManager {
     ) -> Result<()> {
         let chunk_count = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
         let receive_dir = self.receive_dir();
-        let temp_path = receive_dir.join(format!("{}.{}.part", file_name, &file_id[..8]));
+        // 先清洗再拼路径：直接 join 对端给的名字等于允许它指定任意写入位置
+        let file_name = safe_file_name(&file_name);
+        let id_short = file_id.get(..8).unwrap_or(&file_id);
+        let temp_path = receive_dir.join(format!("{}.{}.part", file_name, id_short));
         let final_path = receive_dir.join(&file_name);
 
         // 预分配文件大小
@@ -246,7 +299,10 @@ impl StorageManager {
     /// 校验失败返回 `ChecksumMismatch`，槽位移除、.part 保留供排查。
     /// 先原子领取（remove）槽位：并发的多个 chunk 同时判定完成时只有一个 finalize 生效，
     /// 避免二次校验 / 二次 rename 报错把 Completed 覆盖成 Failed。
-    pub async fn finalize(&self, file_id: &str, expected_sha256: Option<&str>) -> Result<()> {
+    ///
+    /// 返回**实际落盘路径**——目标已存在时会改名成 `name (1).ext`，
+    /// 调用方必须用这个返回值通知 UI，否则"打开文件"会指向错误的路径。
+    pub async fn finalize(&self, file_id: &str, expected_sha256: Option<&str>) -> Result<PathBuf> {
         let slot = {
             let mut slots = self.slots.lock().await;
             slots.remove(file_id)
@@ -273,14 +329,48 @@ impl StorageManager {
                 }
             }
 
-            let temp = &slot.temp_path;
-            let final_path = &slot.final_path;
-            tokio::fs::rename(temp, final_path)
-                .await
-                .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
-            info!(?final_path, "file finalized");
+            // 目标已存在就顺延改名（a.mp4 → a (1).mp4），而不是覆盖或报错。
+            //
+            // 循环是为了处理"检查和改名之间名字被抢"：两个传输同时收完同名文件时，
+            // 可能都看到 a.mp4 不存在，然后 Windows 上后一个 rename 会失败
+            // （Unix 的 rename 是覆盖语义，这里统一按最严的情况处理）。
+            // 重挑一次名字即可——被抢的那个现在 exists 了，会自动跳过。
+            const MAX_RENAME_ATTEMPTS: u32 = 8;
+            let dir = self.receive_dir();
+            let mut last_err: Option<std::io::Error> = None;
+            for _ in 0..MAX_RENAME_ATTEMPTS {
+                let candidate = unique_final_path(&dir, &slot.file_name).ok_or_else(|| {
+                    crate::CoreError::Transfer(format!(
+                        "no available name for {} (tried 1000 suffixes)",
+                        slot.file_name
+                    ))
+                })?;
+                match tokio::fs::rename(&slot.temp_path, &candidate).await {
+                    Ok(()) => {
+                        if candidate.file_name() != Some(std::ffi::OsStr::new(&slot.file_name)) {
+                            info!(?candidate, "final name taken, renamed to avoid overwrite");
+                        }
+                        info!(?candidate, "file finalized");
+                        return Ok(candidate);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        warn!(?candidate, "rename target taken concurrently, retrying");
+                        last_err = Some(e);
+                    }
+                    Err(e) => return Err(crate::CoreError::Transfer(e.to_string())),
+                }
+            }
+            Err(crate::CoreError::Transfer(format!(
+                "rename failed after {} attempts: {}",
+                MAX_RENAME_ATTEMPTS,
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            )))
+        } else {
+            // 槽位不存在：已被别的路径 finalize 过（幂等）
+            Ok(PathBuf::new())
         }
-        Ok(())
     }
 
     /// 中止接收：移除槽位（不再接受该文件的 chunk），**保留 .part 文件**。
@@ -294,5 +384,37 @@ impl StorageManager {
 
     pub async fn list_in_progress(&self) -> Vec<ReceiveSlot> {
         self.slots.lock().await.values().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 文件名相关的纯函数走单元测试：不碰磁盘、不需要临时目录，
+    //! 而这两处的边界（多段扩展名、路径穿越）恰恰最容易写错又不常被调用。
+    use super::*;
+
+    #[test]
+    fn conflict_name_keeps_extension() {
+        assert_eq!(conflict_name("a.mp4", 0), "a.mp4");
+        assert_eq!(conflict_name("a.mp4", 1), "a (1).mp4");
+        assert_eq!(conflict_name("a.mp4", 2), "a (2).mp4");
+        // 多段扩展名只认最后一段：`archive.tar (1).gz` 而不是 `archive (1).tar.gz`
+        assert_eq!(conflict_name("archive.tar.gz", 1), "archive.tar (1).gz");
+        assert_eq!(conflict_name("noext", 1), "noext (1)");
+        // 隐藏文件：Rust 的 extension() 对 `.bashrc` 返回 None，整体当 stem
+        assert_eq!(conflict_name(".bashrc", 1), ".bashrc (1)");
+    }
+
+    /// 文件名来自对端的 offer，是可信度为零的输入
+    #[test]
+    fn safe_file_name_blocks_traversal() {
+        assert_eq!(safe_file_name("a.txt"), "a.txt");
+        assert_eq!(safe_file_name("../../evil.exe"), "evil.exe");
+        assert_eq!(safe_file_name("/etc/passwd"), "passwd");
+        assert_eq!(safe_file_name("C:/Windows/evil.exe"), "evil.exe");
+        // 只剩目录成分 / 空串 / 纯 `..` → 兜底名，绝不能退化成目录
+        assert_eq!(safe_file_name(".."), "unnamed");
+        assert_eq!(safe_file_name(""), "unnamed");
+        assert_eq!(safe_file_name("a/b/"), "b");
     }
 }

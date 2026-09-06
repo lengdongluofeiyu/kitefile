@@ -38,7 +38,11 @@ macro_rules! require_sockets {
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("ftcore-gw-test-{}-{}", tag, std::process::id()));
+    // 同 storage_test：走 FTCORE_TEST_TMP，便于指到 E 盘（系统 temp 在 C 盘）
+    let base = std::env::var("FTCORE_TEST_TMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let dir = base.join(format!("ftcore-gw-test-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

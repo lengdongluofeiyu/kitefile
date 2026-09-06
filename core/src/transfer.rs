@@ -640,14 +640,17 @@ impl TransferEngine {
         self.recv_speed_state.lock().await.remove(file_id);
 
         let (status, error) = match &result {
-            Ok(()) => (TransferStatus::Completed, None),
+            Ok(_) => (TransferStatus::Completed, None),
             Err(e) => (TransferStatus::Failed, Some(e.to_string())),
         };
-        // 完成时携带最终保存路径，UI 据此提供“打开文件 / 打开所在文件夹”
-        let file_path = if matches!(status, TransferStatus::Completed) {
-            Some(slot.final_path.to_string_lossy().into_owned())
-        } else {
-            None
+        // 完成时携带最终保存路径，UI 据此提供“打开文件 / 打开所在文件夹”。
+        // 必须用 finalize 的返回值而不是 slot.final_path：
+        // 目标已存在时实际存成了 `name (1).ext`，slot 里记的只是首选名。
+        let file_path = match &result {
+            Ok(p) if !p.as_os_str().is_empty() => Some(p.to_string_lossy().into_owned()),
+            // 空路径 = 槽位已被别的路径 finalize 过（幂等重复调用），退回首选名
+            Ok(_) => Some(slot.final_path.to_string_lossy().into_owned()),
+            Err(_) => None,
         };
         self.publish_progress(TransferProgress {
             file_id: file_id.to_string(),
@@ -667,7 +670,8 @@ impl TransferEngine {
             file_path,
         })
         .await;
-        result
+        // finalize 返回实际落盘路径（改名后的真名），这里只需要成败
+        result.map(|_| ())
     }
 
     /// 接收方收到发送方补发的最终 sha256（POST /api/verify/:file_id）。
