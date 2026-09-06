@@ -13,6 +13,7 @@ pub mod transfer;
 pub mod gateway;
 pub mod protocol;
 pub mod storage;
+pub mod slot_meta;
 pub mod platform;
 pub mod ffi;
 

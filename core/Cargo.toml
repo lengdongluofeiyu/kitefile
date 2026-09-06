@@ -31,6 +31,9 @@ axum = { version = "0.7", features = ["multipart", "ws", "macros"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 槽位元数据的 bitmap 字段用 base64（跨重启续传 N3 用；本阶段只落格式不写文件）。
+# 它本来就在依赖树里（间接依赖），加为直接依赖不会引入新下载。
+base64 = "0.22"
 
 # Hashing / checksums
 sha2 = "0.10"
