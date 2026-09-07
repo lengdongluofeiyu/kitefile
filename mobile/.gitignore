@@ -28,6 +28,10 @@ migrate_working_dir/
 **/ios/Flutter/.last_build_id
 .dart_tool/
 .flutter-plugins-dependencies
+# Flutter 工具的机器级状态（含本机路径与匿名统计 id），不该入库
+# .flutter 是空标记文件（不是目录），pattern 不能带尾斜杠
+.flutter
+.flutter_tool_state
 .pub-cache/
 .pub/
 /build/

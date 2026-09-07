@@ -72,13 +72,18 @@ $DistAndroid   = Join-Path $DistDir 'android'
 $env:CARGO_HOME        = 'E:\zheten2.0\.deps\cargo'
 $env:RUSTUP_HOME       = 'E:\zheten2.0\.deps\rustup'
 $env:PUB_CACHE         = 'E:\zheten2.0\.deps\pub-cache'
-$env:JAVA_HOME         = 'C:\jdk22'
+# JDK 21：Gradle 9.1 的兼容上限是 JDK 24，JDK 25 会让 Gradle/AGP 直接报错。
+# 原 C:\jdk22 已在清盘时删除，勿再指回 C 盘。
+$env:JAVA_HOME         = 'D:\jdk21\jdk-21.0.12.1+1'
 $env:ANDROID_HOME      = 'E:\zheten2.0\.deps\android-sdk'
 $env:ANDROID_SDK_ROOT  = 'E:\zheten2.0\.deps\android-sdk'
 $env:GRADLE_USER_HOME  = 'E:\zheten2.0\.deps\gradle'
 # TEMP/TMP 必须一起重定向：rustc 与 MSVC link.exe 默认把临时文件、.pdb 写进 %TEMP%
 # （用户目录下，C 盘）。C 盘写满时的症状是 rustc ICE（encode_metadata 里 expect 失败）
 # 加 LNK1201（写 pdb 失败），看起来像编译器 bug，实际是磁盘空间不足。
+# 同样的坑也坑 Dart：frontend_server（kernel_snapshot_program）写临时文件失败时会
+# **静默 exit 1**，日志里只有 "Target kernel_snapshot_program failed: Exception"，
+# 没有任何 Dart 报错行——很容易误判成代码问题。实测重定向 TEMP 后同样的代码能编过。
 $env:TEMP              = 'E:\zheten2.0\.deps\tmp'
 $env:TMP               = $env:TEMP
 $env:PATH              = "$env:CARGO_HOME\bin;$env:JAVA_HOME\bin;$env:ANDROID_HOME\cmdline-tools\latest\bin;$env:ANDROID_HOME\platform-tools;$env:PATH"
