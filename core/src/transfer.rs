@@ -499,21 +499,54 @@ impl TransferEngine {
         Ok(())
     }
 
-    /// 服务一个数据流连接：读 header + chunk → 写入 storage → 推进度
+    /// 服务一个数据流连接：**循环**读帧（header + chunk → 写盘 → 回 ACK）
+    ///
+    /// 连接复用后一条连接要承载一条并行流的全部块，所以这里必须循环读，
+    /// 直到对端关闭——干净 EOF 就是"这条流传完了"。
+    /// 原来"一连接一块"的写法没有循环，改成复用后不补这一层会只收第一块。
     async fn serve_data_stream(self: Arc<Self>, mut stream: TcpStream) -> Result<()> {
-        let mut header_buf = [0u8; DataFrameHeader::SIZE];
-        stream
-            .read_exact(&mut header_buf)
-            .await
-            .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
-        let header = DataFrameHeader::from_bytes(&header_buf)
-            .map_err(|e| crate::CoreError::Transfer(format!("invalid header: {}", e)))?;
+        loop {
+            let mut header_buf = [0u8; DataFrameHeader::SIZE];
+            let n = read_full(&mut stream, &mut header_buf)
+                .await
+                .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+            if n == 0 {
+                // 干净 EOF：对端这条流发完并关闭了连接
+                return Ok(());
+            }
+            if n < DataFrameHeader::SIZE {
+                return Err(crate::CoreError::Transfer(format!(
+                    "truncated frame header ({} bytes)",
+                    n
+                )));
+            }
+            let header = DataFrameHeader::from_bytes(&header_buf)
+                .map_err(|e| crate::CoreError::Transfer(format!("invalid header: {}", e)))?;
 
-        let mut buf = vec![0u8; header.data_len as usize];
-        stream
-            .read_exact(&mut buf)
-            .await
-            .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+            let mut buf = vec![0u8; header.data_len as usize];
+            let n = read_full(&mut stream, &mut buf)
+                .await
+                .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+            if n < buf.len() {
+                return Err(crate::CoreError::Transfer(format!(
+                    "truncated chunk {} body ({} < {})",
+                    header.chunk_id,
+                    n,
+                    buf.len()
+                )));
+            }
+
+            self.handle_data_frame(&mut stream, &header, &buf).await?;
+        }
+    }
+
+    /// 处理一帧数据：写盘 → 推进度 → 回 ACK。由读帧循环 [`Self::serve_data_stream`] 调用。
+    async fn handle_data_frame(
+        self: &Arc<Self>,
+        stream: &mut TcpStream,
+        header: &DataFrameHeader,
+        buf: &[u8],
+    ) -> Result<()> {
 
         // 通过 file_id_prefix 反查 file_id（接收方在 Accept 时建立映射）
         let file_id = {
@@ -1077,6 +1110,9 @@ impl TransferEngine {
             let handle = tokio::spawn(async move {
                 // 按块大小算一次，循环里复用
                 let ack_timeout = ack_timeout_for(chunk_size);
+                // 这条流的连接，**跨块复用**（连接复用：一条连接传完整条流）。
+                // 失败时由 send_chunk_with_retry 置空，下次尝试重建。
+                let mut conn: Option<SendConn> = None;
                 let mut chunk_id = stream_idx as u64;
                 while chunk_id < chunk_count {
                     if *cancel_rx.borrow() {
@@ -1118,6 +1154,7 @@ impl TransferEngine {
                     //   Canceled —— 静默收尾，最终状态由外层判为 Canceled
                     //   Failed   —— 中止整条流；do_send 会把任一流的错误当整体失败
                     match send_chunk_with_retry(
+                        &mut conn,
                         &target_ip,
                         target_port,
                         &header,
@@ -1155,6 +1192,12 @@ impl TransferEngine {
                     }).await;
 
                     chunk_id += parallel as u64;
+                }
+                // 这条流发完：主动关闭写端，让接收端读到干净 EOF 正常退出读帧循环。
+                // 不关的话接收端会一直挂在 read 上，直到 ACK 超时才退出——
+                // 复用后每条连接只关一次，以前每块一连接时是靠连接关闭隐式表达的。
+                if let Some(c) = conn.take() {
+                    let _ = c.into_inner().shutdown().await;
                 }
                 Ok(())
             });
@@ -1230,33 +1273,44 @@ const CHUNK_RETRY_BACKOFF_MS: [u64; 3] = [0, 200, 500];
 // 发送方在 /api/verify 处必然失败。晚失败不如早失败，还省了一整个文件的传输时间。
 // 所以重试耗尽即中止整条流（进而中止整个传输，见 do_send 的错误合并）。
 
+/// 一条并行流的发送连接。
+///
+/// 包一层 `BufReader` 而不是直接拿 `TcpStream`，是因为复用后**缓冲必须跨块保留**：
+/// 每块新建一个 `BufReader` 的话，它可能把下一个 ACK 的字节预读进自己的缓冲区，
+/// 然后随 `BufReader` 一起被 drop——那部分数据就丢了。
+/// 停等模型下虽然不会发生（对端一次只回一个 ACK），但这个坑太隐蔽，
+/// 不如从结构上避免。
+type SendConn = tokio::io::BufReader<TcpStream>;
+
 /// 发送单个 chunk：写 header + data → 等待接收方落盘 ACK。
 ///
 /// 数据写入 TCP 缓冲 ≠ 对端已收到并写入磁盘。
 /// 只有读到接收方的 ChunkAck（chunk_id 匹配且 ok=true）才算发送成功。
 ///
+/// 连接由调用方持有并复用（连接复用：一条连接传完整条流）。
+/// 本函数不负责关闭连接——失败时由调用方决定是重建还是放弃。
+///
 /// 返回 [`ChunkResult`] 而不是 `Result`，是为了让调用方能区分
 /// "网络抖了可以重发"和"对端明确拒绝，重发没用"——
 /// 用统一的字符串错误类型，调用方只能瞎猜。
 async fn send_chunk(
-    mut stream: TcpStream,
+    conn: &mut SendConn,
     header: &DataFrameHeader,
     data: &[u8],
     ack_timeout: Duration,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> ChunkResult {
-    if let Err(e) = stream.write_all(&header.to_bytes()).await {
+    if let Err(e) = conn.get_mut().write_all(&header.to_bytes()).await {
         return ChunkResult::Retryable(format!("write header: {}", e));
     }
-    if let Err(e) = stream.write_all(data).await {
+    if let Err(e) = conn.get_mut().write_all(data).await {
         return ChunkResult::Retryable(format!("write data: {}", e));
     }
-    if let Err(e) = stream.flush().await {
+    if let Err(e) = conn.get_mut().flush().await {
         return ChunkResult::Retryable(format!("flush: {}", e));
     }
 
     // 等待接收方 ACK（写盘完成才回 ACK；出错时对端不发 ACK、直接断开）。
-    // read_until 属于 AsyncBufReadExt，需要包一层 BufReader。
     //
     // 这里三路并发，谁先到算谁：
     //   1. 读到 ACK —— 正常路径
@@ -1267,10 +1321,9 @@ async fn send_chunk(
     // 光把超时从 60s 缩到 20s，用户点取消后界面仍要等满整个窗口才动，
     // 那是功能缺陷而不是体感问题。
     // **超时值只决定多久判定对端失联，select! 才决定取消多久生效——两件事正交。**
-    let mut reader = tokio::io::BufReader::new(stream);
     let mut ack_line = Vec::new();
     let timeout_result = tokio::select! {
-        r = tokio::time::timeout(ack_timeout, reader.read_until(b'\n', &mut ack_line)) => r,
+        r = tokio::time::timeout(ack_timeout, conn.read_until(b'\n', &mut ack_line)) => r,
         _ = cancel_rx.changed() => {
             // 用户取消：不重试，直接结束
             return ChunkResult::Canceled;
@@ -1330,14 +1383,23 @@ enum ChunkOutcome {
 
 /// 发送单个 chunk，可重试的失败最多重试到 [`CHUNK_MAX_ATTEMPTS`] 次。
 ///
-/// **每次尝试都新建一条 TCP 连接**（当前不做连接复用），所以重试是幂等的：
-/// `chunk_id` 不变，接收端按 `chunk_id × chunk_size` 算偏移覆盖写同一块区，
-/// `received_chunks[chunk_id]` 也只是把已置位的布尔再置一次。
+/// `conn` 是这条流当前的连接，**跨块复用**（连接复用）。
+/// 两种情况下会重建：
+///   - 还没有连接（首次，或上次失败后已置空）
+///   - 上一次尝试失败——连接可能已经半死，不能在上面继续发
+///
+/// 重试是幂等的：`chunk_id` 不变，接收端按 `chunk_id × chunk_size` 算偏移
+/// 覆盖写同一块区，`received_chunks[chunk_id]` 也只是把已置位的布尔再置一次。
 /// 即使上一块其实已经落盘、只是 ACK 在路上丢了，重发也只是原样再写一遍。
 ///
-/// 反过来，这也意味着**不能跳过失败的块继续传**：少一块，接收端永远凑不齐，
+/// 也因为如此，**不能跳过失败的块继续传**：少一块，接收端永远凑不齐，
 /// `.part` 不会 finalize，最后 /api/verify 必然失败。所以重试耗尽就中止。
+///
+/// 顺带纠正一个先前的判断：曾经担心"复用后连接断了要判断从哪个未确认块继续"，
+/// 实现时发现这个问题不存在——停等模型下**当前块就是唯一的未确认块**，
+/// 前面所有块都已 ACK。断了就从当前块重发，不需要额外的进度协商。
 async fn send_chunk_with_retry(
+    conn: &mut Option<SendConn>,
     target_ip: &str,
     target_port: u16,
     header: &DataFrameHeader,
@@ -1360,14 +1422,17 @@ async fn send_chunk_with_retry(
             }
         }
 
-        let stream = match TcpStream::connect((target_ip, target_port)).await {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = format!("connect {}:{}: {}", target_ip, target_port, e);
-                warn!(chunk = header.chunk_id, attempt, error = %e, "connect failed, will retry");
-                continue;
+        if conn.is_none() {
+            match TcpStream::connect((target_ip, target_port)).await {
+                Ok(s) => *conn = Some(tokio::io::BufReader::new(s)),
+                Err(e) => {
+                    last_err = format!("connect {}:{}: {}", target_ip, target_port, e);
+                    warn!(chunk = header.chunk_id, attempt, error = %e, "connect failed, will retry");
+                    continue;
+                }
             }
-        };
+        }
+        let stream = conn.as_mut().expect("just ensured Some");
 
         match send_chunk(stream, header, data, ack_timeout, cancel_rx).await {
             ChunkResult::Ok => return ChunkOutcome::Ok,
@@ -1376,6 +1441,8 @@ async fn send_chunk_with_retry(
             ChunkResult::Fatal(e) => return ChunkOutcome::Failed(e),
             ChunkResult::Retryable(e) => {
                 warn!(chunk = header.chunk_id, attempt, error = %e, "chunk send failed, will retry");
+                // 连接可能已经半死（写了一半、ACK 读不到），不能在上面继续发
+                *conn = None;
                 last_err = e;
             }
         }
@@ -1384,6 +1451,22 @@ async fn send_chunk_with_retry(
         "chunk {} failed after {} attempts: {}",
         header.chunk_id, CHUNK_MAX_ATTEMPTS, last_err
     ))
+}
+
+/// 读满 buf，返回实际读到的字节数。**返回 0 = 对端已关闭（干净 EOF）**。
+///
+/// 不用 `read_exact`：它在 EOF 时只给一个 `UnexpectedEof`，
+/// 分不清"一个字节都没读到（这条流正常发完）"和"读到一半断了（异常）"。
+/// 连接复用后这个区分是必需的——干净 EOF 就是"一条流发完了"的信号。
+async fn read_full(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut read = 0;
+    while read < buf.len() {
+        match stream.read(&mut buf[read..]).await? {
+            0 => break,
+            n => read += n,
+        }
+    }
+    Ok(read)
 }
 
 /// 通过 UDP connect 让 OS 路由决策选出「通往 target 的本机源 IP」。
@@ -1554,7 +1637,6 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(60)).await;
         });
 
-        let stream = TcpStream::connect(addr).await.unwrap();
         let header = DataFrameHeader {
             file_id_prefix: 1,
             chunk_id: 0,
@@ -1569,8 +1651,9 @@ mod tests {
         });
 
         let start = Instant::now();
+        let mut conn = tokio::io::BufReader::new(TcpStream::connect(addr).await.unwrap());
         let r = send_chunk(
-            stream,
+            &mut conn,
             &header,
             b"test",
             Duration::from_secs(30), // 故意给一个很长的超时
@@ -1612,7 +1695,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
 
-        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut conn = tokio::io::BufReader::new(TcpStream::connect(addr).await.unwrap());
         let header = DataFrameHeader {
             file_id_prefix: 1,
             chunk_id: 0,
@@ -1621,7 +1704,7 @@ mod tests {
         };
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
         let r = send_chunk(
-            stream,
+            &mut conn,
             &header,
             b"test",
             Duration::from_secs(5),
@@ -1647,8 +1730,10 @@ mod tests {
             _reserved: 0,
         };
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let mut conn: Option<SendConn> = None;
         let start = Instant::now();
         let out = send_chunk_with_retry(
+            &mut conn,
             "127.0.0.1",
             0, // 端口 0 无法连接
             &header,
@@ -1724,7 +1809,9 @@ mod tests {
             _reserved: 0,
         };
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let mut conn: Option<SendConn> = None;
         let out = send_chunk_with_retry(
+            &mut conn,
             "127.0.0.1",
             addr.port(),
             &header,
@@ -1745,6 +1832,83 @@ mod tests {
         );
     }
 
+    /// 连接复用：多个块应当跑在**同一条**连接上。
+    ///
+    /// 这条测试锁的是"复用真的生效了"，而不只是"复用后还能传"。
+    /// 只看后者的话，实现退回每块一连接也能通过——那正是要防止的退化。
+    #[tokio::test]
+    async fn reuse_sends_many_chunks_on_one_connection() {
+        let accept_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accept_count_in_task = accept_count.clone();
+        let frames_in_task = frames.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            accept_count_in_task.fetch_add(1, Ordering::SeqCst);
+            // 循环读帧：一条连接上收多块，每块回一个 ACK
+            loop {
+                let mut header_buf = [0u8; DataFrameHeader::SIZE];
+                let n = read_full(&mut stream, &mut header_buf).await.unwrap();
+                if n == 0 {
+                    break; // 发送端发完并关闭——干净 EOF 就是结束信号
+                }
+                let header = DataFrameHeader::from_bytes(&header_buf).unwrap();
+                let mut buf = vec![0u8; header.data_len as usize];
+                read_full(&mut stream, &mut buf).await.unwrap();
+                frames_in_task.fetch_add(1, Ordering::SeqCst);
+                let ack = crate::protocol::ControlMessage::ChunkAck {
+                    file_id: String::new(),
+                    chunk_id: header.chunk_id,
+                    ok: true,
+                };
+                tokio::io::AsyncWriteExt::write_all(
+                    &mut stream,
+                    ack.to_line().unwrap().as_bytes(),
+                )
+                .await
+                .unwrap();
+                tokio::io::AsyncWriteExt::flush(&mut stream).await.unwrap();
+            }
+        });
+
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let mut conn: Option<SendConn> = None;
+        for chunk_id in 0..5u64 {
+            let header = DataFrameHeader {
+                file_id_prefix: 1,
+                chunk_id,
+                data_len: 4,
+                _reserved: 0,
+            };
+            let out = send_chunk_with_retry(
+                &mut conn,
+                "127.0.0.1",
+                addr.port(),
+                &header,
+                b"test",
+                Duration::from_secs(5),
+                &mut cancel_rx,
+            )
+            .await;
+            assert!(
+                matches!(out, ChunkOutcome::Ok),
+                "第 {chunk_id} 块应发送成功，实际 {out:?}"
+            );
+        }
+        // 这条流发完，关闭写端让对端读到 EOF
+        let _ = conn.take().unwrap().into_inner().shutdown().await;
+
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            1,
+            "5 个块应当只建 1 条连接——如果这里大于 1，说明复用退化成每块一连接了"
+        );
+        assert_eq!(frames.load(Ordering::SeqCst), 5, "一条连接上应收满 5 帧");
+    }
+
     /// 取消在重试**间隔**里也要生效：
     /// 如果退避用的是裸 sleep，用户在间隔点取消就得等退避走完才响应。
     #[tokio::test]
@@ -1762,7 +1926,9 @@ mod tests {
         });
 
         let start = Instant::now();
+        let mut conn: Option<SendConn> = None;
         let out = send_chunk_with_retry(
+            &mut conn,
             "127.0.0.1",
             0,
             &header,
