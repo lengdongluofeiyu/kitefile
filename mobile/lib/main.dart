@@ -186,6 +186,10 @@ class IncomingEntry {
   final String fromId;
   final String fromName;
   final String fromIp;
+  /// 多文件批量发送时同批条目共享；单文件为 null
+  final String? batchId;
+  final int? batchIndex;
+  final int? batchTotal;
   const IncomingEntry({
     required this.incomingId,
     required this.fileId,
@@ -195,6 +199,9 @@ class IncomingEntry {
     required this.fromId,
     required this.fromName,
     required this.fromIp,
+    this.batchId,
+    this.batchIndex,
+    this.batchTotal,
   });
 
   factory IncomingEntry.fromJson(Map<String, dynamic> j) => IncomingEntry(
@@ -206,7 +213,19 @@ class IncomingEntry {
         fromId: j['from_id'] as String? ?? '',
         fromName: j['from_name'] as String? ?? '',
         fromIp: j['from_ip'] as String? ?? '',
+        batchId: j['batch_id'] as String?,
+        batchIndex: (j['batch_index'] as num?)?.toInt(),
+        batchTotal: (j['batch_total'] as num?)?.toInt(),
       );
+}
+
+/// 一次多选发送里，单个文件所属的批次信息（发给 daemon 用）
+class SendBatch {
+  final String batchId;
+  final int index;
+  final int total;
+  const SendBatch(
+      {required this.batchId, required this.index, required this.total});
 }
 
 // ============ 主页 ============
@@ -234,6 +253,11 @@ class _HomePageState extends State<HomePage> {
   final Map<String, TransferProgress> _progress = {};
   /// 待决定的传入请求（incoming_id → entry）
   final Map<String, IncomingEntry> _incoming = {};
+  /// 同批 incoming 暂存区：batch_id → 已到达的条目（攒够后合成一张卡片）
+  final Map<String, List<IncomingEntry>> _pendingBatch = {};
+  final Map<String, Timer> _batchTimers = {};
+  /// 已决定的批次：batch_id → 是否接受。迟到到达的同批条目沿用同一决定。
+  final Map<String, bool> _batchDecision = {};
   WebSocket? _ws;
   Timer? _refreshTimer;
   bool _daemonOnline = false;
@@ -367,10 +391,7 @@ class _HomePageState extends State<HomePage> {
           switch (j['event_type'] as String? ?? 'progress') {
             case 'incoming':
               final entry = IncomingEntry.fromJson(j);
-              if (mounted) {
-                setState(() => _incoming[entry.incomingId] = entry);
-                _showIncomingDialog(entry);
-              }
+              _onIncoming(entry);
               break;
             case 'incoming_resolved':
               final id = j['incoming_id'] as String?;
@@ -389,6 +410,100 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {
       Future.delayed(const Duration(seconds: 5), _connectWs);
     }
+  }
+
+  /// 收到一个 incoming 请求。
+  ///
+  /// 同批的 offer 是对端连续 POST 来的，到达有先后但间隔极短。
+  /// 先攒 600ms，到齐（或超时）后合成一张卡片弹出，一次决定整批。
+  void _onIncoming(IncomingEntry entry) {
+    if (!mounted) return;
+    setState(() => _incoming[entry.incomingId] = entry);
+
+    final bid = entry.batchId;
+    if (bid == null) {
+      _showIncomingDialog(entry);
+      return;
+    }
+
+    // 该批次已经决定过了：迟到的条目沿用同一决定，别再弹窗烦用户
+    final decided = _batchDecision[bid];
+    if (decided != null) {
+      _decideIncoming(entry.incomingId, decided);
+      return;
+    }
+
+    final list = _pendingBatch.putIfAbsent(bid, () => []);
+    if (!list.any((e) => e.incomingId == entry.incomingId)) list.add(entry);
+
+    _batchTimers[bid]?.cancel();
+    if (list.length >= (entry.batchTotal ?? list.length)) {
+      _showBatchDialog(bid);
+    } else {
+      _batchTimers[bid] =
+          Timer(const Duration(milliseconds: 600), () => _showBatchDialog(bid));
+    }
+  }
+
+  /// 批量接收弹窗：一次确认整批
+  void _showBatchDialog(String batchId) {
+    _batchTimers.remove(batchId)?.cancel();
+    final entries = _pendingBatch.remove(batchId);
+    if (entries == null || entries.isEmpty || !mounted) return;
+    entries.sort((a, b) => (a.batchIndex ?? 0).compareTo(b.batchIndex ?? 0));
+    final totalSize = entries.fold<int>(0, (s, e) => s + e.fileSize);
+
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        title: Text('收到 ${entries.length} 个文件'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('来自: ${entries.first.fromName} (${entries.first.fromIp})'),
+            Text('合计: ${formatBytes(totalSize)}'),
+            const SizedBox(height: 8),
+            ...entries.map(
+              (e) => Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2),
+                child: Text('${e.fileName}（${formatBytes(e.fileSize)}）',
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 13)),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _decideBatch(batchId, false);
+            },
+            child: const Text('全部拒绝'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _decideBatch(batchId, true);
+            },
+            child: Text('全部接受 (${entries.length})'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _decideBatch(String batchId, bool accept) async {
+    // 先记下决定：迟到到达的同批条目会据此自动沿用，不再弹窗
+    _batchDecision[batchId] = accept;
+    // 后端 60s 未决策会自动拒绝，之后不会再有同批条目到达，记录可以回收
+    Timer(const Duration(seconds: 70), () => _batchDecision.remove(batchId));
+    try {
+      await httpPost('$_httpBase/api/incoming/batch-decide',
+          body: jsonEncode({'batch_id': batchId, 'accept': accept}));
+    } catch (_) {}
   }
 
   /// 接收方确认弹窗：接受 / 拒绝传入请求
@@ -443,7 +558,8 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<void> _sendFile(Device target, String path, {String? fileName}) async {
+  Future<void> _sendFile(Device target, String path,
+      {String? fileName, SendBatch? batch}) async {
     try {
       // 显式判空而非用 Dart 3.8 的 null-aware element（key: ?value）：
       // 后者需要较新的 Flutter/Dart，旧版工具链会编译失败。这里保持最大兼容性。
@@ -454,6 +570,11 @@ class _HomePageState extends State<HomePage> {
         'file_path': path,
       };
       if (fileName != null) body['file_name'] = fileName;
+      if (batch != null) {
+        body['batch_id'] = batch.batchId;
+        body['batch_index'] = batch.index;
+        body['batch_total'] = batch.total;
+      }
       final r = await httpPost('$_httpBase/api/send', body: jsonEncode(body));
       final fileId = (jsonDecode(r) as Map<String, dynamic>)['file_id'] as String;
       if (!mounted) return;
@@ -1082,10 +1203,19 @@ class _HomePageState extends State<HomePage> {
           FilledButton(
             onPressed: () {
               Navigator.pop(context);
-              // 逐个发送（每个文件独立传输任务，进度列表分别展示）。
+              // 多选时整批共享一个 batch_id：接收端据此合成一张卡片，
+              // 一次确认即可，不用每个文件点一遍。单文件不带批次，行为不变。
               // file_name 显式携带：/proc/self/fd/N 路径推断不出原始文件名
-              for (final f in picks) {
-                _sendFile(d, f.path, fileName: f.name);
+              if (picks.length > 1) {
+                final batchId = 'b-${DateTime.now().microsecondsSinceEpoch}';
+                for (var i = 0; i < picks.length; i++) {
+                  _sendFile(d, picks[i].path,
+                      fileName: picks[i].name,
+                      batch: SendBatch(
+                          batchId: batchId, index: i, total: picks.length));
+                }
+              } else {
+                _sendFile(d, picks.first.path, fileName: picks.first.name);
               }
             },
             child: Text('发送 (${picks.length})'),

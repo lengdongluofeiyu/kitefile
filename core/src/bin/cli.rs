@@ -169,6 +169,8 @@ async fn send(ip: String, path: String) -> anyhow::Result<()> {
             config.device_name.clone(),
             self_ip,
             gateway_port,
+            // CLI 一次只发一个文件，不涉及批次
+            None,
         )
         .await?;
 

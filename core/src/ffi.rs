@@ -281,6 +281,9 @@ pub unsafe extern "C" fn ftcore_send_file(
                 self_name,
                 self_ip,
                 config.gateway_port,
+                // FFI 层是"一次发一个文件"的入口，批量由 UI 走 HTTP /api/send，
+                // 所以这里永远按单文件处理。
+                None,
             )
             .await
         {

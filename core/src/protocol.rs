@@ -106,12 +106,38 @@ pub struct HttpOffer {
     pub from_id: String,
     /// 发送方 device 显示名
     pub from_name: String,
+    /// 一次多选发送共享的批次 ID。
+    ///
+    /// 同一批的 offer 带相同值，接收端可以把它们合成一张
+    /// "XXX 想发 5 个文件" 的卡片，一次接受或拒绝整批，
+    /// 不用逐个点。None = 单文件发送（或旧版本发送端，行为不变）。
+    #[serde(default)]
+    pub batch_id: Option<String>,
+    /// 本文件在批次内的序号（0 起）与批次总数，供 UI 显示 "3/5"。
+    /// 单文件发送时为 None。
+    #[serde(default)]
+    pub batch_index: Option<u32>,
+    #[serde(default)]
+    pub batch_total: Option<u32>,
     /// 发送方 IP（接收方回包用）
     pub from_ip: String,
     /// 发送方 gateway 端口（接收方回包用）
     pub from_gateway_port: u16,
     /// 发送方 TCP transfer 端口（接收方回 Accept 后用，daemon 已知也行）
     pub from_transfer_port: u16,
+}
+
+/// 一次多选发送里，单个文件所属的批次信息。
+///
+/// 同批的所有 offer 带同一个 `batch_id`，接收端据此把它们合成一张卡片，
+/// 让用户一次接受/拒绝整批，而不是逐个点。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendBatchInfo {
+    pub batch_id: String,
+    /// 本文件在批次内的序号（0 起）
+    pub index: u32,
+    /// 批次内文件总数
+    pub total: u32,
 }
 
 /// 接收方 daemon 内部为每个 offer 生成的待决定条目
@@ -135,6 +161,14 @@ pub struct IncomingEntry {
     pub from_ip: String,
     pub from_gateway_port: u16,
     pub from_transfer_port: u16,
+    /// 批次 ID，透传自 `HttpOffer::batch_id`。同批的条目可一次决策。
+    #[serde(default)]
+    pub batch_id: Option<String>,
+    /// 本条目在批次内的位置，透传自 `HttpOffer::batch_index` / `batch_total`
+    #[serde(default)]
+    pub batch_index: Option<u32>,
+    #[serde(default)]
+    pub batch_total: Option<u32>,
     /// 创建时间戳（Unix ms）
     pub created_at: u64,
     /// 决策：None=待决定, Some(true)=已接受, Some(false)=已拒绝

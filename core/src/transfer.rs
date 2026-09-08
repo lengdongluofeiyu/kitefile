@@ -206,6 +206,16 @@ impl TransferHandle {
 struct IncomingSlot {
     entry: IncomingEntry,
     decision_tx: watch::Sender<Option<bool>>, // None=待决定, Some(true)=接受, Some(false)=拒绝
+    /// **必须持有，不能丢。**
+    ///
+    /// tokio 的 `watch::Sender::send` 在「一个 receiver 都没有」时直接返回
+    /// Err 且**不更新值**。以前这里只创建了 `_decision_rx` 然后随 register
+    /// 返回而 drop，于是决策能不能生效完全取决于 `wait_decision` 的
+    /// `subscribe()` 有没有抢先跑到——这是个竞态：
+    /// UI 若在这个后台任务订阅之前就点了接受/拒绝，send 静默失败，
+    /// 该条目会一直等到 60s 超时才被自动拒绝（表现为"点了没反应")。
+    /// 在槽里常驻一个 receiver，send 就永远有接收方，决策不再丢失。
+    _decision_rx: watch::Receiver<Option<bool>>,
 }
 
 /// 接收方 incoming 管理器：登记待决定的传入请求
@@ -237,13 +247,18 @@ impl IncomingManager {
             from_ip: offer.from_ip,
             from_gateway_port: offer.from_gateway_port,
             from_transfer_port: offer.from_transfer_port,
+            // 批次信息透传：UI 靠 batch_id 把同批条目合成一张卡片
+            batch_id: offer.batch_id,
+            batch_index: offer.batch_index,
+            batch_total: offer.batch_total,
             created_at: now_ms(),
             decision: None,
         };
-        let (decision_tx, _decision_rx) = watch::channel(None);
+        let (decision_tx, decision_rx) = watch::channel(None);
         self.slots.lock().insert(incoming_id.clone(), IncomingSlot {
             entry: entry.clone(),
             decision_tx,
+            _decision_rx: decision_rx,
         });
         entry
     }
@@ -260,11 +275,20 @@ impl IncomingManager {
         });
         let slot = slot_opt?;
         let _ = slot.decision_tx.send(Some(accept));
+        let mut entry = slot.entry;
         if !accept {
             // 拒绝：无后续流程，立即移除
             self.slots.lock().remove(incoming_id);
+        } else {
+            // 接受：槽位要留到后台任务建完接收槽再清理，但决议得记进 entry。
+            // 以前这里不写，entry.decision 永远是 None——等于这个字段是死的，
+            // 重复查 pending 列表时会把已接受的条目继续当成"待决定"推给 UI。
+            entry.decision = Some(true);
+            if let Some(s) = self.slots.lock().get_mut(incoming_id) {
+                s.entry.decision = Some(true);
+            }
         }
-        Some(slot.entry)
+        Some(entry)
     }
 
     /// 等待 UI 决策（async，超时自动 reject）
@@ -296,6 +320,39 @@ impl IncomingManager {
             .values()
             .map(|s| s.entry.clone())
             .collect()
+    }
+
+    /// 列出某个批次下所有待决定条目（按 batch_index 排序，UI 顺序稳定）
+    pub fn list_pending_by_batch(&self, batch_id: &str) -> Vec<IncomingEntry> {
+        let mut out: Vec<IncomingEntry> = self
+            .slots
+            .lock()
+            .values()
+            .filter(|s| s.entry.batch_id.as_deref() == Some(batch_id))
+            .map(|s| s.entry.clone())
+            .collect();
+        out.sort_by_key(|e| e.batch_index.unwrap_or(u32::MAX));
+        out
+    }
+
+    /// 对同一批次的所有待决定条目下同一个决定，返回实际处理掉的 incoming_id。
+    ///
+    /// 逐个复用 `decide`，所以语义和 UI 一个个点完全一致——
+    /// 接受后走的仍是同一条 `wait_decision` → `decide_incoming` 流程，
+    /// 不引入第二套状态机，也不改变超时/取消行为。
+    pub async fn decide_batch(&self, batch_id: &str, accept: bool) -> Vec<String> {
+        let ids: Vec<String> = self
+            .list_pending_by_batch(batch_id)
+            .into_iter()
+            .map(|e| e.incoming_id)
+            .collect();
+        let mut done = Vec::new();
+        for id in ids {
+            if self.decide(&id, accept).await.is_some() {
+                done.push(id);
+            }
+        }
+        done
     }
 
     /// 接收完成或失败后清理
@@ -483,6 +540,11 @@ impl TransferEngine {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
+                        // 关 Nagle：接收端每收完一块要立刻回一个 ACK，
+                        // 让这个小包马上上路，不要等延迟确认或搭顺风车。
+                        if let Err(e) = stream.set_nodelay(true) {
+                            warn!(?peer, error = %e, "set_nodelay failed (non-fatal)");
+                        }
                         let engine = self.clone();
                         tokio::spawn(async move {
                             if let Err(e) = engine.serve_data_stream(stream).await {
@@ -800,6 +862,8 @@ impl TransferEngine {
         self_name: String,
         self_ip: String,
         self_gateway_port: u16,
+        // 多文件批量发送时传入；单文件传 None（协议字段为 null，行为不变）
+        batch: Option<crate::protocol::SendBatchInfo>,
     ) -> Result<TransferHandle> {
         // 源 IP（回包地址）自动选择：用 UDP connect 让 OS 按目标做路由决策，
         // 多网卡环境（如 Android WiFi+蜂窝）下必选对通往目标的网卡。
@@ -887,6 +951,9 @@ impl TransferEngine {
                 from_ip: self_ip.clone(),
                 from_gateway_port: self_gateway_port,
                 from_transfer_port: engine.transfer_port,
+                batch_id: batch.as_ref().map(|b| b.batch_id.clone()),
+                batch_index: batch.as_ref().map(|b| b.index),
+                batch_total: batch.as_ref().map(|b| b.total),
             };
             let offer_json = match serde_json::to_string(&offer) {
                 Ok(s) => s,
@@ -1424,7 +1491,15 @@ async fn send_chunk_with_retry(
 
         if conn.is_none() {
             match TcpStream::connect((target_ip, target_port)).await {
-                Ok(s) => *conn = Some(tokio::io::BufReader::new(s)),
+                Ok(s) => {
+                    // 关 Nagle：停等模型下每发完一块都要等一个 ACK 小包回来。
+                    // 不关的话这个小包会被延迟确认（最多 40ms）或等着搭反向数据的顺风车，
+                    // 每块的往返都白等这一段——块越小、块数越多，损失越明显。
+                    if let Err(e) = s.set_nodelay(true) {
+                        warn!(error = %e, "set_nodelay failed (non-fatal)");
+                    }
+                    *conn = Some(tokio::io::BufReader::new(s))
+                }
                 Err(e) => {
                     last_err = format!("connect {}:{}: {}", target_ip, target_port, e);
                     warn!(chunk = header.chunk_id, attempt, error = %e, "connect failed, will retry");
@@ -1527,6 +1602,117 @@ mod tests {
     //! 而这些边界（无终态可淘汰时的退化、重复 file_id 不入队）用集成测试
     //! 很难构造出来。
     use super::*;
+
+    /// 构造一个 offer。batch 为 Some 时带上批次信息。
+    fn offer(file_id: &str, batch: Option<(&str, u32, u32)>) -> crate::protocol::HttpOffer {
+        crate::protocol::HttpOffer {
+            file_id: file_id.to_string(),
+            file_name: format!("{file_id}.bin"),
+            file_size: 1024,
+            chunk_size: Some(1024),
+            sha256: None,
+            sha256_deferred: true,
+            from_id: "peer".into(),
+            from_name: "peer".into(),
+            from_ip: "192.168.1.2".into(),
+            from_gateway_port: 7878,
+            from_transfer_port: 7879,
+            batch_id: batch.map(|(b, _, _)| b.to_string()),
+            batch_index: batch.map(|(_, i, _)| i),
+            batch_total: batch.map(|(_, _, t)| t),
+        }
+    }
+
+    #[tokio::test]
+    async fn decide_batch_applies_to_whole_batch_only() {
+        let m = IncomingManager::new();
+        let e1 = m.register(offer("f1", Some(("b1", 0, 2))));
+        let e2 = m.register(offer("f2", Some(("b1", 1, 2))));
+        m.register(offer("f3", Some(("b2", 0, 1))));
+        m.register(offer("f4", None));
+
+        assert_eq!(m.list_pending_by_batch("b1").len(), 2, "同批条目应聚合");
+
+        let mut done = m.decide_batch("b1", true).await;
+        done.sort();
+        let mut want = vec![e1.incoming_id.clone(), e2.incoming_id.clone()];
+        want.sort();
+        assert_eq!(done, want, "一次决策覆盖整批，且只覆盖该批");
+
+        // 决议确实置位了：wait_decision 立即返回，不用等满 60s 超时
+        assert_eq!(m.wait_decision(&e1.incoming_id).await, Some(true));
+        assert_eq!(m.wait_decision(&e2.incoming_id).await, Some(true));
+
+        // 别的批次没被碰过：仍在等决策（wait_decision 会一直挂住）
+        let b2 = m.list_pending_by_batch("b2");
+        assert_eq!(b2.len(), 1);
+        assert_eq!(b2[0].decision, None);
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            m.wait_decision(&b2[0].incoming_id),
+        )
+        .await;
+        assert!(pending.is_err(), "未决策的条目不应立刻返回结果");
+    }
+
+    #[tokio::test]
+    async fn decide_batch_reject_removes_slots() {
+        let m = IncomingManager::new();
+        m.register(offer("f1", Some(("b1", 0, 2))));
+        m.register(offer("f2", Some(("b1", 1, 2))));
+        m.register(offer("f3", Some(("b2", 0, 1))));
+
+        assert_eq!(m.decide_batch("b1", false).await.len(), 2);
+        assert_eq!(
+            m.list_pending_by_batch("b1").len(),
+            0,
+            "拒绝应立即移除槽位，不留残留在 UI 上"
+        );
+        assert_eq!(m.list_pending_by_batch("b2").len(), 1, "其他批次不受影响");
+    }
+
+    #[tokio::test]
+    async fn decide_batch_on_unknown_batch_is_noop() {
+        let m = IncomingManager::new();
+        m.register(offer("f1", Some(("b1", 0, 1))));
+        assert!(
+            m.decide_batch("does-not-exist", true).await.is_empty(),
+            "未知批次不应误伤任何条目"
+        );
+        assert_eq!(m.list_pending().len(), 1);
+    }
+
+    #[test]
+    fn list_pending_by_batch_sorts_by_index() {
+        let m = IncomingManager::new();
+        // 故意乱序登记，UI 顺序必须仍然稳定
+        m.register(offer("f3", Some(("b1", 2, 3))));
+        m.register(offer("f1", Some(("b1", 0, 3))));
+        m.register(offer("f2", Some(("b1", 1, 3))));
+        let names: Vec<String> = m
+            .list_pending_by_batch("b1")
+            .into_iter()
+            .map(|e| e.file_name)
+            .collect();
+        assert_eq!(names, vec!["f1.bin", "f2.bin", "f3.bin"]);
+    }
+
+    #[test]
+    fn old_sender_offer_without_batch_fields_still_deserializes() {
+        // 旧版本发送端的 offer 里没有 batch_* 字段。
+        // 这三个字段必须是 Option + serde(default)，否则跨版本对接会直接 400。
+        let json = r#"{
+            "file_id": "x", "file_name": "x.bin", "file_size": 10,
+            "chunk_size": 1024, "sha256": null, "sha256_deferred": true,
+            "from_id": "p", "from_name": "p", "from_ip": "192.168.1.2",
+            "from_gateway_port": 7878, "from_transfer_port": 7879
+        }"#;
+        let o: crate::protocol::HttpOffer =
+            serde_json::from_str(json).expect("旧 offer 必须能反序列化");
+        assert!(o.batch_id.is_none());
+        assert!(o.batch_index.is_none());
+        assert!(o.batch_total.is_none());
+    }
 
     fn prog(id: &str, status: TransferStatus) -> TransferProgress {
         TransferProgress {

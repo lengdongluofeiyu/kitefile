@@ -83,6 +83,15 @@ pub struct SendRequest {
     /// 无法从路径推断出原始文件名的路径时使用
     #[serde(default)]
     pub file_name: Option<String>,
+    /// 批量发送：一次多选的多个文件共享同一个 batch_id，
+    /// 接收端据此合成一张卡片、一次确认整批。三个字段必须同时给，
+    /// 缺任何一个都按单文件处理（不会因为部分缺失导致批次信息自相矛盾）。
+    #[serde(default)]
+    pub batch_id: Option<String>,
+    #[serde(default)]
+    pub batch_index: Option<u32>,
+    #[serde(default)]
+    pub batch_total: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,6 +158,7 @@ impl HttpGateway {
             .route("/api/incoming", post(incoming_offer).get(list_incoming))
             .route("/api/incoming/:id/accept", post(accept_incoming))
             .route("/api/incoming/:id/reject", post(reject_incoming))
+            .route("/api/incoming/batch-decide", post(batch_decide_incoming))
             .route("/api/incoming-resp", post(incoming_resp))
             .route("/api/verify/:file_id", post(verify_file))
             .route("/api/config", get(get_config))
@@ -235,6 +245,7 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
         (Method::GET, "/api/incoming", LocalOnly),
         (Method::POST, "/api/incoming/:id/accept", LocalOnly),
         (Method::POST, "/api/incoming/:id/reject", LocalOnly),
+        (Method::POST, "/api/incoming/batch-decide", LocalOnly),
         (Method::GET, "/api/config", LocalOnly),
         (Method::POST, "/api/config/receive-dir", LocalOnly),
         (Method::POST, "/api/config/device-name", LocalOnly),
@@ -337,6 +348,12 @@ async fn send_file(
             self_name,
             self_ip,
             state.config.gateway_port,
+            match (req.batch_id, req.batch_index, req.batch_total) {
+                (Some(batch_id), Some(index), Some(total)) => {
+                    Some(crate::protocol::SendBatchInfo { batch_id, index, total })
+                }
+                _ => None,
+            },
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -603,6 +620,45 @@ async fn accept_incoming(
         Some(_) => StatusCode::OK,
         None => StatusCode::NOT_FOUND,
     }
+}
+
+/// 批量决策请求体：对一个批次内的所有 pending 条目下同一个决定
+#[derive(Debug, serde::Deserialize)]
+struct BatchDecideRequest {
+    batch_id: String,
+    accept: bool,
+}
+
+/// 一次接受/拒绝整批（多文件发送时接收端只需确认一次）
+async fn batch_decide_incoming(
+    State(state): State<AppState>,
+    Json(req): Json<BatchDecideRequest>,
+) -> impl IntoResponse {
+    let done = state
+        .transfer
+        .incoming
+        .decide_batch(&req.batch_id, req.accept)
+        .await;
+    info!(
+        batch_id = %req.batch_id,
+        accepted = req.accept,
+        count = done.len(),
+        "batch incoming decided"
+    );
+    if done.is_empty() {
+        // 批次不存在或已全部超时：和单个决策一样回 404，UI 据此提示"已过期"
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "decided": 0 })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "decided": done.len(),
+            "incoming_ids": done,
+        })),
+    )
 }
 
 async fn reject_incoming(
