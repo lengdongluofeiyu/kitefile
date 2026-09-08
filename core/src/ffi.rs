@@ -101,6 +101,31 @@ pub unsafe extern "C" fn ftcore_init(
         };
         let runtime_handle = runtime.handle().clone();
 
+        // 端口退避。必须在构造 discovery / transfer **之前**定下来：
+        // mDNS 的 TXT 会把实际端口广播出去，对端靠它建连，所以这里改端口
+        // 对端依然能正确发现；反过来若先按 7878 注册 mDNS、再发现绑不上，
+        // 对端就会拿着一个错误的端口去连。
+        //
+        // 为什么要退避：Windows 上 Hyper-V / WSL / Docker 会动态保留成片 TCP
+        // 端口，7878 可能正好落在保留区，bind 失败报 os error 10013，
+        // 且保留区间每次开机都可能变 —— 症状是 daemon 间歇性起不来。
+        if let Some(p) = crate::pick_available_port(crate::GATEWAY_PORT_CANDIDATES) {
+            if p != config.gateway_port {
+                warn!(from = config.gateway_port, to = p, "gateway port unavailable, fell back");
+                config.gateway_port = p;
+            }
+        } else {
+            warn!("no gateway port available; will try default and likely fail");
+        }
+        if let Some(p) = crate::pick_available_port(crate::TRANSFER_PORT_CANDIDATES) {
+            if p != config.transfer_port {
+                warn!(from = config.transfer_port, to = p, "transfer port unavailable, fell back");
+                config.transfer_port = p;
+            }
+        } else {
+            warn!("no transfer port available; will try default and likely fail");
+        }
+
         // 身份持久化：id/名称复用上次的，重启后 mDNS 注册同一服务实例，
         // 对端设备表按 id 覆盖同一条记录（否则每次重启都被当成“新设备”）
         let identity = crate::discovery::load_or_create_identity(

@@ -18,8 +18,19 @@ import 'package:window_manager/window_manager.dart';
 /// - iOS（预留）：使用同 UI 但隐藏窗口控制
 /// - Android（移动端走 mobile 项目）：纯 UI
 
-const String kDaemonHttp = 'http://127.0.0.1:7878';
-const String kDaemonWs = 'ws://127.0.0.1:7878/ws/progress';
+/// daemon 网关端口候选：必须与 core 的 `GATEWAY_PORT_CANDIDATES` 保持一致。
+///
+/// 为什么不是一个固定值：Windows 上 Hyper-V / WSL / Docker 会动态保留成片
+/// TCP 端口，7878 可能正好落在保留区里，daemon 会退避到下一个候选。
+/// 保留区间每次开机都可能变，所以症状是间歇性的。
+const List<int> kGatewayPortCandidates = [7878, 17878, 27878];
+
+/// daemon 实际监听的端口，由 `DaemonManager` 探测后写入。
+/// 未探测到时先用首选，保证 UI 不会因端口未定而崩。
+int daemonPort = 7878;
+
+String get kDaemonHttp => 'http://127.0.0.1:$daemonPort';
+String get kDaemonWs => 'ws://127.0.0.1:$daemonPort/ws/progress';
 
 /// 全局守护进程管理器（单例）
 final DaemonManager daemonManager = DaemonManager();
@@ -48,13 +59,12 @@ void main() async {
 /// 守护进程管理器
 ///
 /// 职责：
-/// - 启动时检查 http://127.0.0.1:7878/api/whoami 是否响应
+/// - 启动时逐个探测 `kGatewayPortCandidates` 上 /api/whoami 是否响应
 ///   - 已响应：说明已有 daemon（用户手动启过 / 上次未退出），直接复用
 ///   - 未响应：spawn 一个 ftcore-cli.exe daemon 子进程
 /// - 子进程用 detached 模式：UI 崩溃不会拖死 daemon，正在传的文件不会断
 /// - 窗口关闭时显式 kill 子进程（避免孤儿进程占用端口）
 class DaemonManager {
-  static const int _port = 7878;
   Process? _process;
   bool _spawned = false;
   bool _isReady = false;
@@ -124,15 +134,25 @@ class DaemonManager {
     }
   }
 
-  /// 检查 daemon 是否响应
+  /// 检查 daemon 是否响应。
+  ///
+  /// 逐个试候选端口：daemon 可能因为默认端口被系统占用而退避到备选，
+  /// 所以不能只试 7878。命中后把实际端口写进全局 `daemonPort`，
+  /// 后续所有请求（含 WebSocket）都跟着走这个端口。
   Future<bool> _isAlive() async {
-    try {
-      final r = await httpGet('http://127.0.0.1:$_port/api/whoami')
-          .timeout(const Duration(milliseconds: 500));
-      return r.isNotEmpty;
-    } catch (_) {
-      return false;
+    for (final p in kGatewayPortCandidates) {
+      try {
+        final r = await httpGet('http://127.0.0.1:$p/api/whoami')
+            .timeout(const Duration(milliseconds: 500));
+        if (r.isNotEmpty) {
+          daemonPort = p;
+          return true;
+        }
+      } catch (_) {
+        // 该端口没响应，试下一个
+      }
     }
+    return false;
   }
 
   /// 查找 ftcore-cli.exe 路径

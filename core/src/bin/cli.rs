@@ -11,6 +11,7 @@
 //! 只在可信网络里临时开。
 
 use std::sync::Arc;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -42,6 +43,23 @@ async fn run_daemon(allow_remote_admin: bool) -> anyhow::Result<()> {
     let mut config = ftcore::EngineConfig::default();
     config.allow_remote_admin = allow_remote_admin;
 
+    // 端口退避：默认端口可能落在系统保留区间（Windows 上 Hyper-V / WSL /
+    // Docker 会动态保留成片端口），bind 失败报 os error 10013。
+    // 必须在构造 discovery / transfer 之前定下来——mDNS 的 TXT 会把实际端口
+    // 广播出去，对端靠它建连。
+    let gateway_port = ftcore::pick_available_port(ftcore::GATEWAY_PORT_CANDIDATES)
+        .unwrap_or_else(|| os_pick_port(config.gateway_port));
+    let transfer_port = ftcore::pick_available_port(ftcore::TRANSFER_PORT_CANDIDATES)
+        .unwrap_or_else(|| os_pick_port(config.transfer_port));
+    if gateway_port != config.gateway_port || transfer_port != config.transfer_port {
+        warn!(
+            gateway_port,
+            transfer_port, "default ports unavailable, fell back"
+        );
+        config.gateway_port = gateway_port;
+        config.transfer_port = transfer_port;
+    }
+
     // 身份持久化：id/名称复用上次的，重启后 mDNS 注册同一服务实例，
     // 对端设备表按 id 覆盖同一条记录（否则每次重启都被当成“新设备”）
     let identity = ftcore::discovery::load_or_create_identity(
@@ -68,8 +86,8 @@ async fn run_daemon(allow_remote_admin: bool) -> anyhow::Result<()> {
     Arc::clone(&transfer).spawn_receiver().await?;
     Arc::clone(&discovery).spawn_event_loop(tokio::runtime::Handle::current());
 
-    let gateway = ftcore::HttpGateway::new(discovery, transfer, Arc::new(config));
-    gateway.run(7878).await?;
+    let gateway = ftcore::HttpGateway::new(discovery, transfer, Arc::new(config.clone()));
+    gateway.run(config.gateway_port).await?;
     Ok(())
 }
 
@@ -102,15 +120,50 @@ async fn list_devices() -> anyhow::Result<()> {
 }
 
 /// 选一个空闲端口：优先 preferred，被占用时依次尝试备选
-fn pick_free_port(preferred: u16, alternatives: &[u16]) -> u16 {
-    let mut candidates = vec![preferred];
-    candidates.extend_from_slice(alternatives);
-    for p in candidates {
-        if std::net::TcpListener::bind(("0.0.0.0", p)).is_ok() {
-            return p;
+/// 一次极简 HTTP GET，只取响应体。失败一律返回 None（调用方继续试下一个端口）。
+async fn http_get_body(host: &str, port: u16, path: &str) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect((host, port)).await.ok()?;
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
+        path, host, port
+    );
+    s.write_all(req.as_bytes()).await.ok()?;
+    s.flush().await.ok()?;
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).await.ok()?;
+    let text = String::from_utf8_lossy(&resp).to_string();
+    Some(text.split("\r\n\r\n").nth(1)?.to_string())
+}
+
+/// 探测对端真实在用的一对端口。
+///
+/// 对端可能因为默认端口被系统保留而退避到备选，所以不能假定 7878/7879。
+/// 依次试候选 gateway 端口，命中后从 whoami 响应里读出它实际通告的端口。
+async fn probe_peer_ports(ip: &str) -> anyhow::Result<(u16, u16)> {
+    for &p in ftcore::GATEWAY_PORT_CANDIDATES {
+        let Some(body) = http_get_body(ip, p, "/api/whoami").await else {
+            continue;
+        };
+        let Ok(j) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let gw = j
+            .get("gateway_port")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(p as u64) as u16;
+        if let Some(tp) = j.get("transfer_port").and_then(|v| v.as_u64()) {
+            return Ok((gw, tp as u16));
         }
     }
-    // 全部被占用：让 OS 随机分配（TcpListener::bind port 0 必成功）
+    Err(anyhow::anyhow!(
+        "peer {ip} 在候选端口 {:?} 上都没有响应，确认对端 daemon 已启动且在同一网段",
+        ftcore::GATEWAY_PORT_CANDIDATES
+    ))
+}
+
+/// 候选全被占用时的兜底：让 OS 随机分配（bind port 0 必成功）
+fn os_pick_port(preferred: u16) -> u16 {
     match std::net::TcpListener::bind(("0.0.0.0", 0)) {
         Ok(l) => l.local_addr().map(|a| a.port()).unwrap_or(preferred),
         Err(_) => preferred,
@@ -123,8 +176,17 @@ async fn send(ip: String, path: String) -> anyhow::Result<()> {
     // CLI send 需要本机 gateway 可达（接收方回包 /api/incoming-resp 会打过来），
     // 因此拉起完整栈：discovery + receiver + gateway。
     // 若本机已有 daemon 占用默认端口，则退避到备选端口。
-    let gateway_port = pick_free_port(config.gateway_port, &[17878, 27878]);
-    let transfer_port = pick_free_port(config.transfer_port, &[17879, 27879]);
+    // 退避：CLI 常和常驻 daemon 同时存在，两边都要能起得来
+    let gateway_port = ftcore::pick_available_port(ftcore::GATEWAY_PORT_CANDIDATES)
+        .unwrap_or_else(|| os_pick_port(config.gateway_port));
+    let transfer_port = ftcore::pick_available_port(ftcore::TRANSFER_PORT_CANDIDATES)
+        .unwrap_or_else(|| os_pick_port(config.transfer_port));
+    if gateway_port != config.gateway_port || transfer_port != config.transfer_port {
+        warn!(
+            gateway_port,
+            transfer_port, "default ports unavailable, fell back"
+        );
+    }
     config.gateway_port = gateway_port;
     config.transfer_port = transfer_port;
 
@@ -157,12 +219,21 @@ async fn send(ip: String, path: String) -> anyhow::Result<()> {
     // 回包地址必须是真实本机 IP（不能用 127.0.0.1，跨机时对端无法回包）
     let self_ip = discovery.self_ip().unwrap_or_else(|| "127.0.0.1".into());
 
+    // 对端端口**不能写死 7879**：它也可能因为默认端口被系统保留而退避过。
+    // 依次试候选 gateway 端口，从 /api/whoami 里读它真实在用的端口。
+    let (peer_gateway_port, peer_transfer_port) = probe_peer_ports(&ip).await?;
+    info!(
+        peer = %ip,
+        gateway_port = peer_gateway_port,
+        transfer_port = peer_transfer_port,
+        "peer ports resolved"
+    );
+
     let mut handle = transfer
         .send_file(
             ip,
-            // 对端端口（目标机未改配置时为默认值）
-            7879,
-            7878,
+            peer_transfer_port,
+            peer_gateway_port,
             std::path::PathBuf::from(path),
             None,
             self_id,

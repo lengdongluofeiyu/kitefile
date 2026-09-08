@@ -93,6 +93,70 @@ impl Default for EngineConfig {
     }
 }
 
+/// HTTP 网关端口候选（首选 + 备选）
+///
+/// 为什么不能只认一个端口：Windows 上 Hyper-V / WSL / Docker 会**动态保留**
+/// 成片 TCP 端口，用
+/// `netsh interface ipv4 show excludedportrange protocol=tcp` 能看到。
+/// 7878 就可能正好落在某个保留区间里，此时 bind 会失败并报
+/// `os error 10013`（WSAEACCES，一种访问权限不允许的套接字操作）。
+/// 保留区间每次开机都可能不同，所以症状是**间歇性**的：
+/// 有时 daemon 起得来，有时起不来，很容易误判成别的问题。
+pub const GATEWAY_PORT_CANDIDATES: &[u16] = &[7878, 17878, 27878];
+
+/// TCP 数据通道端口候选（与上面一一对应）
+pub const TRANSFER_PORT_CANDIDATES: &[u16] = &[7879, 17879, 27879];
+
+/// 从候选里挑一个当前能 bind 的端口，全被占用时返回 None。
+///
+/// 注意这是"先探再绑"，两者之间理论上有竞态；本机启动瞬间窗口极小，
+/// 而且真撞上了也只是退化成启动失败并记 error，不会静默出错。
+pub fn pick_available_port(candidates: &[u16]) -> Option<u16> {
+    for &p in candidates {
+        if std::net::TcpListener::bind(("0.0.0.0", p)).is_ok() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_available_port_returns_none_when_all_taken() {
+        let blocker = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let taken = blocker.local_addr().unwrap().port();
+        assert!(
+            pick_available_port(&[taken]).is_none(),
+            "唯一候选被占用时必须返回 None，调用方才知道要兜底"
+        );
+    }
+
+    #[test]
+    fn pick_available_port_skips_taken_and_picks_next() {
+        let taken_sock = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let taken = taken_sock.local_addr().unwrap().port();
+        let probe = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let free = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        assert_eq!(
+            pick_available_port(&[taken, free]),
+            Some(free),
+            "应跳过被占用的第一个候选，选中后面的可用端口"
+        );
+    }
+
+    #[test]
+    fn port_candidate_lists_are_same_length() {
+        // gateway 与 transfer 的候选一一对应，少了任何一个都会让退避后
+        // 两个端口错配（一端通告 7878/17879 这种组合）
+        assert_eq!(GATEWAY_PORT_CANDIDATES.len(), TRANSFER_PORT_CANDIDATES.len());
+    }
+}
+
 fn whoami_fallback() -> String {
     std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))

@@ -219,6 +219,12 @@ class IncomingEntry {
       );
 }
 
+/// daemon 网关端口候选：必须与 core 的 `GATEWAY_PORT_CANDIDATES` 一致。
+///
+/// 默认端口可能被系统保留（Windows 上 Hyper-V/WSL/Docker 会动态保留成片
+/// TCP 端口），此时 daemon 会退避到下一个候选，UI 不能只认 7878。
+const List<int> kGatewayPortCandidates = [7878, 17878, 27878];
+
 /// 一次多选发送里，单个文件所属的批次信息（发给 daemon 用）
 class SendBatch {
   final String batchId;
@@ -240,10 +246,13 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   // 默认指向本机；用户可改成对端 IP
   String _daemonHost = '127.0.0.1';
+  /// daemon 实际监听的网关端口。默认端口可能被系统保留（Android 上少见，
+  /// 但与桌面端共用同一套退避逻辑），探测到实际端口后更新。
+  int _daemonPort = kGatewayPortCandidates.first;
   final TextEditingController _hostController = TextEditingController(text: '127.0.0.1');
 
-  String get _httpBase => 'http://$_daemonHost:7878';
-  String get _wsBase => 'ws://$_daemonHost:7878/ws/progress';
+  String get _httpBase => 'http://$_daemonHost:$_daemonPort';
+  String get _wsBase => 'ws://$_daemonHost:$_daemonPort/ws/progress';
 
   WhoAmI? _me;
   List<Device> _devices = [];
@@ -312,7 +321,10 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// 轮询 daemon 直到 /api/whoami 可达或超时
+  /// 轮询 daemon 直到 /api/whoami 可达或超时。
+  ///
+  /// 每轮都把候选端口试一遍：daemon 可能因为默认端口被占用而退避，
+  /// 命中后 `_fetchWhoAmI` 会把实际端口写进 `_daemonPort`。
   Future<void> _waitDaemonReady({required Duration timeout}) async {
     final deadline = DateTime.now().add(timeout);
     while (mounted && DateTime.now().isBefore(deadline)) {
@@ -358,16 +370,25 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _fetchWhoAmI() async {
-    try {
-      final r = await httpGet('$_httpBase/api/whoami');
-      final me = WhoAmI.fromJson(jsonDecode(r) as Map<String, dynamic>);
-      setState(() {
-        _me = me;
-        _daemonOnline = true;
-      });
-    } catch (_) {
-      setState(() => _daemonOnline = false);
+    // 逐个试候选端口：默认端口可能被系统保留，daemon 会退避到备选。
+    // 命中后记住实际端口，后续所有请求（含 WS）都跟着走。
+    for (final p in kGatewayPortCandidates) {
+      try {
+        final r = await httpGet('http://$_daemonHost:$p/api/whoami')
+            .timeout(const Duration(milliseconds: 800));
+        final me = WhoAmI.fromJson(jsonDecode(r) as Map<String, dynamic>);
+        if (!mounted) return;
+        setState(() {
+          _daemonPort = p;
+          _me = me;
+          _daemonOnline = true;
+        });
+        return;
+      } catch (_) {
+        // 该端口没响应，试下一个
+      }
     }
+    if (mounted) setState(() => _daemonOnline = false);
   }
 
   Future<void> _refreshDevices() async {
