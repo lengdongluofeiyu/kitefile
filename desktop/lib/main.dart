@@ -677,6 +677,9 @@ class _HomePageState extends State<HomePage> with WindowListener {
                             body: jsonEncode({'device_name': name}),
                           );
                           setDialogState(() => currentName = name);
+                          // 重新拉 whoami：_me 只在启动时取过一次，
+                          // 不刷新的话「本机信息」会一直显示旧名字。
+                          await _fetchWhoAmI();
                           if (ctx.mounted) {
                             ScaffoldMessenger.of(ctx).showSnackBar(
                               SnackBar(content: Text('设备名称已更新：$name')),
