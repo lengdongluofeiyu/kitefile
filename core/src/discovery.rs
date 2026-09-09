@@ -383,13 +383,20 @@ fn pick_peer_address_with_nets(
     candidates: &[IpAddr],
     nets: &[(Ipv4Addr, Ipv4Addr)],
 ) -> String {
-    for c in candidates {
-        if let IpAddr::V4(v4) = c {
-            if nets
-                .iter()
-                .any(|(mine, mask)| in_same_subnet(*v4, *mine, *mask))
-            {
-                return v4.to_string();
+    // 外层必须是**网段**而不是候选地址。
+    // 上一版写反了（外层候选、内层网段），结果主网卡优先级形同虚设：
+    // 虚拟网卡地址同样"与本机某网卡同网段"，先撞上哪个全看候选集合的
+    // 迭代顺序，于是一会儿选中 10.124.68.246(WLAN)、一会儿 192.168.17.1(VMware)。
+    // 外层必须是**网段**而不是候选地址。
+    // 上一版写反了（外层候选、内层网段），结果主网卡优先级形同虚设：
+    // 虚拟网卡地址同样"与本机某网卡同网段"，先撞上哪个全看候选集合的
+    // 迭代顺序，于是一会儿选中 10.124.68.246(WLAN)、一会儿 192.168.17.1(VMware)。
+    for (mine, mask) in nets {
+        for c in candidates {
+            if let IpAddr::V4(v4) = c {
+                if in_same_subnet(*v4, *mine, *mask) {
+                    return v4.to_string();
+                }
             }
         }
     }
@@ -465,6 +472,26 @@ mod tests {
             pick_peer_address_with_nets(&candidates, &nets),
             "10.124.5.9",
             "不能选中虚拟网卡地址，否则对端连不上"
+        );
+    }
+
+    /// 主网卡网段虽然在 nets[0]，但候选里**虚拟网卡地址排在前面**——
+    /// 必须仍然选中主网卡网段的地址。
+    ///
+    /// 这条抓的是上一版的实现错误：当时外层遍历候选、内层遍历网段，
+    /// 于是 192.168.17.1 会先撞上"与本机某网卡同网段"而胜出，
+    /// 主网卡优先级等于没做（表现为选中的 IP 时好时坏）。
+    #[test]
+    fn primary_subnet_wins_even_when_virtual_addr_comes_first() {
+        let nets = vec![
+            (v4("10.124.68.246"), v4("255.255.0.0")), // 主网卡，已排到最前
+            (v4("192.168.17.1"), v4("255.255.255.0")),
+        ];
+        let candidates = vec![ip("192.168.17.1"), ip("172.23.48.1"), ip("10.124.5.9")];
+        assert_eq!(
+            pick_peer_address_with_nets(&candidates, &nets),
+            "10.124.5.9",
+            "主网卡网段必须优先，不能因为候选顺序而选中虚拟网卡地址"
         );
     }
 
