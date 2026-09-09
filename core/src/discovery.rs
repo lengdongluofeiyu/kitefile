@@ -8,7 +8,7 @@ use crate::Result;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -246,12 +246,9 @@ impl DiscoveryService {
                                 .find(|p| p.key() == "transfer_port")
                                 .and_then(|p| p.val_str().parse().ok())
                                 .unwrap_or(7879u16);
-                            let ip = info
-                                .get_addresses()
-                                .iter()
-                                .next()
-                                .map(|a| a.to_string())
-                                .unwrap_or_default();
+                            let addrs: Vec<IpAddr> =
+                                info.get_addresses().iter().copied().collect();
+                            let ip = pick_peer_address(&addrs);
 
                             let device = Device {
                                 id: id.clone(),
@@ -342,6 +339,63 @@ fn build_service_info(
     .map_err(|e| crate::CoreError::Discovery(e.to_string()))
 }
 
+/// 从对端通告的多个地址里挑一个真正能连上的。
+///
+/// 多网卡机器（装了 VMware / Hyper-V / Docker 就会有虚拟网卡）上，mDNS 会把
+/// **所有**网卡的地址都放进同一条 A 记录集合里。原来直接取第一个，而集合的
+/// 迭代顺序是不确定的——实测在同一台机器上能先后解析出 192.168.17.1、
+/// 192.168.73.1、172.23.48.1 三个虚拟网卡地址，真实网卡 10.124.68.246(WLAN)
+/// 反而选不中，对端拿到这种地址必然连不上。
+///
+/// 策略：优先选与本机某个网卡**同网段**的那个。都没有同网段的（比如跨网段
+/// 场景）再退回原来的"取第一个"，保证不会比修复前更差。
+fn pick_peer_address(candidates: &[IpAddr]) -> String {
+    let nets = my_ipv4_nets();
+    pick_peer_address_with_nets(candidates, &nets)
+}
+
+fn pick_peer_address_with_nets(
+    candidates: &[IpAddr],
+    nets: &[(Ipv4Addr, Ipv4Addr)],
+) -> String {
+    for c in candidates {
+        if let IpAddr::V4(v4) = c {
+            if nets
+                .iter()
+                .any(|(mine, mask)| in_same_subnet(*v4, *mine, *mask))
+            {
+                return v4.to_string();
+            }
+        }
+    }
+    candidates
+        .iter()
+        .next()
+        .map(|a| a.to_string())
+        .unwrap_or_default()
+}
+
+fn in_same_subnet(a: Ipv4Addr, b: Ipv4Addr, mask: Ipv4Addr) -> bool {
+    (u32::from(a) & u32::from(mask)) == (u32::from(b) & u32::from(mask))
+}
+
+/// 本机各网卡的 (IPv4 地址, 子网掩码)
+pub fn my_ipv4_nets() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    let mut out = Vec::new();
+    if let Ok(ifaces) = get_if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            // if_addrs 0.13 的掩码在 IfAddr::V4 里，Interface 本身没有 netmask()
+            if let get_if_addrs::IfAddr::V4(v4) = &iface.addr {
+                if v4.ip.is_loopback() || v4.ip.is_unspecified() {
+                    continue;
+                }
+                out.push((v4.ip, v4.netmask));
+            }
+        }
+    }
+    out
+}
+
 /// 获取本机所有非环回 IPv4 地址
 pub fn my_ipv4_addrs() -> Vec<String> {
     let mut out = Vec::new();
@@ -360,4 +414,68 @@ pub fn my_ipv4_addrs() -> Vec<String> {
 // get_if_addrs 是平台支持库；这里直接引入以避免单独 crate 列表
 mod get_if_addrs {
     pub use if_addrs::*;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+    fn v4(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    /// 真实场景：本机有 WLAN(10.124.68.246/16) 和 VMware(192.168.73.1/24)，
+    /// 对端把三个网卡地址都通告了过来，必须选中跟我们同网段的那个。
+    #[test]
+    fn prefers_address_on_my_subnet_over_virtual_adapters() {
+        let nets = vec![
+            (v4("10.124.68.246"), v4("255.255.0.0")),
+            (v4("192.168.73.1"), v4("255.255.255.0")),
+        ];
+        let candidates = vec![ip("192.168.17.1"), ip("172.23.48.1"), ip("10.124.5.9")];
+        assert_eq!(
+            pick_peer_address_with_nets(&candidates, &nets),
+            "10.124.5.9",
+            "不能选中虚拟网卡地址，否则对端连不上"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_first_when_nothing_matches() {
+        let nets = vec![(v4("10.124.68.246"), v4("255.255.0.0"))];
+        let candidates = vec![ip("192.168.17.1"), ip("172.23.48.1")];
+        assert_eq!(
+            pick_peer_address_with_nets(&candidates, &nets),
+            "192.168.17.1",
+            "没匹配到时行为应与修复前一致（取第一个），不能变得更差"
+        );
+    }
+
+    #[test]
+    fn empty_candidates_yield_empty_string() {
+        let nets = vec![(v4("10.0.0.1"), v4("255.255.255.0"))];
+        assert_eq!(pick_peer_address_with_nets(&[], &nets), "");
+    }
+
+    #[test]
+    fn subnet_check_respects_netmask() {
+        assert!(in_same_subnet(
+            v4("10.124.5.9"),
+            v4("10.124.68.246"),
+            v4("255.255.0.0")
+        ));
+        assert!(!in_same_subnet(
+            v4("10.125.5.9"),
+            v4("10.124.68.246"),
+            v4("255.255.0.0")
+        ));
+        assert!(!in_same_subnet(
+            v4("10.124.5.9"),
+            v4("10.124.68.246"),
+            v4("255.255.255.0")
+        ));
+    }
 }
