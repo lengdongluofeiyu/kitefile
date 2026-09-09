@@ -70,7 +70,6 @@ pub struct Device {
     pub gateway_port: u16,
     pub transfer_port: u16,
     pub platform: String,
-    pub last_seen: std::time::SystemTime,
 }
 
 /// 发现服务：注册本机并发现局域网内其他设备
@@ -185,36 +184,8 @@ impl DiscoveryService {
             _ => return, // 离线模式或 browse 失败：无事件可轮询
         };
 
-        // 设备条目过期清理：进程被强杀时不会发 mDNS goodbye，
-        // ServiceRemoved 永远不触发；而 mdns-sd 缓存的 PTR 记录 TTL 长达 75 分钟，
-        // 陈旧条目会一直占着设备表（对端表现为“两个相同 IP 的重复设备”）。
-        // 在线设备会周期性响应 querier 的刷新查询（SRV/A 记录 TTL 120s → 约每 100s
-        // 重新触发 ServiceResolved），last_seen 持续更新；超过阈值未更新视为下线。
-        {
-            let devices = self.devices.clone();
-            rt.spawn(async move {
-                let mut interval =
-                    tokio::time::interval(std::time::Duration::from_secs(60));
-                loop {
-                    interval.tick().await;
-                    let now = std::time::SystemTime::now();
-                    let mut map = devices.write();
-                    let stale: Vec<DeviceId> = map
-                        .iter()
-                        .filter(|(_, d)| {
-                            now.duration_since(d.last_seen)
-                                .map(|el| el.as_secs() > 300)
-                                .unwrap_or(true)
-                        })
-                        .map(|(id, _)| id.clone())
-                        .collect();
-                    for id in stale {
-                        info!(%id, "device entry expired (no mDNS refresh for 5 min), removed");
-                        map.remove(&id);
-                    }
-                }
-            });
-        }
+        // 设备下线检测：应用层主动探测（mDNS 事件不可用于此目的，见 spawn_probe_loop 注释）
+        spawn_probe_loop(self.devices.clone(), rt.clone());
 
         rt.spawn(async move {
             loop {
@@ -257,7 +228,6 @@ impl DiscoveryService {
                                 gateway_port,
                                 transfer_port,
                                 platform,
-                                last_seen: std::time::SystemTime::now(),
                             };
                             info!(?device, "resolved device");
                             self.devices.write().insert(id, device);
@@ -302,6 +272,65 @@ impl DiscoveryService {
     pub fn self_ip(&self) -> Option<String> {
         my_ipv4_addrs().into_iter().next()
     }
+}
+
+/// 设备下线检测：应用层 TCP 探测。
+///
+/// **为什么不能用 mDNS 事件判断下线**（mdns-sd 0.11.5 源码确认）：
+/// `ServiceResolved` 只在记录**首次**进入缓存时发一次。对端周期性的刷新
+/// 响应走 `add_or_update` 的"已存在"分支（reset_ttl、updated=false），
+/// 不触发任何事件。因此"多久没收到 mDNS 事件"区分不了在线/离线——
+/// 曾经基于这个错误假设做过 5 分钟过期清理，结果是守护进程跑满 5 分钟后
+/// 把**所有**设备（含在线的）从表里删光，而 mdns-sd 缓存里的 PTR 还活着
+/// （TTL 75 分钟）不会重新发 ServiceFound，设备从此消失、两端互相看不到。
+///
+/// **本方案**：每 60 秒对表内每个设备的 gateway 端口做一次 TCP 握手
+/// （握手成功即代表对端 daemon 在监听，不发 HTTP 请求），连续 3 次失败
+/// 才移除——防 gateway 瞬时忙导致误判。强杀进程发不出 mDNS goodbye 的
+/// 僵尸条目在 ~3 分钟内被清掉，在线设备零误伤。
+fn spawn_probe_loop(
+    devices: Arc<RwLock<HashMap<DeviceId, Device>>>,
+    rt: tokio::runtime::Handle,
+) {
+    rt.spawn(async move {
+        let mut fails: HashMap<DeviceId, u32> = HashMap::new();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let snapshot: Vec<(DeviceId, String, u16)> = {
+                let map = devices.read();
+                map.iter()
+                    .map(|(id, d)| (id.clone(), d.ip.clone(), d.gateway_port))
+                    .collect()
+            };
+            for (id, ip, port) in snapshot {
+                // 空 IP（解析失败）的条目也按探测失败处理
+                let alive = if ip.is_empty() {
+                    false
+                } else {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tokio::net::TcpStream::connect((ip.as_str(), port)),
+                    )
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false)
+                };
+
+                if alive {
+                    fails.remove(&id);
+                } else {
+                    let n = fails.entry(id.clone()).or_insert(0);
+                    *n += 1;
+                    if *n >= 3 {
+                        info!(%id, ip, "device probe failed 3 times, removing from device table");
+                        devices.write().remove(&id);
+                        fails.remove(&id);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// 构造 mDNS 服务注册信息（id 作实例名与主机名，name 等走 TXT 属性）

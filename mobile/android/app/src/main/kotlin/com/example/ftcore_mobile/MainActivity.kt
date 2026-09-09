@@ -44,6 +44,10 @@ class MainActivity : FlutterActivity() {
                             result.error("UNAVAILABLE", "external files dir unavailable", null)
                         }
                     }
+                    // 设备型号（如 "Xiaomi 13"），做 daemon 默认设备名。
+                    // 不传的话 Rust 侧回退 USERNAME 环境变量——Android 上不存在，
+                    // 默认名会变成 "device-xxxx" 这种无信息量的名字。
+                    "getDeviceModel" -> result.success(android.os.Build.MODEL)
                     // 用系统默认应用打开接收到的文件（FileProvider 授权）
                     "openFile" -> {
                         val path = call.arguments as? String

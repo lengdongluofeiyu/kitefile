@@ -52,6 +52,19 @@ Future<String?> _externalFilesDir() async {
   }
 }
 
+/// Android：设备型号（如 "Xiaomi 13"），作 daemon 默认设备名。
+/// 不传时 Rust 侧回退 USERNAME 环境变量——Android 上不存在，
+/// 默认名会变成 "device-xxxx" 这种无信息量的名字。
+Future<String?> _deviceModel() async {
+  try {
+    return await _nativeChannel.invokeMethod<String>('getDeviceModel');
+  } on PlatformException {
+    return null;
+  } on MissingPluginException {
+    return null;
+  }
+}
+
 /// String → NUL 结尾 UTF-8 C 字符串（调用方负责 _free）
 Pointer<Uint8> _toNativeUtf8(String s) {
   final units = utf8.encode(s);
@@ -78,6 +91,8 @@ Future<bool> initFtcoreDaemon({String? deviceName}) async {
   final dir = await _externalFilesDir();
   if (dir != null) receiveDir = '$dir/ftcore';
 
+  // 默认设备名用机型（调用方未显式指定时）
+  deviceName ??= await _deviceModel();
   final namePtr = deviceName == null ? nullptr : _toNativeUtf8(deviceName);
   final dirPtr = receiveDir == null ? nullptr : _toNativeUtf8(receiveDir);
   try {
