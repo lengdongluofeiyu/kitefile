@@ -350,8 +350,33 @@ fn build_service_info(
 /// 策略：优先选与本机某个网卡**同网段**的那个。都没有同网段的（比如跨网段
 /// 场景）再退回原来的"取第一个"，保证不会比修复前更差。
 fn pick_peer_address(candidates: &[IpAddr]) -> String {
-    let nets = my_ipv4_nets();
+    let mut nets = my_ipv4_nets();
+    // 把主网卡（走默认路由的那张）所在网段排到最前，优先匹配。
+    // 否则"同网段"条件太宽松：自己发现自己时，每个虚拟网卡地址都跟自己
+    // 同网段，先撞上哪个是不确定的（实测会选中 VMware 的 192.168.73.1，
+    // 而真实出口是 WLAN 的 10.124.68.246）。
+    if let Some(primary) = primary_ipv4() {
+        if let Some(pos) = nets.iter().position(|(ip, _)| *ip == primary) {
+            let entry = nets.remove(pos);
+            nets.insert(0, entry);
+        }
+    }
     pick_peer_address_with_nets(candidates, &nets)
+}
+
+/// 本机主用 IPv4：通往默认路由的那个源地址。
+///
+/// 做法是 UDP connect 到一个**不需要可达**的目标再读 local_addr ——
+/// connect 只查路由表、不发任何包，所以既无网络开销也无隐私顾虑。
+/// 拿不到（比如没有默认路由）就返回 None，调用方退回普通顺序。
+fn primary_ipv4() -> Option<Ipv4Addr> {
+    use std::net::UdpSocket;
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        IpAddr::V4(v4) => Some(v4),
+        _ => None,
+    }
 }
 
 fn pick_peer_address_with_nets(
