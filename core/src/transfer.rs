@@ -405,6 +405,11 @@ pub struct TransferEngine {
     /// 已接受的 incoming：file_id → (发送方 IP, 发送方 gateway 端口)
     /// 接收方取消时用于通知发送方联动取消
     incoming_endpoints: TokioMutex<HashMap<String, (String, u16)>>,
+    /// 发送中的任务：file_id → (对端 IP, 对端 gateway 端口)
+    /// 发送方取消时用于通知接收方联动取消（对称于 incoming_endpoints；
+    /// 之前只有"接收方取消→通知发送方"，反向漏了，表现为发送方取消后
+    /// 接收方 UI 永远停在"进行中"）
+    outgoing_endpoints: TokioMutex<HashMap<String, (String, u16)>>,
 }
 
 impl TransferEngine {
@@ -428,6 +433,7 @@ impl TransferEngine {
             progress_cache: Arc::new(Mutex::new(ProgressCache::new(PROGRESS_CACHE_CAP))),
             recv_speed_state: TokioMutex::new(HashMap::new()),
             incoming_endpoints: TokioMutex::new(HashMap::new()),
+            outgoing_endpoints: TokioMutex::new(HashMap::new()),
         }
     }
 
@@ -473,6 +479,23 @@ impl TransferEngine {
                 transfer_port: self.transfer_port,
             });
             found = true;
+        }
+
+        // 发送方取消 → 通知接收方联动取消。
+        // 接收方的 cancel() 自带"清接收槽位 + 推 Canceled 进度"的接收方分支
+        // （即下方代码），这里只需跨机调它的 /api/cancel 即可。
+        // 不通知的话：连接直接断掉，接收端只留一行 warn，UI 永远显示进行中。
+        if let Some((target_ip, target_gateway_port)) =
+            self.outgoing_endpoints.lock().await.remove(file_id)
+        {
+            let file_id_owned = file_id.to_string();
+            tokio::spawn(async move {
+                let path = format!("/api/cancel/{}", file_id_owned);
+                if let Err(e) = http_post_json(&target_ip, target_gateway_port, &path, "{}").await
+                {
+                    warn!(error = %e, "notify receiver cancel failed");
+                }
+            });
         }
 
         // ---- 接收方视角：移除接收槽位、清理映射、推 Canceled ----
@@ -524,10 +547,11 @@ impl TransferEngine {
         found
     }
 
-    /// 发送任务结束后清理注册表（inflight / 等回包 oneshot）
+    /// 发送任务结束后清理注册表（inflight / 等回包 oneshot / 对端地址）
     async fn cleanup_send_state(&self, file_id: &str) {
         self.inflight.lock().remove(file_id);
         self.outgoing_offers.lock().await.remove(file_id);
+        self.outgoing_endpoints.lock().await.remove(file_id);
     }
 
     /// 启动接收端 TCP listener，等待对端发起的数据流连接
@@ -1032,7 +1056,12 @@ impl TransferEngine {
                 return;
             }
 
-            // 3. Accept → 启动多流 TCP 传输
+            // 3. Accept → 登记对端地址（发送方取消时通知它联动取消）→ 启动多流 TCP 传输
+            engine
+                .outgoing_endpoints
+                .lock()
+                .await
+                .insert(file_id_for_spawn.clone(), (target_ip.clone(), target_gateway_port));
             let engine_for_cleanup = engine.clone();
             let mut result = engine
                 .do_send(
