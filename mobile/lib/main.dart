@@ -225,6 +225,9 @@ class IncomingEntry {
 /// TCP 端口），此时 daemon 会退避到下一个候选，UI 不能只认 7878。
 const List<int> kGatewayPortCandidates = [7878, 17878, 27878];
 
+/// incoming 请求决策超时（秒）：与 core 的 `INCOMING_DECISION_TIMEOUT_SECS` 保持一致
+const int kDecisionTimeoutSecs = 60;
+
 /// 一次多选发送里，单个文件所属的批次信息（发给 daemon 用）
 class SendBatch {
   final String batchId;
@@ -466,54 +469,80 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// 批量接收弹窗：一次确认整批
+  /// 批量接收弹窗：一次确认整批（60 秒未接受自动超时）
   void _showBatchDialog(String batchId) {
     _batchTimers.remove(batchId)?.cancel();
     final entries = _pendingBatch.remove(batchId);
     if (entries == null || entries.isEmpty || !mounted) return;
     entries.sort((a, b) => (a.batchIndex ?? 0).compareTo(b.batchIndex ?? 0));
     final totalSize = entries.fold<int>(0, (s, e) => s + e.fileSize);
+    var remaining = kDecisionTimeoutSecs;
+    Timer? ticker;
 
     showDialog<void>(
       context: context,
       barrierDismissible: false,
-      builder: (_) => AlertDialog(
+      builder: (dialogCtx) => AlertDialog(
         title: Text('收到 ${entries.length} 个文件'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('来自: ${entries.first.fromName} (${entries.first.fromIp})'),
-            Text('合计: ${formatBytes(totalSize)}'),
-            const SizedBox(height: 8),
-            ...entries.map(
-              (e) => Padding(
-                padding: const EdgeInsets.symmetric(vertical: 2),
-                child: Text('${e.fileName}（${formatBytes(e.fileSize)}）',
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 13)),
-              ),
-            ),
-          ],
+        content: StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            ticker ??= Timer.periodic(const Duration(seconds: 1), (t) {
+              remaining -= 1;
+              if (remaining <= 0) {
+                t.cancel();
+                if (ctx.mounted) Navigator.pop(ctx);
+                _onIncomingTimeout(batchId);
+                return;
+              }
+              if (ctx.mounted) setDialogState(() {});
+            });
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('来自: ${entries.first.fromName} (${entries.first.fromIp})'),
+                Text('合计: ${formatBytes(totalSize)}'),
+                const SizedBox(height: 8),
+                ...entries.map(
+                  (e) => Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: Text('${e.fileName}（${formatBytes(e.fileSize)}）',
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 13)),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  '$remaining 秒内未接受将自动拒绝',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: remaining <= 10 ? Colors.orange : Colors.grey,
+                  ),
+                ),
+              ],
+            );
+          },
         ),
         actions: [
           TextButton(
             onPressed: () {
-              Navigator.pop(context);
+              ticker?.cancel();
+              Navigator.pop(dialogCtx);
               _decideBatch(batchId, false);
             },
             child: const Text('全部拒绝'),
           ),
           FilledButton(
             onPressed: () {
-              Navigator.pop(context);
+              ticker?.cancel();
+              Navigator.pop(dialogCtx);
               _decideBatch(batchId, true);
             },
             child: Text('全部接受 (${entries.length})'),
           ),
         ],
       ),
-    );
+    ).whenComplete(() => ticker?.cancel());
   }
 
   Future<void> _decideBatch(String batchId, bool accept) async {
@@ -527,46 +556,81 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {}
   }
 
-  /// 接收方确认弹窗：接受 / 拒绝传入请求
+  /// 接收方确认弹窗：接受 / 拒绝传入请求（60 秒未接受自动超时）
   void _showIncomingDialog(IncomingEntry e) {
+    var remaining = kDecisionTimeoutSecs;
+    Timer? ticker;
     showDialog<void>(
       context: context,
       barrierDismissible: false,
-      builder: (_) => AlertDialog(
+      builder: (dialogCtx) => AlertDialog(
         title: const Text('收到文件'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('来自: ${e.fromName} (${e.fromIp})'),
-            const SizedBox(height: 8),
-            Text('文件: ${e.fileName}'),
-            Text('大小: ${formatBytes(e.fileSize)}'),
-            if (e.sha256 != null)
-              Text(
-                'SHA256: ${e.sha256!.substring(0, e.sha256!.length.clamp(0, 16))}…',
-                style: const TextStyle(fontSize: 11, color: Colors.grey),
-              ),
-          ],
+        content: StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            ticker ??= Timer.periodic(const Duration(seconds: 1), (t) {
+              remaining -= 1;
+              if (remaining <= 0) {
+                t.cancel();
+                if (ctx.mounted) Navigator.pop(ctx);
+                _onIncomingTimeout(e.incomingId);
+                return;
+              }
+              if (ctx.mounted) setDialogState(() {});
+            });
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('来自: ${e.fromName} (${e.fromIp})'),
+                const SizedBox(height: 8),
+                Text('文件: ${e.fileName}'),
+                Text('大小: ${formatBytes(e.fileSize)}'),
+                if (e.sha256 != null)
+                  Text(
+                    'SHA256: ${e.sha256!.substring(0, e.sha256!.length.clamp(0, 16))}…',
+                    style: const TextStyle(fontSize: 11, color: Colors.grey),
+                  ),
+                const SizedBox(height: 10),
+                Text(
+                  '$remaining 秒内未接受将自动拒绝',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: remaining <= 10 ? Colors.orange : Colors.grey,
+                  ),
+                ),
+              ],
+            );
+          },
         ),
         actions: [
           TextButton(
             onPressed: () {
-              Navigator.pop(context);
+              ticker?.cancel();
+              Navigator.pop(dialogCtx);
               _decideIncoming(e.incomingId, false);
             },
             child: const Text('拒绝'),
           ),
           FilledButton(
             onPressed: () {
-              Navigator.pop(context);
+              ticker?.cancel();
+              Navigator.pop(dialogCtx);
               _decideIncoming(e.incomingId, true);
             },
             child: const Text('接受'),
           ),
         ],
       ),
-    );
+    ).whenComplete(() => ticker?.cancel());
+  }
+
+  void _onIncomingTimeout(String incomingId) {
+    if (mounted) {
+      setState(() => _incoming.remove(incomingId));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('传输请求已超时（60 秒未接受）')),
+      );
+    }
   }
 
   Future<void> _decideIncoming(String incomingId, bool accept) async {

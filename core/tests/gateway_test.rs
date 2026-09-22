@@ -691,24 +691,34 @@ async fn test_receiver_cancel_notifies_sender() {
     let (status, _) = http(18017, "POST", &format!("/api/cancel/{file_id}"), Some("{}")).await;
     assert!(status == 200 || status == 404, "cancel 应返回 200 或已完成后的 404，实际 {status}");
 
-    // B 侧视角 Canceled（若已 Completed 则跳过后续联动断言——太快了没取到消）
-    let canceled = wait_for_json(18017, "/api/transfers", 5, |v| {
-        find_transfer(v, &file_id)
-            .map(|t| t["status"].as_str() == Some("Canceled"))
-            .unwrap_or(false)
-    })
-    .await;
-    let b_done_fast = find_transfer(&canceled, &file_id)
-        .map(|t| t["status"].as_str() == Some("Completed"))
-        .unwrap_or(false);
-    if b_done_fast {
+    // 轮询 B 侧终态：Canceled（取消成功）或 Completed（传太快没取到消）。
+    // 不能 wait_for_json 等 Canceled——超时会 panic，跳过分支永远走不到。
+    let mut b_final = Value::Null;
+    let mut b_canceled = false;
+    for _ in 0..50 {
+        let (_, body) = http(18017, "GET", "/api/transfers", None).await;
+        let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if let Some(t) = find_transfer(&v, &file_id) {
+            let st = t["status"].as_str().unwrap_or("");
+            if st == "Canceled" {
+                b_final = t;
+                b_canceled = true;
+                break;
+            }
+            if st == "Completed" {
+                b_final = t;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !b_canceled {
         eprintln!("SKIP cancel linkage: 80MB 在本机仍传完太快，未能落在传输中");
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
         return;
     }
-    let t = find_transfer(&canceled, &file_id).unwrap();
-    assert!(t["incoming"].as_bool().unwrap());
+    assert!(b_final["incoming"].as_bool().unwrap());
 
     // 发送方被联动取消（而非 Completed）
     let v = wait_for_json(18016, "/api/transfers", 15, |v| {

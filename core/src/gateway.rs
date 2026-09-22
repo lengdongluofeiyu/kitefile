@@ -559,11 +559,9 @@ async fn incoming_offer(
     let entry_for_spawn = entry.clone();
 
     tokio::spawn(async move {
-        let accepted = transfer
-            .incoming
-            .wait_decision(&incoming_id)
-            .await
-            .unwrap_or(false);
+        // Some(true)=接受，Some(false)=用户拒绝，None=超时
+        let decision = transfer.incoming.wait_decision(&incoming_id).await;
+        let accepted = decision.unwrap_or(false);
 
         let _ = ws_bus.send(WsEvent::IncomingResolved {
             incoming_id: incoming_id.clone(),
@@ -581,10 +579,13 @@ async fn incoming_offer(
         let resp = HttpIncomingResponse {
             file_id: entry_for_spawn.file_id.clone(),
             accepted,
-            reason: if accepted {
-                None
-            } else {
-                Some("rejected by user or timeout".into())
+            reason: match decision {
+                Some(true) => None,
+                Some(false) => Some("rejected by user".into()),
+                None => Some(format!(
+                    "timeout: not accepted within {}s",
+                    crate::transfer::INCOMING_DECISION_TIMEOUT_SECS
+                )),
             },
             transfer_port: config.transfer_port,
         };
@@ -604,7 +605,7 @@ async fn incoming_offer(
     Json(IncomingAck {
         incoming_id: entry.incoming_id,
         pending: true,
-        expires_in_seconds: 60,
+        expires_in_seconds: crate::transfer::INCOMING_DECISION_TIMEOUT_SECS as u32,
     })
 }
 

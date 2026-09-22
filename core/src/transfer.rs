@@ -84,6 +84,12 @@ const PROGRESS_PUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// 速度采样窗口：收发两端统一 1 秒更新一次，避免 100ms 级抖动让速度乱跳
 const SPEED_SAMPLE_WINDOW: Duration = Duration::from_secs(1);
 
+/// incoming 请求决策超时：**60 秒**内未点「接受」即自动拒绝。
+///
+/// 发送方等回包的窗口是 70s（见 send_file），必须大于本值，
+/// 否则发送方先超时、接收方还在等 UI，状态会对不齐。
+pub const INCOMING_DECISION_TIMEOUT_SECS: u64 = 60;
+
 /// 流式读写缓冲。够大摊薄 syscall，够小让进度平滑、内存友好。
 const STREAM_IO_BUF: usize = 256 * 1024;
 
@@ -270,7 +276,14 @@ impl IncomingManager {
         Some(entry)
     }
 
-    /// 等待 UI 决策（async，超时自动 reject）
+    /// 等待 UI 决策。
+    ///
+    /// 返回：
+    /// - `Some(true)` 用户接受
+    /// - `Some(false)` 用户拒绝
+    /// - `None` **超时**（[`INCOMING_DECISION_TIMEOUT_SECS`] 秒内未决策）或槽位不存在
+    ///
+    /// 超时会把决策置为拒绝，发送方收到的 reason 是 timeout 而不是用户拒绝。
     pub async fn wait_decision(&self, incoming_id: &str) -> Option<bool> {
         let (tx, mut rx) = {
             let slots = self.slots.lock();
@@ -280,9 +293,15 @@ impl IncomingManager {
         if let Some(d) = *rx.borrow() {
             return Some(d);
         }
-        match tokio::time::timeout(Duration::from_secs(60), rx.changed()).await {
+        match tokio::time::timeout(
+            Duration::from_secs(INCOMING_DECISION_TIMEOUT_SECS),
+            rx.changed(),
+        )
+        .await
+        {
             Ok(Ok(())) => *rx.borrow(),
             _ => {
+                // 超时：强制记为拒绝，并返回 None 让调用方区分「超时」和「用户拒绝」
                 let _ = tx.send(Some(false));
                 None
             }

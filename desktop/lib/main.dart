@@ -21,7 +21,8 @@ import 'package:window_manager/window_manager.dart';
 /// - iOS（预留）：使用同 UI 但隐藏窗口控制
 /// - Android（移动端走 mobile 项目）：纯 UI
 
-/// daemon 网关端口候选：必须与 core 的 `GATEWAY_PORT_CANDIDATES` 保持一致。
+/// incoming 请求决策超时（秒）：与 core 的 `INCOMING_DECISION_TIMEOUT_SECS` 保持一致
+const int kDecisionTimeoutSecs = 60;
 ///
 /// 为什么不是一个固定值：Windows 上 Hyper-V / WSL / Docker 会动态保留成片
 /// TCP 端口，7878 可能正好落在保留区里，daemon 会退避到下一个候选。
@@ -745,6 +746,8 @@ class _HomePageState extends State<HomePage> with WindowListener {
     if (entries == null || entries.isEmpty || !mounted) return;
     entries.sort((a, b) => (a.batchIndex ?? 0).compareTo(b.batchIndex ?? 0));
     final totalSize = entries.fold<int>(0, (s, e) => s + e.fileSize);
+    var remaining = kDecisionTimeoutSecs;
+    Timer? ticker;
 
     showDialog<void>(
       context: context,
@@ -757,38 +760,61 @@ class _HomePageState extends State<HomePage> with WindowListener {
             Text('收到 ${entries.length} 个文件'),
           ],
         ),
-        content: SizedBox(
-          width: 420,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _kv('来自', entries.first.fromName),
-              _kv('合计', formatBytes(totalSize)),
-              const SizedBox(height: 8),
-              ...entries.map(
-                (e) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 2),
-                  child: Row(
-                    children: [
-                      const Icon(Icons.insert_drive_file,
-                          size: 16, color: Colors.grey),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: Text('${e.fileName}（${formatBytes(e.fileSize)}）',
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontSize: 13)),
+        content: StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            ticker ??= Timer.periodic(const Duration(seconds: 1), (t) {
+              remaining -= 1;
+              if (remaining <= 0) {
+                t.cancel();
+                if (ctx.mounted) Navigator.pop(ctx);
+                _onIncomingTimeout(batchId);
+                return;
+              }
+              if (ctx.mounted) setDialogState(() {});
+            });
+            return SizedBox(
+              width: 420,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _kv('来自', entries.first.fromName),
+                  _kv('合计', formatBytes(totalSize)),
+                  const SizedBox(height: 8),
+                  ...entries.map(
+                    (e) => Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.insert_drive_file,
+                              size: 16, color: Colors.grey),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text('${e.fileName}（${formatBytes(e.fileSize)}）',
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontSize: 13)),
+                          ),
+                        ],
                       ),
-                    ],
+                    ),
                   ),
-                ),
+                  const SizedBox(height: 10),
+                  Text(
+                    '$remaining 秒内未接受将自动拒绝',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: remaining <= 10 ? Colors.orange : Colors.grey,
+                    ),
+                  ),
+                ],
               ),
-            ],
-          ),
+            );
+          },
         ),
         actions: [
           TextButton(
             onPressed: () {
+              ticker?.cancel();
               Navigator.pop(context);
               _rejectBatch(batchId);
             },
@@ -798,13 +824,14 @@ class _HomePageState extends State<HomePage> with WindowListener {
             icon: const Icon(Icons.download),
             label: Text('全部接受 (${entries.length})'),
             onPressed: () {
+              ticker?.cancel();
               Navigator.pop(context);
               _acceptBatch(batchId);
             },
           ),
         ],
       ),
-    );
+    ).whenComplete(() => ticker?.cancel());
   }
 
   Future<void> _acceptBatch(String batchId) async {
@@ -842,7 +869,10 @@ class _HomePageState extends State<HomePage> with WindowListener {
   }
 
   /// 接收文件弹窗：显示来源、文件名、大小，让用户选择接受/拒绝
+  /// 60 秒内未接受自动关闭并提示超时（与 daemon 侧自动拒绝对齐）
   void _showIncomingDialog(IncomingEntry entry) {
+    var remaining = kDecisionTimeoutSecs;
+    Timer? ticker;
     showDialog<void>(
       context: context,
       barrierDismissible: false,
@@ -854,22 +884,45 @@ class _HomePageState extends State<HomePage> with WindowListener {
             Text('收到文件传输请求'),
           ],
         ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _kv('来自', entry.fromName),
-            _kv('地址', '${entry.fromIp}:${entry.fromTransferPort}'),
-            const SizedBox(height: 8),
-            _kv('文件名', entry.fileName),
-            _kv('大小', formatBytes(entry.fileSize)),
-            if (entry.sha256 != null && entry.sha256!.isNotEmpty)
-              _kv('SHA256', '${entry.sha256!.substring(0, 12)}…'),
-          ],
+        content: StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            ticker ??= Timer.periodic(const Duration(seconds: 1), (t) {
+              remaining -= 1;
+              if (remaining <= 0) {
+                t.cancel();
+                if (ctx.mounted) Navigator.pop(ctx);
+                _onIncomingTimeout(entry.incomingId);
+                return;
+              }
+              if (ctx.mounted) setDialogState(() {});
+            });
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _kv('来自', entry.fromName),
+                _kv('地址', '${entry.fromIp}:${entry.fromTransferPort}'),
+                const SizedBox(height: 8),
+                _kv('文件名', entry.fileName),
+                _kv('大小', formatBytes(entry.fileSize)),
+                if (entry.sha256 != null && entry.sha256!.isNotEmpty)
+                  _kv('SHA256', '${entry.sha256!.substring(0, 12)}…'),
+                const SizedBox(height: 10),
+                Text(
+                  '$remaining 秒内未接受将自动拒绝',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: remaining <= 10 ? Colors.orange : Colors.grey,
+                  ),
+                ),
+              ],
+            );
+          },
         ),
         actions: [
           TextButton(
             onPressed: () {
+              ticker?.cancel();
               Navigator.pop(context);
               _rejectIncoming(entry.incomingId);
             },
@@ -879,12 +932,21 @@ class _HomePageState extends State<HomePage> with WindowListener {
             icon: const Icon(Icons.download),
             label: const Text('接受'),
             onPressed: () {
+              ticker?.cancel();
               Navigator.pop(context);
               _acceptIncoming(entry.incomingId);
             },
           ),
         ],
       ),
+    ).whenComplete(() => ticker?.cancel());
+  }
+
+  void _onIncomingTimeout(String incomingId) {
+    setState(() => _pendingIncoming.remove(incomingId));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('传输请求已超时（60 秒未接受）')),
     );
   }
 
