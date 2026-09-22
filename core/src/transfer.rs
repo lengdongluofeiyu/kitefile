@@ -379,6 +379,9 @@ pub struct TransferEngine {
     /// 发送中的任务：file_id → (对端 IP, 对端 gateway 端口)
     /// 发送方取消时用于通知接收方联动取消（对称于 incoming_endpoints）
     outgoing_endpoints: TokioMutex<HashMap<String, (String, u16)>>,
+    /// 出站 offer 并发闸门：多文件批量发送时限制同时在途的 /api/incoming，
+    /// 免得几个连接一起把手机网络栈打满（表现为 ETIMEDOUT）。
+    offer_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl TransferEngine {
@@ -401,6 +404,7 @@ impl TransferEngine {
             recv_speed_state: TokioMutex::new(HashMap::new()),
             incoming_endpoints: TokioMutex::new(HashMap::new()),
             outgoing_endpoints: TokioMutex::new(HashMap::new()),
+            offer_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         }
     }
 
@@ -624,7 +628,9 @@ impl TransferEngine {
 
                 if last_push.elapsed() >= PROGRESS_PUSH_INTERVAL {
                     last_push = Instant::now();
-                    self.publish_recv_progress(&file_id, &slot).await;
+                    // 必须重新取 slot：上面这个 `slot` 是开头的快照，
+                    // bytes_received 仍是 0，拿它推进度会让接收端一直显示 0 B / 0 B/s
+                    self.publish_recv_progress(&file_id).await;
                 }
             }
             file.flush()
@@ -637,7 +643,7 @@ impl TransferEngine {
             .finish_stream(&file_id, header.stream_id)
             .await
             .ok_or_else(|| crate::CoreError::Transfer("slot vanished during stream".into()))?;
-        self.publish_recv_progress(&file_id, &slot).await;
+        self.publish_recv_progress(&file_id).await;
 
         // 全部流收齐后的收尾
         if slot.is_complete() {
@@ -657,8 +663,11 @@ impl TransferEngine {
         Ok(())
     }
 
-    /// 推送接收方视角的 InProgress 进度
-    async fn publish_recv_progress(&self, file_id: &str, slot: &crate::storage::ReceiveSlot) {
+    /// 推送接收方视角的 InProgress 进度（每次从 storage 取最新 bytes_received）
+    async fn publish_recv_progress(&self, file_id: &str) {
+        let Some(slot) = self.storage.get_slot(file_id).await else {
+            return;
+        };
         let streams_done = slot.streams_done.iter().filter(|ok| **ok).count() as u64;
         let bytes_done = slot.bytes_received.min(slot.file_size);
         let speed_bps = {
@@ -861,17 +870,10 @@ impl TransferEngine {
         let file_id_for_spawn = file_id.clone();
         let file_name_for_err = file_name.clone();
         tokio::spawn(async move {
-            // 后台并行计算整文件 sha256：与传输同时进行，offer 不等它
-            let hash_task = {
-                let path_clone = file_path.clone();
-                tokio::task::spawn_blocking(move || -> std::io::Result<String> {
-                    use sha2::{Digest, Sha256};
-                    let mut f = std::fs::File::open(&path_clone)?;
-                    let mut hasher = Sha256::new();
-                    std::io::copy(&mut f, &mut hasher)?;
-                    Ok(format!("{:x}", hasher.finalize()))
-                })
-            };
+            // sha256 **不要**在 offer 之前就开算：多文件批量发送时几个 GB 级
+            // 文件同时全量读盘，会把手机 IO/网络栈打满，表现为后续 offer
+            // `Connection timed out (os error 110)`。推迟到 Accept 之后、
+            // 与 do_send 重叠计算，语义不变（仍走 /api/verify 延后补发）。
 
             let offer = HttpOffer {
                 file_id: file_id_for_spawn.clone(),
@@ -909,13 +911,20 @@ impl TransferEngine {
                 }
             };
 
-            let post_result = http_post_json(
-                &target_ip,
-                target_gateway_port,
-                "/api/incoming",
-                &offer_json,
-            )
-            .await;
+            let post_result = {
+                let _permit = engine
+                    .offer_gate
+                    .acquire()
+                    .await
+                    .expect("semaphore never closed");
+                http_post_json_retry(
+                    &target_ip,
+                    target_gateway_port,
+                    "/api/incoming",
+                    &offer_json,
+                )
+                .await
+            };
 
             if let Err(e) = post_result {
                 push_progress(&progress_tx, TransferProgress {
@@ -963,7 +972,17 @@ impl TransferEngine {
                 return;
             }
 
-            // Accept → 登记对端地址（发送方取消时通知它联动取消）→ 启动多流传输
+            // Accept → 哈希与传输重叠计算 → 登记对端地址 → 启动多流传输
+            let hash_task = {
+                let path_clone = file_path.clone();
+                tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+                    use sha2::{Digest, Sha256};
+                    let mut f = std::fs::File::open(&path_clone)?;
+                    let mut hasher = Sha256::new();
+                    std::io::copy(&mut f, &mut hasher)?;
+                    Ok(format!("{:x}", hasher.finalize()))
+                })
+            };
             engine
                 .outgoing_endpoints
                 .lock()
@@ -1077,7 +1096,7 @@ impl TransferEngine {
         target_port: u16,
         file_path: PathBuf,
         file_id: String,
-        _file_name: String,
+        file_name: String,
         file_size: u64,
         stream_count: u32,
         cancel_rx: watch::Receiver<bool>,
@@ -1099,6 +1118,7 @@ impl TransferEngine {
             let pctx = SendProgress {
                 progress_tx: progress_tx.clone(),
                 file_id: file_id.clone(),
+                file_name: file_name.clone(),
                 file_size,
                 streams_total: layout.len() as u64,
                 streams_done: Arc::new(AtomicU64::new(0)), // 仅用于显示，完成数由 join 后不回推；bytes 为主
@@ -1173,6 +1193,9 @@ impl TransferEngine {
 struct SendProgress {
     progress_tx: mpsc::Sender<TransferProgress>,
     file_id: String,
+    /// **必须带上**：空文件名会覆盖进度缓存里的 Pending 帧，
+    /// 手机端传输中就会显示成无名任务。
+    file_name: String,
     file_size: u64,
     streams_total: u64,
     streams_done: Arc<AtomicU64>,
@@ -1194,7 +1217,7 @@ impl SendProgress {
         let elapsed = self.start.elapsed().as_secs_f64().max(0.001);
         push_progress(&self.progress_tx, TransferProgress {
             file_id: self.file_id.clone(),
-            file_name: String::new(),
+            file_name: self.file_name.clone(),
             file_size: self.file_size,
             bytes_transferred: bd.min(self.file_size),
             chunks_done: self.streams_done.load(Ordering::Relaxed),
@@ -1368,6 +1391,35 @@ async fn http_post_json(host: &str, port: u16, path: &str, body: &str) -> std::i
         .find("\r\n\r\n")
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no header/body sep"))?;
     Ok(response_str[body_start + 4..].to_string())
+}
+
+/// offer 投递：连不上的瞬时故障重试几次。
+///
+/// 多文件批量发送时几个 offer 几乎同时出站，手机侧偶发 `ETIMEDOUT`
+/// （网络栈被打满 / 路由瞬时不可达）。一次失败就整文件判死太脆。
+async fn http_post_json_retry(
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &str,
+) -> std::io::Result<String> {
+    const ATTEMPTS: u32 = 3;
+    const BACKOFF_MS: [u64; 3] = [0, 300, 800];
+    let mut last_err = std::io::Error::new(std::io::ErrorKind::Other, "no attempt");
+    for attempt in 0..ATTEMPTS {
+        let backoff = BACKOFF_MS.get(attempt as usize).copied().unwrap_or(800);
+        if backoff > 0 {
+            tokio::time::sleep(Duration::from_millis(backoff)).await;
+        }
+        match http_post_json(host, port, path, body).await {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                warn!(attempt, error = %e, "http post failed, will retry");
+                last_err = e;
+            }
+        }
+    }
+    Err(last_err)
 }
 
 #[cfg(test)]
