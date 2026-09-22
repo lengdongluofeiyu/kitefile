@@ -672,13 +672,19 @@ impl TransferEngine {
         let bytes_done = slot.bytes_received.min(slot.file_size);
         let speed_bps = {
             let mut state = self.recv_speed_state.lock().await;
-            let (start, _) = state
+            // (上次采样时刻, 上次 bytes_done)：速度 = 两次采样的字节差 / 时间差。
+            // 累计均值（total/elapsed）会表现为「开头很快、越传越慢」——
+            // 那是平均值在收敛，不是真的掉速。
+            let ent = state
                 .entry(file_id.to_string())
-                .or_insert_with(|| (Instant::now(), 0));
-            let elapsed = start.elapsed().as_secs_f64();
-            if elapsed >= 0.5 {
-                (bytes_done as f64 / elapsed) as u64
+                .or_insert_with(|| (Instant::now(), bytes_done));
+            let dt = ent.0.elapsed().as_secs_f64();
+            if dt >= 0.15 {
+                let db = bytes_done.saturating_sub(ent.1);
+                *ent = (Instant::now(), bytes_done);
+                (db as f64 / dt) as u64
             } else {
+                // 采样间隔太短，沿用上次结果（0 表示还没测出）
                 0
             }
         };
@@ -972,17 +978,10 @@ impl TransferEngine {
                 return;
             }
 
-            // Accept → 哈希与传输重叠计算 → 登记对端地址 → 启动多流传输
-            let hash_task = {
-                let path_clone = file_path.clone();
-                tokio::task::spawn_blocking(move || -> std::io::Result<String> {
-                    use sha2::{Digest, Sha256};
-                    let mut f = std::fs::File::open(&path_clone)?;
-                    let mut hasher = Sha256::new();
-                    std::io::copy(&mut f, &mut hasher)?;
-                    Ok(format!("{:x}", hasher.finalize()))
-                })
-            };
+            // Accept → 先跑数据传输。sha256 **等传输结束后**再算：
+            // 与 do_send 并行会两路全量读同一文件，手机闪存被抢满后
+            // 表现为「开头 ~10MB/s、后段掉到 ~6MB/s」（页缓存耗尽后双读打架）。
+            // 代价是 /api/verify 稍晚发出，用户体感不受影响（进度条走的是数据）。
             engine
                 .outgoing_endpoints
                 .lock()
@@ -993,7 +992,7 @@ impl TransferEngine {
                 .do_send(
                     target_ip.clone(),
                     target_transfer_port,
-                    file_path,
+                    file_path.clone(),
                     file_id_for_spawn.clone(),
                     file_name_for_err.clone(),
                     file_size,
@@ -1008,7 +1007,15 @@ impl TransferEngine {
             let canceled = *cancel_check.borrow();
 
             if !canceled && result.is_ok() {
-                let sha256 = match hash_task.await {
+                let sha256 = match tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+                    use sha2::{Digest, Sha256};
+                    let mut f = std::fs::File::open(&file_path)?;
+                    let mut hasher = Sha256::new();
+                    std::io::copy(&mut f, &mut hasher)?;
+                    Ok(format!("{:x}", hasher.finalize()))
+                })
+                .await
+                {
                     Ok(Ok(s)) => Some(s),
                     Ok(Err(e)) => {
                         warn!(file_id = %file_id_for_spawn, error = %e, "sha256 compute failed, skip verify");
@@ -1109,6 +1116,7 @@ impl TransferEngine {
         let last_push = Arc::new(TokioMutex::new(Instant::now()
             .checked_sub(PROGRESS_PUSH_INTERVAL)
             .unwrap_or_else(Instant::now)));
+        let last_sample = Arc::new(TokioMutex::new((Instant::now(), 0u64)));
 
         let mut handles = Vec::new();
         for (stream_id, &(start_offset, seg_len)) in layout.iter().enumerate() {
@@ -1125,6 +1133,7 @@ impl TransferEngine {
                 bytes_done: bytes_done.clone(),
                 start,
                 last_push: last_push.clone(),
+                last_sample: last_sample.clone(),
             };
             let streams_done_shared = pctx.streams_done.clone();
             let file_id_prefix = file_id_prefix;
@@ -1202,6 +1211,8 @@ struct SendProgress {
     bytes_done: Arc<AtomicU64>,
     start: Instant,
     last_push: Arc<TokioMutex<Instant>>,
+    /// (上次采样时刻, 上次 bytes_done)，算**瞬时**速度用
+    last_sample: Arc<TokioMutex<(Instant, u64)>>,
 }
 
 impl SendProgress {
@@ -1214,7 +1225,18 @@ impl SendProgress {
             *last = Instant::now();
         }
         let bd = self.bytes_done.load(Ordering::Relaxed);
-        let elapsed = self.start.elapsed().as_secs_f64().max(0.001);
+        // 瞬时速度 = Δbytes/Δt。累计均值（total/elapsed）会「开头很快、越传越慢」。
+        let speed_bps = {
+            let mut s = self.last_sample.lock().await;
+            let dt = s.0.elapsed().as_secs_f64();
+            if dt >= 0.05 {
+                let db = bd.saturating_sub(s.1);
+                *s = (Instant::now(), bd);
+                (db as f64 / dt) as u64
+            } else {
+                0
+            }
+        };
         push_progress(&self.progress_tx, TransferProgress {
             file_id: self.file_id.clone(),
             file_name: self.file_name.clone(),
@@ -1222,7 +1244,7 @@ impl SendProgress {
             bytes_transferred: bd.min(self.file_size),
             chunks_done: self.streams_done.load(Ordering::Relaxed),
             chunks_total: self.streams_total,
-            speed_bps: (bd as f64 / elapsed) as u64,
+            speed_bps,
             status: TransferStatus::InProgress,
             error: None,
             incoming: false,
