@@ -1112,7 +1112,6 @@ impl TransferEngine {
         let file_id_prefix = file_id_prefix_u64(&file_id);
         let layout = stream_layout(file_size, stream_count);
         let bytes_done = Arc::new(AtomicU64::new(0));
-        let start = Instant::now();
         let last_push = Arc::new(TokioMutex::new(Instant::now()
             .checked_sub(PROGRESS_PUSH_INTERVAL)
             .unwrap_or_else(Instant::now)));
