@@ -57,6 +57,8 @@ void main() async {
       title: 'FTCore',
     );
     windowManager.waitUntilReadyToShow(windowOptions, () async {
+      // 不拦截的话点 × 窗口直接没了，onWindowClose 里的「进托盘/完全退出」弹窗根本弹不出来
+      await windowManager.setPreventClose(true);
       await windowManager.show();
       await windowManager.focus();
     });
@@ -505,6 +507,9 @@ class _HomePageState extends State<HomePage> with WindowListener {
   }
 
   /// 窗口关闭：默认最小化到托盘（守护进程后台接收）；也可完全退出。
+  ///
+  /// 必须配合 `setPreventClose(true)`：否则系统直接销毁窗口，
+  /// 这里的弹窗/隐藏逻辑没有执行机会。
   @override
   void onWindowClose() async {
     final action = await _showExitDialog();
@@ -516,6 +521,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
       case _CloseAction.fullExit:
         await daemonManager.stop();
         await trayService.destroy();
+        // destroy() 会绕过 preventClose，真正关掉窗口
         await windowManager.destroy();
         exit(0);
     }
