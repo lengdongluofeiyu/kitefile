@@ -1131,7 +1131,6 @@ impl TransferEngine {
                 streams_total: layout.len() as u64,
                 streams_done: Arc::new(AtomicU64::new(0)), // 仅用于显示，完成数由 join 后不回推；bytes 为主
                 bytes_done: bytes_done.clone(),
-                start,
                 last_push: last_push.clone(),
                 last_sample: last_sample.clone(),
             };
@@ -1209,7 +1208,6 @@ struct SendProgress {
     streams_total: u64,
     streams_done: Arc<AtomicU64>,
     bytes_done: Arc<AtomicU64>,
-    start: Instant,
     last_push: Arc<TokioMutex<Instant>>,
     /// (上次采样时刻, 上次 bytes_done)，算**瞬时**速度用
     last_sample: Arc<TokioMutex<(Instant, u64)>>,
