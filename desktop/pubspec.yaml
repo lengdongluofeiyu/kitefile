@@ -14,6 +14,10 @@ dependencies:
   window_manager: ^0.4.3
   # 系统文件选择器（Windows 原生对话框，支持多选）
   file_picker: ^8.3.0
+  # 系统托盘（隐藏图标区常驻；与 window_manager 同门，0.5.x 兼容当前 Flutter）
+  tray_manager: ^0.5.3
+  # 系统通知（Windows toast）：窗口隐藏时来文件提醒用户
+  local_notifier: ^0.1.6
 
 dev_dependencies:
   flutter_test:
@@ -22,3 +26,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/tray_icon.ico

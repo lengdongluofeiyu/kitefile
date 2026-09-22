@@ -5,6 +5,9 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:local_notifier/local_notifier.dart';
+import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
 /// FTCore 桌面端
@@ -39,6 +42,15 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
     await windowManager.ensureInitialized();
+    // 系统通知（Windows toast）：窗口隐藏时来文件提醒
+    try {
+      await localNotifier.setup(
+        appName: 'FTCore',
+        shortcutPolicy: ShortcutPolicy.requireCreate,
+      );
+    } catch (e) {
+      debugPrint('[LocalNotifier] setup failed: $e');
+    }
     WindowOptions windowOptions = const WindowOptions(
       size: Size(900, 700),
       minimumSize: Size(500, 400),
@@ -52,9 +64,83 @@ void main() async {
 
   // 启动时自动拉起 Rust 守护进程（非阻塞：UI 立即显示，daemon 在后台 ready）
   daemonManager.ensureRunning();
+  // 托盘图标常驻（隐藏图标区），窗口关掉后仍可唤起 / 完全退出
+  trayService.init();
 
   runApp(const FTCoreApp());
 }
+
+/// 系统托盘：窗口隐藏后仍驻留，可唤起主界面或完全退出（含守护进程）
+class TrayService with TrayListener {
+  bool _inited = false;
+
+  Future<void> init() async {
+    if (!Platform.isWindows && !Platform.isMacOS && !Platform.isLinux) return;
+    if (_inited) return;
+    _inited = true;
+    try {
+      final iconPath = await _extractIcon();
+      await trayManager.setIcon(iconPath);
+      await trayManager.setToolTip('FTCore - 局域网文件传输');
+      await trayManager.setContextMenu(Menu(items: [
+        MenuItem(key: 'show_window', label: '显示主界面'),
+        MenuItem.separator(),
+        MenuItem(key: 'exit_app', label: '完全退出'),
+      ]));
+      trayManager.addListener(this);
+    } catch (e) {
+      debugPrint('[TrayService] init failed: $e');
+    }
+  }
+
+  /// tray_manager 要磁盘上的图标文件路径；从 assets 解一份到临时目录
+  Future<String> _extractIcon() async {
+    final data = await rootBundle.load('assets/tray_icon.ico');
+    final f = File(
+        '${Directory.systemTemp.path}${Platform.pathSeparator}ftcore_tray_icon.ico');
+    await f.writeAsBytes(data.buffer.asUint8List(), flush: true);
+    return f.path;
+  }
+
+  @override
+  void onTrayIconMouseDown() {
+    _showWindow();
+  }
+
+  @override
+  void onTrayIconRightMouseDown() {
+    trayManager.popUpContextMenu();
+  }
+
+  @override
+  void onTrayMenuItemClick(MenuItem menuItem) {
+    switch (menuItem.key) {
+      case 'show_window':
+        _showWindow();
+        break;
+      case 'exit_app':
+        _exitCompletely();
+        break;
+    }
+  }
+
+  Future<void> _showWindow() async {
+    await windowManager.show();
+    await windowManager.focus();
+  }
+
+  Future<void> _exitCompletely() async {
+    await daemonManager.stop();
+    await windowManager.destroy();
+    exit(0);
+  }
+
+  Future<void> destroy() async {
+    trayManager.removeListener(this);
+  }
+}
+
+final TrayService trayService = TrayService();
 
 /// 守护进程管理器
 ///
@@ -63,7 +149,7 @@ void main() async {
 ///   - 已响应：说明已有 daemon（用户手动启过 / 上次未退出），直接复用
 ///   - 未响应：spawn 一个 ftcore-cli.exe daemon 子进程
 /// - 子进程用 detached 模式：UI 崩溃不会拖死 daemon，正在传的文件不会断
-/// - 窗口关闭时显式 kill 子进程（避免孤儿进程占用端口）
+/// - 「完全退出」时才 kill 子进程；「最小化到托盘」只藏窗口，daemon 继续跑
 class DaemonManager {
   Process? _process;
   bool _spawned = false;
@@ -383,6 +469,8 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
+enum _CloseAction { tray, fullExit }
+
 class _HomePageState extends State<HomePage> with WindowListener {
   WhoAmI? _me;
   List<Device> _devices = [];
@@ -416,44 +504,101 @@ class _HomePageState extends State<HomePage> with WindowListener {
     super.dispose();
   }
 
-  /// 窗口关闭时弹窗询问是否同时退出守护进程
-  ///
-  /// 选择「完全退出」：杀掉 daemon 子进程，端口释放
-  /// 选择「仅关闭 UI」：daemon 留在后台，其他设备仍可发现本机并发起传输
+  /// 窗口关闭：默认最小化到托盘（守护进程后台接收）；也可完全退出。
   @override
   void onWindowClose() async {
-    final shouldExit = await _showExitDialog();
-    if (shouldExit) {
-      await daemonManager.stop();
+    final action = await _showExitDialog();
+    switch (action) {
+      case _CloseAction.tray:
+        await windowManager.hide();
+        _notifyTrayResident();
+        break;
+      case _CloseAction.fullExit:
+        await daemonManager.stop();
+        await trayService.destroy();
+        await windowManager.destroy();
+        exit(0);
     }
-    await windowManager.destroy();
   }
 
-  Future<bool> _showExitDialog() async {
-    if (!mounted) return true;
-    final result = await showDialog<bool>(
+  Future<_CloseAction> _showExitDialog() async {
+    if (!mounted) return _CloseAction.fullExit;
+    final result = await showDialog<_CloseAction>(
       context: context,
       barrierDismissible: false,
       builder: (_) => AlertDialog(
         title: const Text('关闭 FTCore'),
         content: const Text(
-          '是否同时退出守护进程？\n\n'
-          '· 选「仅关闭 UI」：守护进程留在后台，其他设备仍能发现本机并向本机传输文件。\n'
-          '· 选「完全退出」：守护进程一同退出，本机不再被其他设备发现。',
+          '· 选「最小化到托盘」：窗口隐藏、守护进程后台接收；\n'
+          '  其他设备仍能发现本机并传文件，来文件会弹系统通知。\n\n'
+          '· 选「完全退出」：守护进程一并退出，本机不再被其他设备发现。',
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('仅关闭 UI'),
+            onPressed: () => Navigator.pop(context, _CloseAction.fullExit),
+            child: const Text('完全退出'),
           ),
           FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('完全退出'),
+            onPressed: () => Navigator.pop(context, _CloseAction.tray),
+            child: const Text('最小化到托盘'),
           ),
         ],
       ),
     );
-    return result ?? true;
+    return result ?? _CloseAction.tray;
+  }
+
+  /// 首次驻留托盘时用系统通知提示，避免用户以为进程没了
+  void _notifyTrayResident() {
+    try {
+      final n = LocalNotification(
+        title: 'FTCore 仍在后台运行',
+        body: '已最小化到系统托盘（隐藏图标区）。双击托盘图标可打开主界面；来文件时会再通知你。',
+      );
+      n.show();
+    } catch (e) {
+      debugPrint('[Notify] tray resident failed: $e');
+    }
+  }
+
+  /// 窗口隐藏/最小化时，来传输请求 → 系统通知
+  Future<void> _notifyIncomingIfNeeded(IncomingEntry entry) async {
+    try {
+      final visible = await windowManager.isVisible();
+      final minimized = await windowManager.isMinimized();
+      if (visible && !minimized) return;
+      final n = LocalNotification(
+        title: '${entry.fromName} 想发送文件',
+        body: '${entry.fileName}（${formatBytes(entry.fileSize)}）\n点击打开 FTCore 接收',
+      );
+      n.onClick = () {
+        windowManager.show();
+        windowManager.focus();
+      };
+      n.show();
+    } catch (e) {
+      debugPrint('[Notify] incoming failed: $e');
+    }
+  }
+
+  /// 接收完成且窗口不可见时也通知一下
+  Future<void> _notifyReceivedIfNeeded(TransferProgress p) async {
+    try {
+      final visible = await windowManager.isVisible();
+      final minimized = await windowManager.isMinimized();
+      if (visible && !minimized) return;
+      final n = LocalNotification(
+        title: '已接收 ${p.fileName}',
+        body: '点击打开 FTCore 查看',
+      );
+      n.onClick = () {
+        windowManager.show();
+        windowManager.focus();
+      };
+      n.show();
+    } catch (e) {
+      debugPrint('[Notify] received failed: $e');
+    }
   }
 
   Future<void> _initDaemon() async {
@@ -531,11 +676,13 @@ class _HomePageState extends State<HomePage> with WindowListener {
             !_notifiedComplete.contains(p.fileId)) {
           _notifiedComplete.add(p.fileId);
           _showReceivedDialog(p);
+          _notifyReceivedIfNeeded(p);
         }
         break;
       case 'incoming':
         final entry = IncomingEntry.fromJson(j);
         _onIncoming(entry);
+        _notifyIncomingIfNeeded(entry);
         break;
       case 'incoming_resolved':
         final id = j['incoming_id'] as String;
