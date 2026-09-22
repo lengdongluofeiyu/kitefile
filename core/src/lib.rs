@@ -2,7 +2,7 @@
 //!
 //! 三个核心子系统：
 //! - [`discovery`]：mDNS 设备发现
-//! - [`transfer`]：多流 TCP 并行传输
+//! - [`transfer`]：多流 TCP 并行流式传输
 //! - [`gateway`]：HTTP/WebSocket 网关，供 Web 前端调用
 //!
 //! 平台支持矩阵：Windows / Android / iOS / macOS
@@ -48,19 +48,9 @@ pub struct EngineConfig {
     pub gateway_port: u16,
     /// TCP 传输端口（默认 7879）
     pub transfer_port: u16,
-    /// 并行流数量（默认 = CPU 核数，封顶 8）
+    /// 并行流数量上限（默认 = CPU 核数，封顶 8）。
+    /// 实际流数按文件大小自适应，见 `protocol::compute_stream_count`。
     pub parallel_streams: usize,
-    /// 单个分块大小（默认 2MB）
-    ///
-    /// 这个值决定**进度条粒度**和**单块停顿时长**，不只是吞吐：
-    /// - 停等模型下，每块要等 ACK 才发下一块，进度只在块完成时更新。
-    ///   16MB 时一个 100MB 文件只有 7 次更新，观感是"每 16MB 卡一下"。
-    /// - 2MB 时同一文件有 50 次更新，进度平滑，单块停顿降到约 1/8。
-    /// - 吞吐不会变差：单流 2MB/(读+发+落盘+RTT) 仍有 ~30MB/s，
-    ///   乘以 parallel_streams 后瓶颈在网络而非分块。
-    /// - 附带好处：单块内存占用从 16MB 降到 2MB，8 条并行流峰值
-    ///   从 ~128MB 降到 ~16MB，对手机友好；重传一块的代价也小得多。
-    pub chunk_size: usize,
     /// 接收目录
     pub receive_dir: std::path::PathBuf,
     /// 是否允许来自其他设备的「管理类」HTTP 调用（默认 false）
@@ -86,7 +76,6 @@ impl Default for EngineConfig {
             gateway_port: 7878,
             transfer_port: 7879,
             parallel_streams,
-            chunk_size: 2 * 1024 * 1024,
             receive_dir: crate::platform::default_receive_dir(),
             allow_remote_admin: false,
         }

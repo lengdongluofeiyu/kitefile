@@ -1,76 +1,100 @@
-//! 传输协议：握手消息 + 数据帧格式
+//! 传输协议：握手消息 + 数据流格式
 //!
 //! 协议分两条通道：
 //! 1. **控制通道 = HTTP**（复用 7878 网关）。offer / accept / reject / cancel /
 //!    verify 都是普通 HTTP 请求，没有自定义的 TCP 控制连接——握手要双向跨机
 //!    调用，走 HTTP 能直接复用网关已有的路由与访问分级。
-//!    完整时序见 [`HttpOffer`] 的文档注释。
-//! 2. **数据通道 = N 条并行 TCP**（默认 7879），只传分块二进制，见 [`DataFrameHeader`]。
+//! 2. **数据通道 = N 条并行 TCP**（默认 7879）。每条流一去不回：
+//!    [`StreamHeader`] 一次 + 连续原始字节，**没有分块 ACK、没有停等**。
+//!    流内顺序写文件偏移，背压靠 TCP 滑动窗口。流数由文件大小自适应
+//!    （见 [`compute_stream_count`]），小文件单流、大文件拉满并行。
 //!
-//! 握手请求体示例（`POST /api/incoming`，字段以 [`HttpOffer`] 为准）：
-//! ```json
-//! {"file_id":"uuid","file_name":"a.mp4","file_size":10737418240,
-//!  "sha256":null,"sha256_deferred":true,
-//!  "from_id":"dev-1","from_name":"laptop","from_ip":"192.168.1.5",
-//!  "from_gateway_port":7878,"from_transfer_port":7879}
-//! ```
-//!
-//! 两点容易看错，说明一下：
-//! - `sha256` 常为 null 且 `sha256_deferred=true`：整文件哈希由发送方边传边算，
-//!   全部 chunk 发完后经 `POST /api/verify/:file_id` 补发，大文件的弹窗不等它。
-//! - 请求体里**没有** `chunk_size`：分块大小目前是发送方的本地配置，不随 offer
-//!   协商。两端配置不一致会静默产生错位数据，详见方案 N2。
+//! 为何不做应用层分块 ACK：停等模型下每块都要等「对端落盘」才能发下一块，
+//! 节奏卡顿和吞吐上限都出在这里。整文件 sha256（发完经 `/api/verify` 补发）
+//! 负责端到端校验；中途中断则整传失败（暂无按段续传）。
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const SERVICE_TYPE: &str = "_ftcore._tcp.local.";
 
-/// 控制消息
+/// 数据流头：每条 TCP 连接一次，后跟 `data_len` 字节原始数据。
 ///
-/// 数据通道上目前只跑一种：接收方给发送方的 chunk 确认（[`ControlMessage::ChunkAck`]）。
-/// 握手（offer / accept / reject / cancel / verify）全部走 HTTP，见文件头说明。
-///
-/// 保留 enum 而不是退化成裸 struct，是为了将来加消息类型时不用改函数签名。
-/// 这里原先还有 Offer / Accept / Reject / Complete / Cancel 五个变体，
-/// 对应"单条 TCP 控制通道"的早期设计，从未被调用过（含 resume_token），已删除。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ControlMessage {
-    /// 接收方 → 发送方：单个 chunk 接收确认
-    ChunkAck {
-        file_id: String,
-        chunk_id: u64,
-        ok: bool,
-    },
-}
-
-impl ControlMessage {
-    /// 序列化为一行 JSON（以 \n 结尾），用于数据通道上的 ChunkAck
-    pub fn to_line(&self) -> anyhow::Result<String> {
-        let mut s = serde_json::to_string(self)?;
-        s.push('\n');
-        Ok(s)
-    }
-
-    pub fn from_line(s: &str) -> anyhow::Result<Self> {
-        Ok(serde_json::from_str(s.trim())?)
-    }
-}
-
-/// 数据帧：每个 TCP 数据流的前导头
-/// 每个数据帧前加固定大小的二进制头，后跟 chunk_size 字节数据
+/// 同一文件的 N 条流各写不同字节区间，区间由 [`stream_layout`] 切分，
+/// 两端必须用相同的 `stream_count` 计算（由 offer 携带）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct DataFrameHeader {
-    /// 文件 ID 的前 8 字节（用于校验路由）
+pub struct StreamHeader {
+    /// 文件 ID 的前 8 字节（路由到接收槽）
     pub file_id_prefix: u64,
-    /// chunk 序号
-    pub chunk_id: u64,
-    /// 实际数据长度（可能小于 chunk_size，针对最后一块）
-    pub data_len: u32,
-    /// 预留
+    /// 流序号（0..stream_count），完成位图按下标记
+    pub stream_id: u32,
     pub _reserved: u32,
+    /// 本流数据写入文件的起始偏移
+    pub start_offset: u64,
+    /// 本流字节数（连接上后跟这么多原始数据，读满即本流结束）
+    pub data_len: u64,
+}
+
+impl StreamHeader {
+    pub const SIZE: usize = 32;
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..8].copy_from_slice(&self.file_id_prefix.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.stream_id.to_le_bytes());
+        buf[12..16].copy_from_slice(&self._reserved.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.start_offset.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.data_len.to_le_bytes());
+        buf
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> anyhow::Result<Self> {
+        if buf.len() < Self::SIZE {
+            anyhow::bail!("stream header too short");
+        }
+        Ok(Self {
+            file_id_prefix: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            stream_id: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            _reserved: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            start_offset: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            data_len: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+        })
+    }
+}
+
+/// 按文件大小自适应并行流数：小文件单流（省握手），大文件拉满 `max_parallel`。
+///
+/// 阈值 4MB/流：几百 KB 的文件开 8 条 TCP 纯属浪费；几十 MB 以上再铺开。
+pub fn compute_stream_count(file_size: u64, max_parallel: usize) -> u32 {
+    const MIN_BYTES_PER_STREAM: u64 = 4 * 1024 * 1024;
+    let max = max_parallel.max(1) as u64;
+    if file_size == 0 {
+        return 1;
+    }
+    let by_size = (file_size + MIN_BYTES_PER_STREAM - 1) / MIN_BYTES_PER_STREAM;
+    by_size.clamp(1, max) as u32
+}
+
+/// 把 `[0, file_size)` 切成 `stream_count` 段连续字节区间 `[(start, len), …]`。
+///
+/// 尽量均分，余数摊给前面的流。空文件退化为一段 `(0, 0)`。
+/// 两端必须用同一 `stream_count` 调用本函数，否则偏移会错位。
+pub fn stream_layout(file_size: u64, stream_count: u32) -> Vec<(u64, u64)> {
+    let n = stream_count.max(1) as u64;
+    if file_size == 0 {
+        return vec![(0, 0)];
+    }
+    let base = file_size / n;
+    let rem = file_size % n;
+    let mut out = Vec::with_capacity(n as usize);
+    let mut off = 0u64;
+    for i in 0..n {
+        let len = base + if i < rem { 1 } else { 0 };
+        out.push((off, len));
+        off += len;
+    }
+    out
 }
 
 /// HTTP offer：发送方 daemon 调用接收方 gateway 时 POST 的请求体
@@ -87,18 +111,16 @@ pub struct HttpOffer {
     pub file_id: String,
     pub file_name: String,
     pub file_size: u64,
-    /// 发送方的分块大小。**接收方建槽必须用这个值，不能用本地配置**——
-    /// 两端配置不一致会让 chunk 偏移整体错位，而每个块都会"成功"落盘，
-    /// 只有最后的整文件 sha256 能发现，为时已晚（方案 N2）。
+    /// 发送方决定的并行流数。**接收方建槽必须用这个值**算分段布局
+    /// （[`stream_layout`]），两端不一致会让字节区间错位，而每条流都会
+    /// "成功"写入错误偏移，只有整文件 sha256 能发现（方案 N2）。
     ///
-    /// 用 `Option` 而非 `#[serde(default)]`：旧版本 daemon 发来的 offer 没有这个字段，
-    /// 若给默认值 0，接收方会拿 0 去算偏移和 chunk_count（除零 / 全错位），
-    /// 比"字段缺失"本身危险得多。None 表示对端没说，接收方回退本地配置并告警。
+    /// `Option` + 无默认 0：旧版本 offer 没有该字段时视为缺失而不是 0 流。
     #[serde(default)]
-    pub chunk_size: Option<usize>,
+    pub stream_count: Option<u32>,
     /// 整文件 sha256（hex；可空）
     pub sha256: Option<String>,
-    /// true = sha256 由发送方边传边算，全部 chunk 发完后通过
+    /// true = sha256 由发送方边传边算，全部数据发完后通过
     /// POST /api/verify/:file_id 补发（大文件不再阻塞 offer，弹窗即时出现）
     #[serde(default)]
     pub sha256_deferred: bool,
@@ -149,10 +171,10 @@ pub struct IncomingEntry {
     pub file_id: String,
     pub file_name: String,
     pub file_size: u64,
-    /// 发送方声明的分块大小（透传自 `HttpOffer::chunk_size`）。
-    /// 接受时用它建槽，不能用接收方本地配置——理由同 `HttpOffer::chunk_size`。
+    /// 发送方声明的流数（透传自 `HttpOffer::stream_count`）。
+    /// 接受时用它建槽——理由同 `HttpOffer::stream_count`。
     #[serde(default)]
-    pub chunk_size: Option<usize>,
+    pub stream_count: Option<u32>,
     pub sha256: Option<String>,
     #[serde(default)]
     pub sha256_deferred: bool,
@@ -206,28 +228,60 @@ pub struct HttpIncomingResponse {
     pub transfer_port: u16,
 }
 
-impl DataFrameHeader {
-    pub const SIZE: usize = std::mem::size_of::<Self>();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
-        // 小端序，简单 memcpy
-        let mut buf = [0u8; Self::SIZE];
-        buf[0..8].copy_from_slice(&self.file_id_prefix.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.chunk_id.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.data_len.to_le_bytes());
-        buf[20..24].copy_from_slice(&self._reserved.to_le_bytes());
-        buf
+    #[test]
+    fn stream_count_adapts_to_file_size() {
+        // 几百 KB：单流
+        assert_eq!(compute_stream_count(300 * 1024, 8), 1);
+        // 2MB：仍单流（未到 4MB/流）
+        assert_eq!(compute_stream_count(2 * 1024 * 1024, 8), 1);
+        // 8MB：2 流
+        assert_eq!(compute_stream_count(8 * 1024 * 1024, 8), 2);
+        // 32MB+：拉满
+        assert_eq!(compute_stream_count(32 * 1024 * 1024, 8), 8);
+        // 封顶 max_parallel
+        assert_eq!(compute_stream_count(1024 * 1024 * 1024, 3), 3);
+        // 空文件
+        assert_eq!(compute_stream_count(0, 8), 1);
     }
 
-    pub fn from_bytes(buf: &[u8]) -> anyhow::Result<Self> {
-        if buf.len() < Self::SIZE {
-            anyhow::bail!("data frame header too short");
+    #[test]
+    fn layout_covers_file_without_gap_or_overlap() {
+        for size in [0u64, 1, 7, 10, 1024, 10_000] {
+            for n in [1u32, 2, 3, 8] {
+                let layout = stream_layout(size, n);
+                // 空文件固定一段 (0,0)，与 n 无关
+                let expect_len = if size == 0 { 1 } else { n.max(1) as usize };
+                assert_eq!(layout.len(), expect_len, "size={size} n={n}");
+                let total: u64 = layout.iter().map(|(_, len)| len).sum();
+                assert_eq!(total, size, "size={size} n={n}");
+                let mut expect = 0u64;
+                for (start, len) in &layout {
+                    assert_eq!(*start, expect);
+                    expect += len;
+                }
+            }
         }
-        Ok(Self {
-            file_id_prefix: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            chunk_id: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            data_len: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
-            _reserved: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-        })
+    }
+
+    #[test]
+    fn stream_header_roundtrip() {
+        let h = StreamHeader {
+            file_id_prefix: 0x0123_4567_89ab_cdef,
+            stream_id: 3,
+            _reserved: 0,
+            start_offset: 1 << 40,
+            data_len: 5 * 1024 * 1024 * 1024,
+        };
+        let bytes = h.to_bytes();
+        assert_eq!(bytes.len(), StreamHeader::SIZE);
+        let back = StreamHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(back.file_id_prefix, h.file_id_prefix);
+        assert_eq!(back.stream_id, h.stream_id);
+        assert_eq!(back.start_offset, h.start_offset);
+        assert_eq!(back.data_len, h.data_len);
     }
 }

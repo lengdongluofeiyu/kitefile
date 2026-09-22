@@ -160,7 +160,6 @@ pub unsafe extern "C" fn ftcore_init(
         let transfer = Arc::new(TransferEngine::new(
             config.transfer_port,
             config.parallel_streams,
-            config.chunk_size,
             config.receive_dir.clone(),
         ));
 

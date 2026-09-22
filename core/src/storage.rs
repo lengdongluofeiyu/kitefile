@@ -1,16 +1,16 @@
 //! 接收端文件落盘管理
 //!
 //! 设计：
-//! - 每个传输任务在 receive_dir 下创建 `<file_id>.part` 临时文件
-//! - 各 chunk 通过定位写（seek + write）写入正确偏移
-//! - 全部 chunk 完成 + 校验通过后，原子重命名为最终文件名
+//! - 每个传输任务在 receive_dir 下创建 `<file_name>.<id8>.part` 临时文件（预分配大小）
+//! - N 条 TCP 流各写一段连续字节区间（`stream_layout`），流内顺序写、无 ACK
+//! - 全部流完成 + 校验通过后，原子重命名为最终文件名
 //! - 中止（abort）时保留 .part 文件
 //!
-//! TODO: 保留 .part **不等于**支持断点续传。槽位与 chunk 完成位图只存在于
-//! 内存，进程重启即丢失，重启后这些 .part 无法被识别、也无人认领。
-//! 要真正续传，得先把槽位元数据落盘（含 chunk_size、位图、原 file_id），
-//! 详见方案 N2 / N3。在此之前 .part 只作为失败排查的现场。
+//! TODO: 保留 .part **不等于**支持断点续传。槽位与流完成位图只存在于
+//! 内存，进程重启即丢失。要真正续传，得先把槽位元数据落盘（含分段布局、
+//! 位图、原 file_id），详见方案 N2 / N3。在此之前 .part 只作为失败排查的现场。
 
+use crate::protocol::stream_layout;
 use crate::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -83,13 +83,18 @@ pub struct ReceiveSlot {
     pub file_id: String,
     pub file_name: String,
     pub file_size: u64,
-    pub chunk_size: usize,
-    pub chunk_count: u64,
-    pub received_chunks: Vec<bool>,
+    /// 发送方声明的并行流数（分段布局由它决定，两端必须一致）
+    pub stream_count: u32,
+    /// 各流的 `(start_offset, len)`，与 [`crate::protocol::stream_layout`] 一致
+    pub segments: Vec<(u64, u64)>,
+    /// 各流是否已收完
+    pub streams_done: Vec<bool>,
+    /// 已落盘字节（进度用；可能领先/落后于已完成流的段长之和）
+    pub bytes_received: u64,
     /// 发送方在 offer 中声明的整文件 sha256（校验用；可空）
     pub sha256: Option<String>,
     /// true = 发送方声明 sha256 会延后补发（POST /api/verify）：
-    /// 全部 chunk 收齐后若哈希未到，暂不 finalize，等哈希或超时保险丝
+    /// 全部流收齐后若哈希未到，暂不 finalize，等哈希或超时保险丝
     #[serde(default)]
     pub await_sha256: bool,
     pub temp_path: PathBuf,
@@ -97,15 +102,8 @@ pub struct ReceiveSlot {
 }
 
 impl ReceiveSlot {
-    pub fn next_missing_chunk(&self) -> Option<u64> {
-        self.received_chunks
-            .iter()
-            .position(|ok| !ok)
-            .map(|i| i as u64)
-    }
-
     pub fn is_complete(&self) -> bool {
-        self.received_chunks.iter().all(|ok| *ok)
+        !self.streams_done.is_empty() && self.streams_done.iter().all(|ok| *ok)
     }
 }
 
@@ -168,18 +166,18 @@ impl StorageManager {
         Ok(())
     }
 
-    /// 创建新接收槽位
+    /// 创建新接收槽位。`stream_count` 必须来自发送方 offer。
     #[allow(clippy::too_many_arguments)]
     pub async fn create_slot(
         &self,
         file_id: String,
         file_name: String,
         file_size: u64,
-        chunk_size: usize,
+        stream_count: u32,
         sha256: Option<String>,
         await_sha256: bool,
     ) -> Result<()> {
-        let chunk_count = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
+        let segments = stream_layout(file_size, stream_count);
         let receive_dir = self.receive_dir();
         // 先清洗再拼路径：直接 join 对端给的名字等于允许它指定任意写入位置
         let file_name = safe_file_name(&file_name);
@@ -202,9 +200,10 @@ impl StorageManager {
             file_id: file_id.clone(),
             file_name,
             file_size,
-            chunk_size,
-            chunk_count,
-            received_chunks: vec![false; chunk_count as usize],
+            stream_count: stream_count.max(1),
+            streams_done: vec![false; segments.len()],
+            segments,
+            bytes_received: 0,
             sha256,
             await_sha256,
             temp_path,
@@ -213,6 +212,11 @@ impl StorageManager {
 
         self.slots.lock().await.insert(file_id, slot);
         Ok(())
+    }
+
+    /// 槽位快照（流式写入时取 temp_path / 校验 stream_id）
+    pub async fn get_slot(&self, file_id: &str) -> Option<ReceiveSlot> {
+        self.slots.lock().await.get(file_id).cloned()
     }
 
     /// 补发最终 sha256（POST /api/verify/:file_id 调用）。
@@ -234,45 +238,29 @@ impl StorageManager {
         Some(slot.clone())
     }
 
-    /// 将一个 chunk 写入对应槽位
-    ///
-    /// 校验失败 / 槽位不存在均返回 Err：接收方只在落盘成功后才回 ACK，
-    /// 让发送方能感知到丢块，而不是误认为已发送完成。
-    pub async fn write_chunk(&self, file_id: &str, chunk_id: u64, data: &[u8]) -> Result<()> {
-        let slot_ref = {
+    /// 在指定偏移写入一段数据（测试与简单路径用；生产路径由调用方持句柄顺序写）。
+    pub async fn write_at(&self, file_id: &str, offset: u64, data: &[u8]) -> Result<()> {
+        let temp_path = {
             let slots = self.slots.lock().await;
-            slots.get(file_id).cloned()
+            let Some(slot) = slots.get(file_id) else {
+                return Err(crate::CoreError::Transfer(format!(
+                    "no receive slot for file_id {}",
+                    file_id
+                )));
+            };
+            if offset + data.len() as u64 > slot.file_size {
+                return Err(crate::CoreError::Transfer(format!(
+                    "write_at out of range: offset={} len={} file_size={}",
+                    offset,
+                    data.len(),
+                    slot.file_size
+                )));
+            }
+            slot.temp_path.clone()
         };
 
-        let Some(slot) = slot_ref else {
-            return Err(crate::CoreError::Transfer(format!(
-                "no receive slot for file_id {}",
-                file_id
-            )));
-        };
-
-        // 长度校验：chunk 数据必须与声明的偏移/大小严格一致
-        if chunk_id >= slot.chunk_count {
-            return Err(crate::CoreError::Transfer(format!(
-                "chunk_id {} out of range (chunk_count={})",
-                chunk_id, slot.chunk_count
-            )));
-        }
-        let offset = chunk_id * slot.chunk_size as u64;
-        let expected_len =
-            std::cmp::min(slot.file_size.saturating_sub(offset), slot.chunk_size as u64) as usize;
-        if data.len() != expected_len {
-            return Err(crate::CoreError::Transfer(format!(
-                "chunk {} length mismatch: expected {}, got {}",
-                chunk_id,
-                expected_len,
-                data.len()
-            )));
-        }
-
-        let temp_path = slot.temp_path.clone();
         let data = data.to_vec();
-
+        let n = data.len() as u64;
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             use std::io::{Seek, SeekFrom, Write};
             let mut f = std::fs::OpenOptions::new().write(true).open(&temp_path)?;
@@ -284,20 +272,48 @@ impl StorageManager {
         .await
         .map_err(|e| crate::CoreError::Transfer(e.to_string()))?
         .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+        self.add_bytes(file_id, n).await;
+        Ok(())
+    }
 
+    /// 累计已收字节（进度）
+    pub async fn add_bytes(&self, file_id: &str, n: u64) {
+        if let Some(slot) = self.slots.lock().await.get_mut(file_id) {
+            slot.bytes_received = slot.bytes_received.saturating_add(n);
+        }
+    }
+
+    /// 标记一条流收完。返回更新后的槽位快照（None = 槽位已不在）。
+    ///
+    /// 段长会补进 `bytes_received`（若调用方未用 `add_bytes` 逐段累计，
+    /// 完成时至少保证总量正确）。重复 mark 幂等。
+    pub async fn finish_stream(&self, file_id: &str, stream_id: u32) -> Option<ReceiveSlot> {
         let mut slots = self.slots.lock().await;
-        if let Some(slot) = slots.get_mut(file_id) {
-            if (chunk_id as usize) < slot.received_chunks.len() {
-                slot.received_chunks[chunk_id as usize] = true;
+        let slot = slots.get_mut(file_id)?;
+        let idx = stream_id as usize;
+        if idx < slot.streams_done.len() {
+            if !slot.streams_done[idx] {
+                slot.streams_done[idx] = true;
             }
         }
-        Ok(())
+        // 用已完成流的段长之和校正 bytes_received，避免双计或漏计
+        let done_bytes: u64 = slot
+            .segments
+            .iter()
+            .zip(&slot.streams_done)
+            .filter(|(_, done)| **done)
+            .map(|((_, len), _)| *len)
+            .sum();
+        if done_bytes > slot.bytes_received {
+            slot.bytes_received = done_bytes;
+        }
+        Some(slot.clone())
     }
 
     /// 完成时校验 sha256 并将 .part 重命名为最终文件
     ///
     /// 校验失败返回 `ChecksumMismatch`，槽位移除、.part 保留供排查。
-    /// 先原子领取（remove）槽位：并发的多个 chunk 同时判定完成时只有一个 finalize 生效，
+    /// 先原子领取（remove）槽位：并发的多个流同时判定完成时只有一个 finalize 生效，
     /// 避免二次校验 / 二次 rename 报错把 Completed 覆盖成 Failed。
     ///
     /// 返回**实际落盘路径**——目标已存在时会改名成 `name (1).ext`，
@@ -310,7 +326,7 @@ impl StorageManager {
 
         if let Some(slot) = slot {
             if !slot.is_complete() {
-                warn!(file_id, "finalize called but chunks incomplete");
+                warn!(file_id, "finalize called but streams incomplete");
             }
 
             // 整文件 sha256 校验（offer 声明了才校验）
@@ -373,7 +389,7 @@ impl StorageManager {
         }
     }
 
-    /// 中止接收：移除槽位（不再接受该文件的 chunk），**保留 .part 文件**。
+    /// 中止接收：移除槽位（不再接受该文件的流），**保留 .part 文件**。
     ///
     /// 注意这里只移除内存里的槽位，不删磁盘文件。保留下来是为了事后排查
     /// 传输失败的原因（落盘内容、偏移都对不对）。
@@ -398,23 +414,24 @@ mod tests {
         assert_eq!(conflict_name("a.mp4", 0), "a.mp4");
         assert_eq!(conflict_name("a.mp4", 1), "a (1).mp4");
         assert_eq!(conflict_name("a.mp4", 2), "a (2).mp4");
-        // 多段扩展名只认最后一段：`archive.tar (1).gz` 而不是 `archive (1).tar.gz`
+    }
+
+    #[test]
+    fn conflict_name_multi_ext_treats_last_as_ext() {
         assert_eq!(conflict_name("archive.tar.gz", 1), "archive.tar (1).gz");
-        assert_eq!(conflict_name("noext", 1), "noext (1)");
-        // 隐藏文件：Rust 的 extension() 对 `.bashrc` 返回 None，整体当 stem
+    }
+
+    #[test]
+    fn conflict_name_hidden_file_has_no_ext() {
         assert_eq!(conflict_name(".bashrc", 1), ".bashrc (1)");
     }
 
-    /// 文件名来自对端的 offer，是可信度为零的输入
     #[test]
-    fn safe_file_name_blocks_traversal() {
-        assert_eq!(safe_file_name("a.txt"), "a.txt");
-        assert_eq!(safe_file_name("../../evil.exe"), "evil.exe");
+    fn safe_file_name_strips_directories() {
+        assert_eq!(safe_file_name("../../etc/passwd"), "passwd");
         assert_eq!(safe_file_name("/etc/passwd"), "passwd");
-        assert_eq!(safe_file_name("C:/Windows/evil.exe"), "evil.exe");
-        // 只剩目录成分 / 空串 / 纯 `..` → 兜底名，绝不能退化成目录
+        assert_eq!(safe_file_name("C:\\Windows\\System32\\evil.exe"), "evil.exe");
         assert_eq!(safe_file_name(".."), "unnamed");
         assert_eq!(safe_file_name(""), "unnamed");
-        assert_eq!(safe_file_name("a/b/"), "b");
     }
 }

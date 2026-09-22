@@ -79,7 +79,6 @@ async fn run_daemon(allow_remote_admin: bool) -> anyhow::Result<()> {
     let transfer = Arc::new(ftcore::TransferEngine::new(
         config.transfer_port,
         config.parallel_streams,
-        config.chunk_size,
         config.receive_dir.clone(),
     ));
 
@@ -201,7 +200,6 @@ async fn send(ip: String, path: String) -> anyhow::Result<()> {
     let transfer = Arc::new(ftcore::TransferEngine::new(
         transfer_port,
         config.parallel_streams,
-        config.chunk_size,
         config.receive_dir.clone(),
     ));
 

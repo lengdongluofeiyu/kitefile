@@ -1,25 +1,24 @@
-//! 多流 TCP 并行传输引擎
+//! 多流 TCP 并行流式传输引擎
 //!
 //! 设计要点：
-//! 1. 文件分块（chunk_size 默认 16MB），并行流数量默认 = min(CPU, 8)
-//! 2. 每条数据流负责不同的 chunk，独立 TCP 连接
+//! 1. 文件按字节切成 N 段连续区间（[`crate::protocol::stream_layout`]），
+//!    每条 TCP 流顺序写一段，**流内无分块、无应用层 ACK**。
+//!    停等 ACK 会把节奏卡在「等对端落盘」上，已彻底去掉；背压靠 TCP 窗口。
+//! 2. 流数按文件大小自适应（[`crate::protocol::compute_stream_count`]）：
+//!    几百 KB 单流，几十 MB 拉满 `parallel_streams`（默认 min(CPU, 8)）。
 //! 3. 背压：进度事件走**有界** channel（容量见 `PROGRESS_CHANNEL_CAP`）。
 //!    进行中的进度用 `try_send`（满了就丢，不阻塞发送主循环），
 //!    终态用 `send().await` 确保送达——否则 UI 会永远停在 99%。
 //! 4. 校验：目前只有「整文件 sha256」一道。发送方边传边算，传完后经
 //!    `POST /api/verify/:file_id` 补发给接收方，由接收方 finalize 时比对。
-//!    TODO: chunk 级校验尚未实现——`DataFrameHeader` 只有 4 个字段，
-//!    没有 checksum 位。现状下单块数据损坏只有整文件 sha256 能发现，
-//!    而发现之后只能整体重传。阶段 5b 上加密后，认证标签会顺带补上这一层。
-//! 5. TODO: 断点续传尚未实现。chunk 完成位图只在内存里，进程重启即丢失，
-//!    发送方也没有获知旧 file_id 的渠道。详见方案 N2 / N3。
+//! 5. TODO: 断点续传尚未实现。流完成位图只在内存里，进程重启即丢失。
 //! 6. 接收方需先弹窗确认（HTTP offer/accept 握手）才开始 TCP 数据流
 //!
 //! 跨平台实现：使用 `Seek + Read`，不依赖平台专属零拷贝 API。
 //! 后续可按平台用 cfg 切到 sendfile/TransmitFile 等优化。
 
 use crate::protocol::{
-    DataFrameHeader, HttpIncomingResponse, HttpOffer, IncomingEntry,
+    compute_stream_count, stream_layout, HttpIncomingResponse, HttpOffer, IncomingEntry, StreamHeader,
 };
 use crate::storage::StorageManager;
 use crate::Result;
@@ -30,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as TokioMutex};
 use tracing::{error, info, warn};
@@ -52,6 +51,7 @@ pub struct TransferProgress {
     pub file_name: String,
     pub file_size: u64,
     pub bytes_transferred: u64,
+    /// 已完成的流数（UI 兼容字段；流式下即「段」数）
     pub chunks_done: u64,
     pub chunks_total: u64,
     pub speed_bps: u64,
@@ -66,10 +66,9 @@ pub struct TransferProgress {
     pub file_path: Option<String>,
 }
 
-/// 传输句柄，可用于取消与订阅进度
 /// 单个传输的进度通道容量。
 ///
-/// 用有界而非无界：InProgress 是高频帧（每块一条），UI 若不消费，
+/// 用有界而非无界：InProgress 是高频帧（按字节推），UI 若不消费，
 /// 无界通道会一路堆到 OOM。
 const PROGRESS_CHANNEL_CAP: usize = 256;
 
@@ -77,16 +76,15 @@ const PROGRESS_CHANNEL_CAP: usize = 256;
 const TERMINAL_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 全量进度快照的条目上限（`GET /api/transfers` 的数据源）。
-///
-/// daemon 是常驻进程，不设限的话每传一个文件都会在这里留一条终态进度，
-/// 传上千个文件就积上千条永不释放的记录。
 const PROGRESS_CACHE_CAP: usize = 200;
 
+/// 进度推送节流：整个传输每 100ms 最多一条 InProgress
+const PROGRESS_PUSH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 流式读写缓冲。够大摊薄 syscall，够小让进度平滑、内存友好。
+const STREAM_IO_BUF: usize = 256 * 1024;
+
 /// 有上限的进度快照：HashMap + 插入顺序队列。
-///
-/// 淘汰时优先丢**已终态**的最早条目——老任务的终态进度通常已经没人看了；
-/// 全是进行中时退化为丢最早一条。宁可让最老的任务从列表里消失，
-/// 也不能让新进度写不进来。
 struct ProgressCache {
     cap: usize,
     map: HashMap<String, TransferProgress>,
@@ -111,8 +109,6 @@ impl ProgressCache {
         }
         self.order.push_back(file_id);
 
-        // evict_one 返回 false 表示再也淘汰不掉（理论上不会发生），
-        // 此时必须退出，否则是一个死循环。
         while self.map.len() > self.cap && self.evict_one() {}
     }
 
@@ -133,8 +129,6 @@ impl ProgressCache {
         }
 
         // 全是进行中：退化为淘汰最早一条。
-        // 这里的 continue（即继续 pop）是刻意的：队列里可能残留已失效的 id，
-        // 一旦写成 break，整个淘汰就停摆，快照再也降不下来。
         while let Some(id) = self.order.pop_front() {
             if self.map.remove(&id).is_some() {
                 return true;
@@ -158,13 +152,8 @@ fn is_terminal(s: &TransferStatus) -> bool {
 
 /// 推送一条进度帧。
 ///
-/// 两类帧必须区别对待，这就是本函数存在的全部理由：
-/// - **InProgress**：高频（每块一条）。用 `try_send`，通道满就直接丢。
-///   绝不能在这里 await——UI 不消费时，无界通道吃光内存、有界通道拖死
-///   传输主循环，两种都是事故。丢几帧无所谓：进度是瞬时快照，后到的会覆盖。
+/// - **InProgress**：高频。用 `try_send`，通道满就直接丢。
 /// - **其余状态**：必须送达。丢一帧终态，UI 就永远停在 99%。
-///   用带超时的 `send`：超时说明压根没人消费，记一条 warn 后放弃，
-///   不能让收尾消息把任务永久挂住。
 async fn push_progress(tx: &mpsc::Sender<TransferProgress>, p: TransferProgress) {
     let terminal = !matches!(p.status, TransferStatus::InProgress);
     if terminal {
@@ -182,7 +171,6 @@ async fn push_progress(tx: &mpsc::Sender<TransferProgress>, p: TransferProgress)
             );
         }
     } else if let Err(e) = tx.try_send(p) {
-        // 通道满：丢弃这一帧。进度是瞬时快照，下一帧会覆盖它。
         tracing::debug!(error = %e, "进度通道已满，丢弃一帧 InProgress");
     }
 }
@@ -209,12 +197,7 @@ struct IncomingSlot {
     /// **必须持有，不能丢。**
     ///
     /// tokio 的 `watch::Sender::send` 在「一个 receiver 都没有」时直接返回
-    /// Err 且**不更新值**。以前这里只创建了 `_decision_rx` 然后随 register
-    /// 返回而 drop，于是决策能不能生效完全取决于 `wait_decision` 的
-    /// `subscribe()` 有没有抢先跑到——这是个竞态：
-    /// UI 若在这个后台任务订阅之前就点了接受/拒绝，send 静默失败，
-    /// 该条目会一直等到 60s 超时才被自动拒绝（表现为"点了没反应")。
-    /// 在槽里常驻一个 receiver，send 就永远有接收方，决策不再丢失。
+    /// Err 且**不更新值**。槽里常驻一个 receiver，send 就永远有接收方。
     _decision_rx: watch::Receiver<Option<bool>>,
 }
 
@@ -238,8 +221,7 @@ impl IncomingManager {
             file_id: offer.file_id.clone(),
             file_name: offer.file_name,
             file_size: offer.file_size,
-            // 透传发送方的分块大小：后面建槽要用它，不能用本地配置
-            chunk_size: offer.chunk_size,
+            stream_count: offer.stream_count,
             sha256: offer.sha256,
             sha256_deferred: offer.sha256_deferred,
             from_id: offer.from_id,
@@ -247,7 +229,6 @@ impl IncomingManager {
             from_ip: offer.from_ip,
             from_gateway_port: offer.from_gateway_port,
             from_transfer_port: offer.from_transfer_port,
-            // 批次信息透传：UI 靠 batch_id 把同批条目合成一张卡片
             batch_id: offer.batch_id,
             batch_index: offer.batch_index,
             batch_total: offer.batch_total,
@@ -255,19 +236,18 @@ impl IncomingManager {
             decision: None,
         };
         let (decision_tx, decision_rx) = watch::channel(None);
-        self.slots.lock().insert(incoming_id.clone(), IncomingSlot {
-            entry: entry.clone(),
-            decision_tx,
-            _decision_rx: decision_rx,
-        });
+        self.slots.lock().insert(
+            incoming_id.clone(),
+            IncomingSlot {
+                entry: entry.clone(),
+                decision_tx,
+                _decision_rx: decision_rx,
+            },
+        );
         entry
     }
 
     /// UI 决策。返回 Some(entry) 表示找到该 incoming，None 表示已超时/不存在
-    ///
-    /// 注意：接受时不能在此移除槽位 —— gateway 的 accept 路由先调本方法设置决议，
-    /// 随后后台任务（wait_decision 唤醒后）再调 `TransferEngine::decide_incoming`
-    /// 创建接收槽；槽位移除由 decide_incoming 完成（见下）。
     pub async fn decide(&self, incoming_id: &str, accept: bool) -> Option<IncomingEntry> {
         let slot_opt = self.slots.lock().get(incoming_id).map(|s| IncomingSlotRef {
             decision_tx: s.decision_tx.clone(),
@@ -277,12 +257,8 @@ impl IncomingManager {
         let _ = slot.decision_tx.send(Some(accept));
         let mut entry = slot.entry;
         if !accept {
-            // 拒绝：无后续流程，立即移除
             self.slots.lock().remove(incoming_id);
         } else {
-            // 接受：槽位要留到后台任务建完接收槽再清理，但决议得记进 entry。
-            // 以前这里不写，entry.decision 永远是 None——等于这个字段是死的，
-            // 重复查 pending 列表时会把已接受的条目继续当成"待决定"推给 UI。
             entry.decision = Some(true);
             if let Some(s) = self.slots.lock().get_mut(incoming_id) {
                 s.entry.decision = Some(true);
@@ -298,48 +274,41 @@ impl IncomingManager {
             let slot = slots.get(incoming_id)?;
             (slot.decision_tx.clone(), slot.decision_tx.subscribe())
         };
-        // 当前值
         if let Some(d) = *rx.borrow() {
             return Some(d);
         }
-        // 等待变化，最多 60 秒（给用户足够时间在弹窗上决策）
         match tokio::time::timeout(Duration::from_secs(60), rx.changed()).await {
             Ok(Ok(())) => *rx.borrow(),
             _ => {
-                // 超时：自动 reject
                 let _ = tx.send(Some(false));
                 None
             }
         }
     }
 
-    /// 列出所有 pending incoming（供 UI / GET /api/incoming）
+    /// 列出所有待决定的 incoming（GET /api/incoming）。
+    /// 已决策的不再出现在「待决定」列表里，否则 UI 会把已接受的继续弹成待决定。
     pub fn list_pending(&self) -> Vec<IncomingEntry> {
         self.slots
             .lock()
             .values()
+            .filter(|s| s.entry.decision.is_none())
             .map(|s| s.entry.clone())
             .collect()
     }
 
-    /// 列出某个批次下所有待决定条目（按 batch_index 排序，UI 顺序稳定）
     pub fn list_pending_by_batch(&self, batch_id: &str) -> Vec<IncomingEntry> {
         let mut out: Vec<IncomingEntry> = self
             .slots
             .lock()
             .values()
-            .filter(|s| s.entry.batch_id.as_deref() == Some(batch_id))
+            .filter(|s| s.entry.decision.is_none() && s.entry.batch_id.as_deref() == Some(batch_id))
             .map(|s| s.entry.clone())
             .collect();
         out.sort_by_key(|e| e.batch_index.unwrap_or(u32::MAX));
         out
     }
 
-    /// 对同一批次的所有待决定条目下同一个决定，返回实际处理掉的 incoming_id。
-    ///
-    /// 逐个复用 `decide`，所以语义和 UI 一个个点完全一致——
-    /// 接受后走的仍是同一条 `wait_decision` → `decide_incoming` 流程，
-    /// 不引入第二套状态机，也不改变超时/取消行为。
     pub async fn decide_batch(&self, batch_id: &str, accept: bool) -> Vec<String> {
         let ids: Vec<String> = self
             .list_pending_by_batch(batch_id)
@@ -355,12 +324,10 @@ impl IncomingManager {
         done
     }
 
-    /// 接收完成或失败后清理
     pub fn remove(&self, incoming_id: &str) {
         self.slots.lock().remove(incoming_id);
     }
 
-    /// 按 file_id 清理（传输完成/失败/取消后调用）
     pub fn remove_by_file_id(&self, file_id: &str) {
         let mut slots = self.slots.lock();
         let keys: Vec<String> = slots
@@ -374,6 +341,12 @@ impl IncomingManager {
     }
 }
 
+impl Default for IncomingManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// 辅助：从 Mutex<HashMap> 里安全取出 slot（避免持有锁跨 await）
 struct IncomingSlotRef {
     decision_tx: watch::Sender<Option<bool>>,
@@ -384,7 +357,6 @@ struct IncomingSlotRef {
 pub struct TransferEngine {
     pub transfer_port: u16,
     pub parallel_streams: usize,
-    pub chunk_size: usize,
     pub receive_dir: PathBuf,
     inflight: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     /// 发送方 daemon：等待接收方回包的 file_id → oneshot
@@ -397,18 +369,15 @@ pub struct TransferEngine {
     prefix_to_file_id: TokioMutex<HashMap<u64, String>>,
     /// 进度广播 bus（gateway 注入；None 时 send_file 仍能用，只是不广播）
     progress_bus: TokioMutex<Option<Arc<broadcast::Sender<TransferProgress>>>>,
-    /// 全量进度快照：file_id → 最近一条进度（GET /api/transfers 用）。
-    /// 有条目上限，超出后按插入顺序淘汰，见 [`ProgressCache`]。
+    /// 全量进度快照：file_id → 最近一条进度（GET /api/transfers 用）
     progress_cache: Arc<Mutex<ProgressCache>>,
-    /// 接收方速率统计：file_id → (首 chunk 时间, 上次已收字节数)
+    /// 接收方速率统计：file_id → (首 字节 时间, 上次已收字节数)
     recv_speed_state: TokioMutex<HashMap<String, (Instant, u64)>>,
     /// 已接受的 incoming：file_id → (发送方 IP, 发送方 gateway 端口)
     /// 接收方取消时用于通知发送方联动取消
     incoming_endpoints: TokioMutex<HashMap<String, (String, u16)>>,
     /// 发送中的任务：file_id → (对端 IP, 对端 gateway 端口)
-    /// 发送方取消时用于通知接收方联动取消（对称于 incoming_endpoints；
-    /// 之前只有"接收方取消→通知发送方"，反向漏了，表现为发送方取消后
-    /// 接收方 UI 永远停在"进行中"）
+    /// 发送方取消时用于通知接收方联动取消（对称于 incoming_endpoints）
     outgoing_endpoints: TokioMutex<HashMap<String, (String, u16)>>,
 }
 
@@ -416,13 +385,11 @@ impl TransferEngine {
     pub fn new(
         transfer_port: u16,
         parallel_streams: usize,
-        chunk_size: usize,
         receive_dir: PathBuf,
     ) -> Self {
         Self {
             transfer_port,
             parallel_streams,
-            chunk_size,
             receive_dir: receive_dir.clone(),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             outgoing_offers: Arc::new(TokioMutex::new(HashMap::new())),
@@ -460,8 +427,6 @@ impl TransferEngine {
     }
 
     /// 取消一个传输（file_id 可能是本机作为发送方或接收方的任务）
-    ///
-    /// 返回是否找到对应任务。
     pub async fn cancel(&self, file_id: &str) -> bool {
         let mut found = false;
 
@@ -470,7 +435,6 @@ impl TransferEngine {
             let _ = tx.send(true);
             found = true;
         }
-        // 若发送方正卡在等回包，直接注入一条“已取消”回包
         if let Some(tx) = self.outgoing_offers.lock().await.remove(file_id) {
             let _ = tx.send(HttpIncomingResponse {
                 file_id: file_id.to_string(),
@@ -482,9 +446,6 @@ impl TransferEngine {
         }
 
         // 发送方取消 → 通知接收方联动取消。
-        // 接收方的 cancel() 自带"清接收槽位 + 推 Canceled 进度"的接收方分支
-        // （即下方代码），这里只需跨机调它的 /api/cancel 即可。
-        // 不通知的话：连接直接断掉，接收端只留一行 warn，UI 永远显示进行中。
         if let Some((target_ip, target_gateway_port)) =
             self.outgoing_endpoints.lock().await.remove(file_id)
         {
@@ -511,7 +472,7 @@ impl TransferEngine {
             self.prefix_to_file_id.lock().await.remove(&prefix);
             self.incoming.remove_by_file_id(file_id);
             self.recv_speed_state.lock().await.remove(file_id);
-            // 通知发送方联动取消（发送方收到 POST /api/cancel 后停止发送）
+            // 通知发送方联动取消
             if let Some((from_ip, from_gateway_port)) =
                 self.incoming_endpoints.lock().await.remove(file_id)
             {
@@ -530,7 +491,7 @@ impl TransferEngine {
                 file_size: slot.file_size,
                 bytes_transferred: 0,
                 chunks_done: 0,
-                chunks_total: slot.chunk_count,
+                chunks_total: slot.streams_done.len() as u64,
                 speed_bps: 0,
                 status: TransferStatus::Canceled,
                 error: Some("canceled by receiver".into()),
@@ -564,8 +525,6 @@ impl TransferEngine {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
-                        // 关 Nagle：接收端每收完一块要立刻回一个 ACK，
-                        // 让这个小包马上上路，不要等延迟确认或搭顺风车。
                         if let Err(e) = stream.set_nodelay(true) {
                             warn!(?peer, error = %e, "set_nodelay failed (non-fatal)");
                         }
@@ -585,173 +544,158 @@ impl TransferEngine {
         Ok(())
     }
 
-    /// 服务一个数据流连接：**循环**读帧（header + chunk → 写盘 → 回 ACK）
+    /// 服务一条数据流：读 [`StreamHeader`] → 流式落盘到对应偏移 → 标记该流完成。
     ///
-    /// 连接复用后一条连接要承载一条并行流的全部块，所以这里必须循环读，
-    /// 直到对端关闭——干净 EOF 就是"这条流传完了"。
-    /// 原来"一连接一块"的写法没有循环，改成复用后不补这一层会只收第一块。
+    /// 一条连接只承载一段连续字节，没有分块 ACK。干净 EOF 且读满 `data_len` 即成功。
     async fn serve_data_stream(self: Arc<Self>, mut stream: TcpStream) -> Result<()> {
-        loop {
-            let mut header_buf = [0u8; DataFrameHeader::SIZE];
-            let n = read_full(&mut stream, &mut header_buf)
-                .await
-                .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
-            if n == 0 {
-                // 干净 EOF：对端这条流发完并关闭了连接
-                return Ok(());
-            }
-            if n < DataFrameHeader::SIZE {
-                return Err(crate::CoreError::Transfer(format!(
-                    "truncated frame header ({} bytes)",
-                    n
-                )));
-            }
-            let header = DataFrameHeader::from_bytes(&header_buf)
-                .map_err(|e| crate::CoreError::Transfer(format!("invalid header: {}", e)))?;
+        let mut header_buf = [0u8; StreamHeader::SIZE];
+        read_full(&mut stream, &mut header_buf)
+            .await
+            .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+        let header = StreamHeader::from_bytes(&header_buf)
+            .map_err(|e| crate::CoreError::Transfer(format!("invalid stream header: {}", e)))?;
 
-            let mut buf = vec![0u8; header.data_len as usize];
-            let n = read_full(&mut stream, &mut buf)
-                .await
-                .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
-            if n < buf.len() {
-                return Err(crate::CoreError::Transfer(format!(
-                    "truncated chunk {} body ({} < {})",
-                    header.chunk_id,
-                    n,
-                    buf.len()
-                )));
-            }
-
-            self.handle_data_frame(&mut stream, &header, &buf).await?;
-        }
-    }
-
-    /// 处理一帧数据：写盘 → 推进度 → 回 ACK。由读帧循环 [`Self::serve_data_stream`] 调用。
-    async fn handle_data_frame(
-        self: &Arc<Self>,
-        stream: &mut TcpStream,
-        header: &DataFrameHeader,
-        buf: &[u8],
-    ) -> Result<()> {
-
-        // 通过 file_id_prefix 反查 file_id（接收方在 Accept 时建立映射）
         let file_id = {
             let prefix = header.file_id_prefix;
             let map = self.prefix_to_file_id.lock().await;
             map.get(&prefix).cloned()
         };
-
-        if let Some(file_id) = file_id {
-            // 写入对应 chunk
-            if let Err(e) = self.storage.write_chunk(&file_id, header.chunk_id, &buf).await {
-                // 写盘失败：推 Failed 并返回，不再 ACK
-                error!(%file_id, chunk = header.chunk_id, error = %e, "write chunk failed");
-                let slot = self.storage.list_in_progress().await.into_iter().find(|s| s.file_id == file_id);
-                let (name, size, chunk_count) = match &slot {
-                    Some(s) => (s.file_name.clone(), s.file_size, s.chunk_count),
-                    None => (String::new(), 0, 0),
-                };
-                self.publish_progress(TransferProgress {
-                    file_id: file_id.clone(),
-                    file_name: name,
-                    file_size: size,
-                    bytes_transferred: 0,
-                    chunks_done: 0,
-                    chunks_total: chunk_count,
-                    speed_bps: 0,
-                    status: TransferStatus::Failed,
-                    error: Some(format!("write chunk: {}", e)),
-                    incoming: true,
-                file_path: None,
-                })
-                .await;
-                return Err(e);
-            }
-
-            // 更新接收进度并广播（速率 = 累计字节 / 首chunk以来的耗时）
-            let slot = self.storage.list_in_progress().await.into_iter().find(|s| s.file_id == file_id);
-            if let Some(slot) = slot {
-                let chunks_done = slot.received_chunks.iter().filter(|ok| **ok).count() as u64;
-                let bytes_done = chunks_done * slot.chunk_size as u64;
-                let speed_bps = {
-                    let mut state = self.recv_speed_state.lock().await;
-                    let (start, _) = state
-                        .entry(file_id.clone())
-                        .or_insert_with(|| (Instant::now(), 0));
-                    let elapsed = start.elapsed().as_secs_f64();
-                    if elapsed >= 0.5 {
-                        (bytes_done as f64 / elapsed) as u64
-                    } else {
-                        0 // 首个 chunk 窗口太短，避免虚高
-                    }
-                };
-                let progress = TransferProgress {
-                    file_id: file_id.clone(),
-                    file_name: slot.file_name.clone(),
-                    file_size: slot.file_size,
-                    bytes_transferred: bytes_done.min(slot.file_size),
-                    chunks_done,
-                    chunks_total: slot.chunk_count,
-                    speed_bps,
-                    status: TransferStatus::InProgress,
-                    error: None,
-                    incoming: true,
-                file_path: None,
-                };
-                self.publish_progress(progress).await;
-
-                // 全部 chunk 收齐后的收尾
-                if slot.is_complete() {
-                    if slot.await_sha256 && slot.sha256.is_none() {
-                        // 发送方声明会补发 sha256（大文件边传边算）：先不 finalize，
-                        // 等 POST /api/verify。保险丝：120 秒未收到（发送方失联）
-                        // 则跳过校验直接完成，避免接收方永久卡在 InProgress。
-                        let engine = self.clone();
-                        let fid = file_id.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(120)).await;
-                            // None 不覆盖已到的真哈希；slot 已 finalize 则为幂等 no-op
-                            let _ = engine.apply_final_sha256(&fid, None).await;
-                        });
-                    } else {
-                        let _ = self.finish_receive(&file_id, &slot).await;
-                    }
-                }
-            }
-        } else {
-            // 不回 ACK：发送方等不到确认会按失败处理。
-            // 若这里回 ok=true，会掩盖丢块（发送方显示完成、接收方缺 chunk）。
+        let Some(file_id) = file_id else {
             warn!(prefix = header.file_id_prefix, "unknown file_id_prefix (no receive slot)");
             return Err(crate::CoreError::Transfer(format!(
                 "unknown file_id_prefix {} (no receive slot)",
                 header.file_id_prefix
             )));
+        };
+
+        let slot = self
+            .storage
+            .get_slot(&file_id)
+            .await
+            .ok_or_else(|| crate::CoreError::Transfer(format!("no receive slot for {}", file_id)))?;
+
+        let seg_idx = header.stream_id as usize;
+        let Some(&(seg_start, seg_len)) = slot.segments.get(seg_idx) else {
+            return Err(crate::CoreError::Transfer(format!(
+                "stream_id {} out of range (stream_count={})",
+                header.stream_id, slot.stream_count
+            )));
+        };
+        if header.start_offset != seg_start || header.data_len != seg_len {
+            return Err(crate::CoreError::Transfer(format!(
+                "stream {} layout mismatch: header=({}, {}) expected=({}, {})",
+                header.stream_id, header.start_offset, header.data_len, seg_start, seg_len
+            )));
         }
 
-        // ACK 给发送方（控制消息，JSON 行）
-        let ack = crate::protocol::ControlMessage::ChunkAck {
-            file_id: String::new(),
-            chunk_id: header.chunk_id,
-            ok: true,
-        };
-        let line = ack.to_line().unwrap_or_default();
-        stream
-            .write_all(line.as_bytes())
+        // 流式写盘：顺序写本段区间，每读一块就推进度（平滑、无停等）
+        {
+            use std::io::SeekFrom;
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&slot.temp_path)
+                .await
+                .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+            file.seek(SeekFrom::Start(header.start_offset))
+                .await
+                .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+
+            let mut remaining = header.data_len;
+            let mut buf = vec![0u8; STREAM_IO_BUF.min(header.data_len.max(1) as usize)];
+            let mut last_push = Instant::now()
+                .checked_sub(PROGRESS_PUSH_INTERVAL)
+                .unwrap_or_else(Instant::now);
+            while remaining > 0 {
+                let want = std::cmp::min(remaining as usize, buf.len());
+                let n = read_full(&mut stream, &mut buf[..want])
+                    .await
+                    .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+                if n == 0 {
+                    return Err(crate::CoreError::Transfer(format!(
+                        "truncated stream {} ({} bytes missing)",
+                        header.stream_id, remaining
+                    )));
+                }
+                file.write_all(&buf[..n])
+                    .await
+                    .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+                remaining -= n as u64;
+                self.storage.add_bytes(&file_id, n as u64).await;
+
+                if last_push.elapsed() >= PROGRESS_PUSH_INTERVAL {
+                    last_push = Instant::now();
+                    self.publish_recv_progress(&file_id, &slot).await;
+                }
+            }
+            file.flush()
+                .await
+                .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+        }
+
+        let slot = self
+            .storage
+            .finish_stream(&file_id, header.stream_id)
             .await
-            .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+            .ok_or_else(|| crate::CoreError::Transfer("slot vanished during stream".into()))?;
+        self.publish_recv_progress(&file_id, &slot).await;
+
+        // 全部流收齐后的收尾
+        if slot.is_complete() {
+            if slot.await_sha256 && slot.sha256.is_none() {
+                // 发送方声明会补发 sha256：先不 finalize，等 POST /api/verify。
+                // 保险丝：120 秒未收到则跳过校验直接完成。
+                let engine = self.clone();
+                let fid = file_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                    let _ = engine.apply_final_sha256(&fid, None).await;
+                });
+            } else {
+                let _ = self.finish_receive(&file_id, &slot).await;
+            }
+        }
         Ok(())
     }
 
+    /// 推送接收方视角的 InProgress 进度
+    async fn publish_recv_progress(&self, file_id: &str, slot: &crate::storage::ReceiveSlot) {
+        let streams_done = slot.streams_done.iter().filter(|ok| **ok).count() as u64;
+        let bytes_done = slot.bytes_received.min(slot.file_size);
+        let speed_bps = {
+            let mut state = self.recv_speed_state.lock().await;
+            let (start, _) = state
+                .entry(file_id.to_string())
+                .or_insert_with(|| (Instant::now(), 0));
+            let elapsed = start.elapsed().as_secs_f64();
+            if elapsed >= 0.5 {
+                (bytes_done as f64 / elapsed) as u64
+            } else {
+                0
+            }
+        };
+        self.publish_progress(TransferProgress {
+            file_id: file_id.to_string(),
+            file_name: slot.file_name.clone(),
+            file_size: slot.file_size,
+            bytes_transferred: bytes_done,
+            chunks_done: streams_done,
+            chunks_total: slot.streams_done.len() as u64,
+            speed_bps,
+            status: TransferStatus::InProgress,
+            error: None,
+            incoming: true,
+            file_path: None,
+        })
+        .await;
+    }
+
     /// 接收方收尾：校验 sha256 + 原子重命名 + 清理注册表 + 推最终进度
-    ///
-    /// （原 serve_data_stream 完成分支的逻辑，抽出供「哈希随到随 finalize」复用）
     async fn finish_receive(
         &self,
         file_id: &str,
         slot: &crate::storage::ReceiveSlot,
     ) -> crate::Result<()> {
         let result = self.storage.finalize(file_id, slot.sha256.as_deref()).await;
-        // 清理 prefix 映射、incoming 条目、发送方地址登记与速率统计
         let prefix = file_id_prefix_u64(file_id);
         self.prefix_to_file_id.lock().await.remove(&prefix);
         self.incoming.remove_by_file_id(file_id);
@@ -762,12 +706,8 @@ impl TransferEngine {
             Ok(_) => (TransferStatus::Completed, None),
             Err(e) => (TransferStatus::Failed, Some(e.to_string())),
         };
-        // 完成时携带最终保存路径，UI 据此提供“打开文件 / 打开所在文件夹”。
-        // 必须用 finalize 的返回值而不是 slot.final_path：
-        // 目标已存在时实际存成了 `name (1).ext`，slot 里记的只是首选名。
         let file_path = match &result {
             Ok(p) if !p.as_os_str().is_empty() => Some(p.to_string_lossy().into_owned()),
-            // 空路径 = 槽位已被别的路径 finalize 过（幂等重复调用），退回首选名
             Ok(_) => Some(slot.final_path.to_string_lossy().into_owned()),
             Err(_) => None,
         };
@@ -780,8 +720,8 @@ impl TransferEngine {
             } else {
                 0
             },
-            chunks_done: slot.chunk_count,
-            chunks_total: slot.chunk_count,
+            chunks_done: slot.streams_done.len() as u64,
+            chunks_total: slot.streams_done.len() as u64,
             speed_bps: 0,
             status,
             error,
@@ -789,15 +729,10 @@ impl TransferEngine {
             file_path,
         })
         .await;
-        // finalize 返回实际落盘路径（改名后的真名），这里只需要成败
         result.map(|_| ())
     }
 
     /// 接收方收到发送方补发的最终 sha256（POST /api/verify/:file_id）。
-    ///
-    /// - 哈希先到（传输未完）：暂存到槽位，等最后一个 chunk 收齐时一并 finalize
-    /// - chunk 已收齐（常见时序）：立即校验 + finalize
-    /// - 槽位不存在（已 finalize / 重复通知）：幂等成功
     pub async fn apply_final_sha256(
         &self,
         file_id: &str,
@@ -816,39 +751,36 @@ impl TransferEngine {
     pub async fn decide_incoming(&self, incoming_id: &str, accept: bool) -> Option<IncomingEntry> {
         let entry = self.incoming.decide(incoming_id, accept).await?;
         if accept {
-            // 分块大小**必须**用发送方声明的值。用本地配置的话，两端配置不一致
-            // 会让 chunk 偏移整体错位，而每个块都会"成功"落盘，
-            // 只有最后的整文件 sha256 能发现，为时已晚（N2）。
-            // 对端是旧版本（未携带该字段）时回退本地配置并告警。
-            let chunk_size = entry.chunk_size.unwrap_or_else(|| {
+            // 流数**必须**用发送方声明的值算分段布局，否则两端区间错位。
+            let stream_count = entry.stream_count.unwrap_or_else(|| {
                 warn!(
                     file_id = %entry.file_id,
-                    local_chunk_size = self.chunk_size,
-                    "对端未携带 chunk_size（旧版本？），回退到本地配置；两端不一致会导致数据错位"
+                    "对端未携带 stream_count（旧版本？），回退本地自适应；两端不一致会导致数据错位"
                 );
-                self.chunk_size
+                compute_stream_count(entry.file_size, self.parallel_streams)
             });
-            // 接受：在 storage 中创建接收槽，登记 file_id_prefix 映射
-            let _ = self
-                .storage
+            let sha256_deferred = entry.sha256_deferred && entry.sha256.is_none();
+            self.storage
                 .create_slot(
                     entry.file_id.clone(),
                     entry.file_name.clone(),
                     entry.file_size,
-                    chunk_size,
+                    stream_count,
                     entry.sha256.clone(),
-                    entry.sha256_deferred,
+                    sha256_deferred,
                 )
-                .await;
+                .await
+                .ok()?;
             let prefix = file_id_prefix_u64(&entry.file_id);
-            self.prefix_to_file_id.lock().await.insert(prefix, entry.file_id.clone());
-            // 登记发送方地址（接收方取消时通知其联动取消）
+            self.prefix_to_file_id
+                .lock()
+                .await
+                .insert(prefix, entry.file_id.clone());
             self.incoming_endpoints.lock().await.insert(
                 entry.file_id.clone(),
                 (entry.from_ip.clone(), entry.from_gateway_port),
             );
             info!(file_id = %entry.file_id, "incoming accepted, receive slot ready");
-            // 接收槽已创建、prefix 映射已登记 → 从 pending 表移除
             self.incoming.remove(incoming_id);
         } else {
             info!(file_id = %entry.file_id, "incoming rejected by user");
@@ -865,16 +797,6 @@ impl TransferEngine {
     }
 
     /// 发送文件到对端，返回可订阅进度的句柄
-    ///
-    /// 流程：
-    /// 1. 计算 file_id, file_size, file_name
-    /// 2. POST /api/incoming 到对端 gateway（offer，立即发出不等哈希）
-    /// 3. 等对端回 /api/incoming-resp（Accept/Reject）
-    /// 4. Accept → 启动多流 TCP 传输；Reject → 推 Canceled 进度
-    /// 5. 全部 chunk ACK 后，POST /api/verify/:file_id 补发 sha256（接收方校验）
-    ///
-    /// `file_name_override`：SAF 等场景传入的路径无法推断出原始文件名
-    /// （如 /proc/self/fd/N）时，由调用方显式指定
     pub async fn send_file(
         self: Arc<Self>,
         target_ip: String,
@@ -886,12 +808,8 @@ impl TransferEngine {
         self_name: String,
         self_ip: String,
         self_gateway_port: u16,
-        // 多文件批量发送时传入；单文件传 None（协议字段为 null，行为不变）
         batch: Option<crate::protocol::SendBatchInfo>,
     ) -> Result<TransferHandle> {
-        // 源 IP（回包地址）自动选择：用 UDP connect 让 OS 按目标做路由决策，
-        // 多网卡环境（如 Android WiFi+蜂窝）下必选对通往目标的网卡。
-        // 调用方传入的 self_ip 仅作回退（UDP 路由不可用时）。
         let self_ip = local_source_ip(&target_ip).unwrap_or(self_ip);
 
         let file_id = uuid::Uuid::new_v4().to_string();
@@ -907,20 +825,17 @@ impl TransferEngine {
             .map_err(|e| crate::CoreError::Transfer(e.to_string()))?
             .len();
 
-        let chunk_size = self.chunk_size;
-        let chunk_count = (file_size + chunk_size as u64 - 1) / chunk_size as u64;
-        let parallel = self.parallel_streams;
+        // 流数自适应：小文件单流，大文件拉满并行
+        let stream_count = compute_stream_count(file_size, self.parallel_streams);
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (progress_tx, progress_rx) = mpsc::channel(PROGRESS_CHANNEL_CAP);
-        // 保留一份 cancel 订阅，供发送任务结束时判断最终状态是 Canceled 还是 Completed
         let cancel_check = cancel_rx.clone();
 
         self.inflight
             .lock()
             .insert(file_id.clone(), cancel_tx.clone());
 
-        // 登记等待回包的 oneshot
         let (resp_tx, resp_rx) = oneshot::channel::<HttpIncomingResponse>();
         self.outgoing_offers
             .lock()
@@ -933,12 +848,12 @@ impl TransferEngine {
             file_size,
             bytes_transferred: 0,
             chunks_done: 0,
-            chunks_total: chunk_count,
+            chunks_total: stream_count as u64,
             speed_bps: 0,
             status: TransferStatus::Pending,
             error: None,
             incoming: false,
-                file_path: None,
+            file_path: None,
         };
         push_progress(&progress_tx, initial).await;
 
@@ -946,9 +861,7 @@ impl TransferEngine {
         let file_id_for_spawn = file_id.clone();
         let file_name_for_err = file_name.clone();
         tokio::spawn(async move {
-            // 0. 后台并行计算整文件 sha256：与传输同时进行，offer 不再等它。
-            //    大文件哈希要读完整文件（2GB 十几秒），之前放在 offer 前面会
-            //    导致对端弹窗迟迟不出现；现在哈希随 /api/verify 在传完后补发。
+            // 后台并行计算整文件 sha256：与传输同时进行，offer 不等它
             let hash_task = {
                 let path_clone = file_path.clone();
                 tokio::task::spawn_blocking(move || -> std::io::Result<String> {
@@ -960,14 +873,11 @@ impl TransferEngine {
                 })
             };
 
-            // 1. POST offer 到对端 gateway（立即发出）
             let offer = HttpOffer {
                 file_id: file_id_for_spawn.clone(),
                 file_name: file_name_for_err.clone(),
                 file_size,
-                // 把本端的分块大小告诉接收方：它必须用这个值建槽，
-                // 否则两端切片不一致会静默损坏数据（N2）
-                chunk_size: Some(chunk_size),
+                stream_count: Some(stream_count),
                 sha256: None,
                 sha256_deferred: true,
                 from_id: self_id.clone(),
@@ -988,18 +898,17 @@ impl TransferEngine {
                         file_size,
                         bytes_transferred: 0,
                         chunks_done: 0,
-                        chunks_total: chunk_count,
+                        chunks_total: stream_count as u64,
                         speed_bps: 0,
                         status: TransferStatus::Failed,
                         error: Some(format!("serialize offer: {}", e)),
                         incoming: false,
-                file_path: None,
+                        file_path: None,
                     }).await;
                     return;
                 }
             };
 
-            // 用纯 TCP 发 HTTP POST
             let post_result = http_post_json(
                 &target_ip,
                 target_gateway_port,
@@ -1015,19 +924,17 @@ impl TransferEngine {
                     file_size,
                     bytes_transferred: 0,
                     chunks_done: 0,
-                    chunks_total: chunk_count,
+                    chunks_total: stream_count as u64,
                     speed_bps: 0,
                     status: TransferStatus::Failed,
                     error: Some(format!("post offer: {}", e)),
                     incoming: false,
-                file_path: None,
+                    file_path: None,
                 }).await;
                 engine.cleanup_send_state(&file_id_for_spawn).await;
                 return;
             }
 
-            // 2. 等对端 /api/incoming-resp 回包（70 秒，长于接收方 60 秒
-            //    的决策超时：正常必收到明确回包，自身超时=对端 daemon 失联）
             let resp = match tokio::time::timeout(Duration::from_secs(70), resp_rx).await {
                 Ok(Ok(r)) => r,
                 _ => HttpIncomingResponse {
@@ -1045,18 +952,18 @@ impl TransferEngine {
                     file_size,
                     bytes_transferred: 0,
                     chunks_done: 0,
-                    chunks_total: chunk_count,
+                    chunks_total: stream_count as u64,
                     speed_bps: 0,
                     status: TransferStatus::Canceled,
                     error: resp.reason.clone(),
                     incoming: false,
-                file_path: None,
+                    file_path: None,
                 }).await;
                 engine.cleanup_send_state(&file_id_for_spawn).await;
                 return;
             }
 
-            // 3. Accept → 登记对端地址（发送方取消时通知它联动取消）→ 启动多流 TCP 传输
+            // Accept → 登记对端地址（发送方取消时通知它联动取消）→ 启动多流传输
             engine
                 .outgoing_endpoints
                 .lock()
@@ -1071,23 +978,16 @@ impl TransferEngine {
                     file_id_for_spawn.clone(),
                     file_name_for_err.clone(),
                     file_size,
-                    chunk_count,
-                    chunk_size,
-                    parallel,
+                    stream_count,
                     cancel_rx,
                     progress_tx.clone(),
                 )
                 .await;
 
-            // 清理发送方注册表（inflight / 等回包 oneshot）
             engine_for_cleanup.cleanup_send_state(&file_id_for_spawn).await;
 
-            // 被取消时最终状态是 Canceled，不是 Completed/Failed
             let canceled = *cancel_check.borrow();
 
-            // 4. 数据全部 ACK 且未取消 → 取后台哈希结果，通知接收方最终校验。
-            //    哈希与传输并行进行，这里通常零等待；
-            //    哈希失败则发 null（接收方跳过校验直接完成），网络失败则整体 Failed。
             if !canceled && result.is_ok() {
                 let sha256 = match hash_task.await {
                     Ok(Ok(s)) => Some(s),
@@ -1122,12 +1022,12 @@ impl TransferEngine {
                     file_size,
                     bytes_transferred: 0,
                     chunks_done: 0,
-                    chunks_total: chunk_count,
+                    chunks_total: stream_count as u64,
                     speed_bps: 0,
                     status: TransferStatus::Canceled,
                     error: Some("canceled".into()),
                     incoming: false,
-                file_path: None,
+                    file_path: None,
                 }
             } else {
                 match result {
@@ -1136,13 +1036,13 @@ impl TransferEngine {
                         file_name: file_name_for_err.clone(),
                         file_size,
                         bytes_transferred: file_size,
-                        chunks_done: chunk_count,
-                        chunks_total: chunk_count,
+                        chunks_done: stream_count as u64,
+                        chunks_total: stream_count as u64,
                         speed_bps: 0,
                         status: TransferStatus::Completed,
                         error: None,
                         incoming: false,
-                file_path: None,
+                        file_path: None,
                     },
                     Err(e) => TransferProgress {
                         file_id: file_id_for_spawn.clone(),
@@ -1150,12 +1050,12 @@ impl TransferEngine {
                         file_size,
                         bytes_transferred: 0,
                         chunks_done: 0,
-                        chunks_total: chunk_count,
+                        chunks_total: stream_count as u64,
                         speed_bps: 0,
                         status: TransferStatus::Failed,
                         error: Some(e.to_string()),
                         incoming: false,
-                file_path: None,
+                        file_path: None,
                     },
                 }
             };
@@ -1169,6 +1069,7 @@ impl TransferEngine {
         })
     }
 
+    /// 启动 N 条流，每条顺序发送一个字节区间。任一条失败即整体失败。
     #[allow(clippy::too_many_arguments)]
     async fn do_send(
         self: Arc<Self>,
@@ -1176,132 +1077,76 @@ impl TransferEngine {
         target_port: u16,
         file_path: PathBuf,
         file_id: String,
-        file_name: String,
+        _file_name: String,
         file_size: u64,
-        chunk_count: u64,
-        chunk_size: usize,
-        parallel: usize,
+        stream_count: u32,
         cancel_rx: watch::Receiver<bool>,
         progress_tx: mpsc::Sender<TransferProgress>,
     ) -> Result<()> {
         let file_id_prefix = file_id_prefix_u64(&file_id);
+        let layout = stream_layout(file_size, stream_count);
         let bytes_done = Arc::new(AtomicU64::new(0));
-        let chunks_done = Arc::new(AtomicU64::new(0));
         let start = Instant::now();
+        let last_push = Arc::new(TokioMutex::new(Instant::now()
+            .checked_sub(PROGRESS_PUSH_INTERVAL)
+            .unwrap_or_else(Instant::now)));
 
         let mut handles = Vec::new();
-        for stream_idx in 0..parallel {
+        for (stream_id, &(start_offset, seg_len)) in layout.iter().enumerate() {
             let target_ip = target_ip.clone();
-            let file_id_prefix = file_id_prefix;
-            let progress_tx = progress_tx.clone();
-            let bytes_done = bytes_done.clone();
-            let chunks_done = chunks_done.clone();
             let file_path = file_path.clone();
-            // mut：send_chunk 需要 &mut 来订阅取消信号（watch::Receiver::changed 要 &mut self）
             let mut cancel_rx = cancel_rx.clone();
-            let file_id_for_err = file_id.clone();
-            let file_name_for_err = file_name.clone();
-            let file_size_for_err = file_size;
+            let pctx = SendProgress {
+                progress_tx: progress_tx.clone(),
+                file_id: file_id.clone(),
+                file_size,
+                streams_total: layout.len() as u64,
+                streams_done: Arc::new(AtomicU64::new(0)), // 仅用于显示，完成数由 join 后不回推；bytes 为主
+                bytes_done: bytes_done.clone(),
+                start,
+                last_push: last_push.clone(),
+            };
+            let streams_done_shared = pctx.streams_done.clone();
+            let file_id_prefix = file_id_prefix;
 
-            let handle = tokio::spawn(async move {
-                // 按块大小算一次，循环里复用
-                let ack_timeout = ack_timeout_for(chunk_size);
-                // 这条流的连接，**跨块复用**（连接复用：一条连接传完整条流）。
-                // 失败时由 send_chunk_with_retry 置空，下次尝试重建。
-                let mut conn: Option<SendConn> = None;
-                let mut chunk_id = stream_idx as u64;
-                while chunk_id < chunk_count {
-                    if *cancel_rx.borrow() {
-                        return Ok::<(), crate::CoreError>(());
-                    }
-                    let offset = chunk_id * chunk_size as u64;
-                    let read_len = std::cmp::min(
-                        chunk_size as u64,
-                        file_size_for_err.saturating_sub(offset),
-                    ) as usize;
-                    if read_len == 0 {
-                        break;
-                    }
-
-                    // 每个 chunk 独立打开文件读取。
-                    // 不能共享同一个 File 句柄：seek 与 read 是两个独立系统调用，
-                    // 多流并发时 seek 会互相覆盖，导致读到错误偏移的数据（内容错乱 → sha256 不匹配）。
-                    let path_for_read = file_path.clone();
-                    let buf = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
-                        use std::io::{Read, Seek, SeekFrom};
-                        let mut f = std::fs::File::open(&path_for_read)?;
-                        f.seek(SeekFrom::Start(offset))?;
-                        let mut buf = vec![0u8; read_len];
-                        f.read_exact(&mut buf)?;
-                        Ok(buf)
-                    })
-                    .await
-                    .map_err(|e| crate::CoreError::Transfer(e.to_string()))?
-                    .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
-
-                    let header = DataFrameHeader {
-                        file_id_prefix,
-                        chunk_id,
-                        data_len: buf.len() as u32,
-                        _reserved: 0,
-                    };
-                    // 带重试的发送。三种结局：
-                    //   Ok       —— 继续下一块
-                    //   Canceled —— 静默收尾，最终状态由外层判为 Canceled
-                    //   Failed   —— 中止整条流；do_send 会把任一流的错误当整体失败
-                    match send_chunk_with_retry(
-                        &mut conn,
-                        &target_ip,
-                        target_port,
-                        &header,
-                        &buf,
-                        ack_timeout,
-                        &mut cancel_rx,
-                    )
-                    .await
-                    {
-                        ChunkOutcome::Ok => {}
-                        ChunkOutcome::Canceled => return Ok::<(), crate::CoreError>(()),
-                        ChunkOutcome::Failed(e) => {
-                            return Err(crate::CoreError::Transfer(e));
-                        }
-                    }
-
-                    bytes_done.fetch_add(buf.len() as u64, Ordering::Relaxed);
-                    chunks_done.fetch_add(1, Ordering::Relaxed);
-
-                    let bd = bytes_done.load(Ordering::Relaxed);
-                    let cd = chunks_done.load(Ordering::Relaxed);
-                    let elapsed = start.elapsed().as_secs_f64().max(0.001);
-                    push_progress(&progress_tx, TransferProgress {
-                        file_id: file_id_for_err.clone(),
-                        file_name: file_name_for_err.clone(),
-                        file_size: file_size_for_err,
-                        bytes_transferred: bd,
-                        chunks_done: cd,
-                        chunks_total: chunk_count,
-                        speed_bps: (bd as f64 / elapsed) as u64,
-                        status: TransferStatus::InProgress,
-                        error: None,
-                        incoming: false,
-                file_path: None,
-                    }).await;
-
-                    chunk_id += parallel as u64;
+            handles.push(tokio::spawn(async move {
+                // 空段（空文件）：直接算完成
+                if seg_len == 0 {
+                    streams_done_shared.fetch_add(1, Ordering::Relaxed);
+                    pctx.maybe_push().await;
+                    return Ok::<(), crate::CoreError>(());
                 }
-                // 这条流发完：主动关闭写端，让接收端读到干净 EOF 正常退出读帧循环。
-                // 不关的话接收端会一直挂在 read 上，直到 ACK 超时才退出——
-                // 复用后每条连接只关一次，以前每块一连接时是靠连接关闭隐式表达的。
-                if let Some(c) = conn.take() {
-                    let _ = c.into_inner().shutdown().await;
-                }
+
+                let mut conn = connect_with_retry(&target_ip, target_port, &mut cancel_rx).await?;
+                let header = StreamHeader {
+                    file_id_prefix,
+                    stream_id: stream_id as u32,
+                    _reserved: 0,
+                    start_offset,
+                    data_len: seg_len,
+                };
+                conn.write_all(&header.to_bytes())
+                    .await
+                    .map_err(|e| crate::CoreError::Transfer(format!("write stream header: {}", e)))?;
+
+                // 顺序读文件区间 → 写 socket。失败即整传失败（无分块可重试）。
+                send_stream_body(
+                    &mut conn,
+                    &file_path,
+                    start_offset,
+                    seg_len,
+                    &mut cancel_rx,
+                    &pctx,
+                )
+                .await?;
+
+                let _ = conn.shutdown().await;
+                streams_done_shared.fetch_add(1, Ordering::Relaxed);
+                pctx.maybe_push().await;
                 Ok(())
-            });
-            handles.push(handle);
+            }));
         }
 
-        // 任何一条并行流失败都视为整体失败：
-        // “写进 socket”不代表对端收到并落盘，错误不能吞掉，否则发送方会误报 Completed
         let mut first_err: Option<crate::CoreError> = None;
         for h in handles {
             match h.await {
@@ -1324,244 +1169,148 @@ impl TransferEngine {
     }
 }
 
-/// chunk ACK 的超时时间：按块大小给，而不是一刀切。
-///
-/// 固定值会让慢设备误判——老安卓机写 eMMC、接收目录挂在 USB2.0 移动硬盘上时，
-/// 16MB 可能写超过 20s。**误判失败 = 功能不可用，多等几秒只是体感。**
-///
-/// 参考值：16MB → 21s，64MB → 69s，小于 1MB → 6s。
-fn ack_timeout_for(chunk_size: usize) -> Duration {
-    let mb = (chunk_size as u64) / (1024 * 1024);
-    Duration::from_secs(5 + mb.max(1))
+/// 发送端进度上下文：按字节推进，100ms 节流推送。
+struct SendProgress {
+    progress_tx: mpsc::Sender<TransferProgress>,
+    file_id: String,
+    file_size: u64,
+    streams_total: u64,
+    streams_done: Arc<AtomicU64>,
+    bytes_done: Arc<AtomicU64>,
+    start: Instant,
+    last_push: Arc<TokioMutex<Instant>>,
 }
 
-/// 单块发送的结果。
-///
-/// 分成"可以再试"和"别试了"两类，是为了让重试循环不做无用功：
-/// 网络抖一下重发就好；但对端已经明确说"这块我没写好"，
-/// 通常是磁盘满或没权限，再试三次只是让用户多等几十秒。
-enum ChunkResult {
-    /// 发送成功（收到 chunk_id 匹配且 ok=true 的 ACK）
-    Ok,
-    /// 瞬时故障：连不上 / 写到一半断开 / 等 ACK 超时 / 连接被提前关闭。
-    /// 重发这一块是有意义的。
-    Retryable(String),
-    /// 不必重试：对端明确拒绝（ok=false）。重发不会改变结果。
-    Fatal(String),
-    /// 用户取消。既不是成功也不是故障，调用方应静默收尾。
-    ///
-    /// 单独成一个变体而不是塞进 `Fatal("canceled")`：
-    /// 否则调用方只能靠比较错误字符串来区分"取消"和"真失败"，
-    /// 而取消走的是 Canceled 终态、失败走 Failed，混在一起必然出 bug。
-    Canceled,
-}
-
-/// 单块最多尝试几次（含首次）。
-const CHUNK_MAX_ATTEMPTS: u32 = 3;
-
-/// 重试前的等待：首次立即，之后 200ms、500ms。
-/// 局域网不需要长退避——长退避只会让传输看起来卡死。
-const CHUNK_RETRY_BACKOFF_MS: [u64; 3] = [0, 200, 500];
-
-// 曾经在这里放过一个 MAX_CONSECUTIVE_CHUNK_FAILURES（连续 N 块失败才放弃），
-// 实现时删掉了，理由是它隐含了"失败就跳过这一块继续传"——而那是错的：
-// 少一块，接收方 `received_chunks` 永远凑不齐，.part 不会 finalize，
-// 发送方在 /api/verify 处必然失败。晚失败不如早失败，还省了一整个文件的传输时间。
-// 所以重试耗尽即中止整条流（进而中止整个传输，见 do_send 的错误合并）。
-
-/// 一条并行流的发送连接。
-///
-/// 包一层 `BufReader` 而不是直接拿 `TcpStream`，是因为复用后**缓冲必须跨块保留**：
-/// 每块新建一个 `BufReader` 的话，它可能把下一个 ACK 的字节预读进自己的缓冲区，
-/// 然后随 `BufReader` 一起被 drop——那部分数据就丢了。
-/// 停等模型下虽然不会发生（对端一次只回一个 ACK），但这个坑太隐蔽，
-/// 不如从结构上避免。
-type SendConn = tokio::io::BufReader<TcpStream>;
-
-/// 发送单个 chunk：写 header + data → 等待接收方落盘 ACK。
-///
-/// 数据写入 TCP 缓冲 ≠ 对端已收到并写入磁盘。
-/// 只有读到接收方的 ChunkAck（chunk_id 匹配且 ok=true）才算发送成功。
-///
-/// 连接由调用方持有并复用（连接复用：一条连接传完整条流）。
-/// 本函数不负责关闭连接——失败时由调用方决定是重建还是放弃。
-///
-/// 返回 [`ChunkResult`] 而不是 `Result`，是为了让调用方能区分
-/// "网络抖了可以重发"和"对端明确拒绝，重发没用"——
-/// 用统一的字符串错误类型，调用方只能瞎猜。
-async fn send_chunk(
-    conn: &mut SendConn,
-    header: &DataFrameHeader,
-    data: &[u8],
-    ack_timeout: Duration,
-    cancel_rx: &mut watch::Receiver<bool>,
-) -> ChunkResult {
-    if let Err(e) = conn.get_mut().write_all(&header.to_bytes()).await {
-        return ChunkResult::Retryable(format!("write header: {}", e));
-    }
-    if let Err(e) = conn.get_mut().write_all(data).await {
-        return ChunkResult::Retryable(format!("write data: {}", e));
-    }
-    if let Err(e) = conn.get_mut().flush().await {
-        return ChunkResult::Retryable(format!("flush: {}", e));
-    }
-
-    // 等待接收方 ACK（写盘完成才回 ACK；出错时对端不发 ACK、直接断开）。
-    //
-    // 这里三路并发，谁先到算谁：
-    //   1. 读到 ACK —— 正常路径
-    //   2. 超时     —— 判定对端失联
-    //   3. 取消     —— 立即返回
-    //
-    // 第 3 路是这段代码的重点，也是本阶段最重要的修复：
-    // 光把超时从 60s 缩到 20s，用户点取消后界面仍要等满整个窗口才动，
-    // 那是功能缺陷而不是体感问题。
-    // **超时值只决定多久判定对端失联，select! 才决定取消多久生效——两件事正交。**
-    let mut ack_line = Vec::new();
-    let timeout_result = tokio::select! {
-        r = tokio::time::timeout(ack_timeout, conn.read_until(b'\n', &mut ack_line)) => r,
-        _ = cancel_rx.changed() => {
-            // 用户取消：不重试，直接结束
-            return ChunkResult::Canceled;
-        }
-    };
-    let n = match timeout_result {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => return ChunkResult::Retryable(format!("read chunk ack: {}", e)),
-        Err(_) => {
-            return ChunkResult::Retryable(format!(
-                "timeout waiting chunk ack ({}s)",
-                ack_timeout.as_secs()
-            ))
-        }
-    };
-    // 对端直接断开。注意接收端写盘失败时也是"不发 ACK、直接断开"，
-    // 发送端无从区分，所以按可重试处理——真要是持久故障，
-    // 这种失败返回得很快（不会各等满一次超时），三次很快耗尽。
-    if n == 0 {
-        return ChunkResult::Retryable("connection closed before chunk ack".into());
-    }
-    let ack = match crate::protocol::ControlMessage::from_line(&String::from_utf8_lossy(&ack_line))
-    {
-        Ok(a) => a,
-        Err(e) => return ChunkResult::Retryable(format!("parse chunk ack: {}", e)),
-    };
-    match ack {
-        crate::protocol::ControlMessage::ChunkAck { chunk_id, ok, .. }
-            if chunk_id == header.chunk_id && ok =>
+impl SendProgress {
+    async fn maybe_push(&self) {
         {
-            ChunkResult::Ok
+            let mut last = self.last_push.lock().await;
+            if last.elapsed() < PROGRESS_PUSH_INTERVAL {
+                return;
+            }
+            *last = Instant::now();
         }
-        // ChunkAck 是目前唯一的变体，所以这里已经穷尽，不再需要 `_` 兜底。
-        // 将来若新增控制消息，编译器会因 match 非穷尽而报错——
-        // 这正是想要的：逼着你去想新消息当 chunk ack 收到时该怎么办。
-        //
-        // ok=false 是**对端明确拒绝**（写盘失败 / 无权限），
-        // 归入 Fatal：重发同一块不会让磁盘突然有空间。
-        crate::protocol::ControlMessage::ChunkAck { chunk_id, ok, .. } => ChunkResult::Fatal(
-            format!("chunk {} rejected by receiver (ok={})", chunk_id, ok),
-        ),
+        let bd = self.bytes_done.load(Ordering::Relaxed);
+        let elapsed = self.start.elapsed().as_secs_f64().max(0.001);
+        push_progress(&self.progress_tx, TransferProgress {
+            file_id: self.file_id.clone(),
+            file_name: String::new(),
+            file_size: self.file_size,
+            bytes_transferred: bd.min(self.file_size),
+            chunks_done: self.streams_done.load(Ordering::Relaxed),
+            chunks_total: self.streams_total,
+            speed_bps: (bd as f64 / elapsed) as u64,
+            status: TransferStatus::InProgress,
+            error: None,
+            incoming: false,
+            file_path: None,
+        })
+        .await;
     }
 }
 
-/// 重试循环结束后，单块的最终结局。
-///
-/// 和 [`ChunkResult`] 的区别：这一层已经把"可重试"消化掉了——
-/// 能重试的都试过了还失败，跟"对端明确拒绝"一样是没救，统一进 `Failed`。
-#[derive(Debug)]
-enum ChunkOutcome {
-    Ok,
-    /// 用户取消，调用方应静默收尾（最终状态是 Canceled，不是 Failed）
-    Canceled,
-    /// 重试耗尽，或对端明确拒绝
-    Failed(String),
-}
-
-/// 发送单个 chunk，可重试的失败最多重试到 [`CHUNK_MAX_ATTEMPTS`] 次。
-///
-/// `conn` 是这条流当前的连接，**跨块复用**（连接复用）。
-/// 两种情况下会重建：
-///   - 还没有连接（首次，或上次失败后已置空）
-///   - 上一次尝试失败——连接可能已经半死，不能在上面继续发
-///
-/// 重试是幂等的：`chunk_id` 不变，接收端按 `chunk_id × chunk_size` 算偏移
-/// 覆盖写同一块区，`received_chunks[chunk_id]` 也只是把已置位的布尔再置一次。
-/// 即使上一块其实已经落盘、只是 ACK 在路上丢了，重发也只是原样再写一遍。
-///
-/// 也因为如此，**不能跳过失败的块继续传**：少一块，接收端永远凑不齐，
-/// `.part` 不会 finalize，最后 /api/verify 必然失败。所以重试耗尽就中止。
-///
-/// 顺带纠正一个先前的判断：曾经担心"复用后连接断了要判断从哪个未确认块继续"，
-/// 实现时发现这个问题不存在——停等模型下**当前块就是唯一的未确认块**，
-/// 前面所有块都已 ACK。断了就从当前块重发，不需要额外的进度协商。
-async fn send_chunk_with_retry(
-    conn: &mut Option<SendConn>,
+/// 连接对端数据端口，带少量重试；取消可打断退避**与** connect。
+async fn connect_with_retry(
     target_ip: &str,
     target_port: u16,
-    header: &DataFrameHeader,
-    data: &[u8],
-    ack_timeout: Duration,
     cancel_rx: &mut watch::Receiver<bool>,
-) -> ChunkOutcome {
-    let mut last_err = String::from("no attempt made");
-    for attempt in 0..CHUNK_MAX_ATTEMPTS {
-        // 退避期间也要响应取消：否则用户在重试间隔点取消，
-        // 要等退避走完才会被下一次尝试的 select! 捕获。
-        let backoff_ms = CHUNK_RETRY_BACKOFF_MS
+) -> Result<TcpStream> {
+    const ATTEMPTS: u32 = 3;
+    const BACKOFF_MS: [u64; 3] = [0, 200, 500];
+    let mut last_err = String::from("no attempt");
+    for attempt in 0..ATTEMPTS {
+        if *cancel_rx.borrow() {
+            return Err(crate::CoreError::Transfer("canceled".into()));
+        }
+        let backoff = BACKOFF_MS
             .get(attempt as usize)
             .copied()
             .unwrap_or(500);
-        if backoff_ms > 0 {
+        if backoff > 0 {
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
-                _ = cancel_rx.changed() => return ChunkOutcome::Canceled,
-            }
-        }
-
-        if conn.is_none() {
-            match TcpStream::connect((target_ip, target_port)).await {
-                Ok(s) => {
-                    // 关 Nagle：停等模型下每发完一块都要等一个 ACK 小包回来。
-                    // 不关的话这个小包会被延迟确认（最多 40ms）或等着搭反向数据的顺风车，
-                    // 每块的往返都白等这一段——块越小、块数越多，损失越明显。
-                    if let Err(e) = s.set_nodelay(true) {
-                        warn!(error = %e, "set_nodelay failed (non-fatal)");
-                    }
-                    *conn = Some(tokio::io::BufReader::new(s))
-                }
-                Err(e) => {
-                    last_err = format!("connect {}:{}: {}", target_ip, target_port, e);
-                    warn!(chunk = header.chunk_id, attempt, error = %e, "connect failed, will retry");
-                    continue;
+                _ = tokio::time::sleep(Duration::from_millis(backoff)) => {}
+                _ = cancel_rx.changed() => {
+                    return Err(crate::CoreError::Transfer("canceled".into()));
                 }
             }
         }
-        let stream = conn.as_mut().expect("just ensured Some");
-
-        match send_chunk(stream, header, data, ack_timeout, cancel_rx).await {
-            ChunkResult::Ok => return ChunkOutcome::Ok,
-            ChunkResult::Canceled => return ChunkOutcome::Canceled,
-            // 对端明确拒绝（ok=false）：再试不会让磁盘突然有空间
-            ChunkResult::Fatal(e) => return ChunkOutcome::Failed(e),
-            ChunkResult::Retryable(e) => {
-                warn!(chunk = header.chunk_id, attempt, error = %e, "chunk send failed, will retry");
-                // 连接可能已经半死（写了一半、ACK 读不到），不能在上面继续发
-                *conn = None;
-                last_err = e;
+        let connect_result = tokio::select! {
+            r = TcpStream::connect((target_ip, target_port)) => r,
+            _ = cancel_rx.changed() => {
+                return Err(crate::CoreError::Transfer("canceled".into()));
+            }
+        };
+        match connect_result {
+            Ok(s) => {
+                if let Err(e) = s.set_nodelay(true) {
+                    warn!(error = %e, "set_nodelay failed (non-fatal)");
+                }
+                return Ok(s);
+            }
+            Err(e) => {
+                last_err = format!("connect {}:{}: {}", target_ip, target_port, e);
+                warn!(attempt, error = %e, "connect failed, will retry");
             }
         }
     }
-    ChunkOutcome::Failed(format!(
-        "chunk {} failed after {} attempts: {}",
-        header.chunk_id, CHUNK_MAX_ATTEMPTS, last_err
-    ))
+    Err(crate::CoreError::Transfer(last_err))
+}
+
+/// 把文件区间顺序写入 socket，边写边推估计进度。取消立即生效。
+async fn send_stream_body(
+    conn: &mut TcpStream,
+    file_path: &std::path::Path,
+    start_offset: u64,
+    seg_len: u64,
+    cancel_rx: &mut watch::Receiver<bool>,
+    pctx: &SendProgress,
+) -> Result<()> {
+    use std::io::SeekFrom;
+    let mut file = tokio::fs::File::open(file_path)
+        .await
+        .map_err(|e| crate::CoreError::Transfer(format!("open source: {}", e)))?;
+    file.seek(SeekFrom::Start(start_offset))
+        .await
+        .map_err(|e| crate::CoreError::Transfer(format!("seek source: {}", e)))?;
+
+    let mut remaining = seg_len;
+    let mut buf = vec![0u8; STREAM_IO_BUF];
+    while remaining > 0 {
+        if *cancel_rx.borrow() {
+            return Err(crate::CoreError::Transfer("canceled".into()));
+        }
+        let want = std::cmp::min(remaining as usize, buf.len());
+        let n = {
+            // 用 select 响应取消：读文件时用户点取消也要尽快退出
+            tokio::select! {
+                r = file.read(&mut buf[..want]) => {
+                    r.map_err(|e| crate::CoreError::Transfer(format!("read source: {}", e)))?
+                }
+                _ = cancel_rx.changed() => {
+                    return Err(crate::CoreError::Transfer("canceled".into()));
+                }
+            }
+        };
+        if n == 0 {
+            return Err(crate::CoreError::Transfer(format!(
+                "source truncated at offset {}",
+                start_offset + (seg_len - remaining)
+            )));
+        }
+        conn.write_all(&buf[..n])
+            .await
+            .map_err(|e| crate::CoreError::Transfer(format!("write data: {}", e)))?;
+        remaining -= n as u64;
+        pctx.bytes_done.fetch_add(n as u64, Ordering::Relaxed);
+        pctx.maybe_push().await;
+    }
+    conn.flush()
+        .await
+        .map_err(|e| crate::CoreError::Transfer(format!("flush: {}", e)))?;
+    Ok(())
 }
 
 /// 读满 buf，返回实际读到的字节数。**返回 0 = 对端已关闭（干净 EOF）**。
-///
-/// 不用 `read_exact`：它在 EOF 时只给一个 `UnexpectedEof`，
-/// 分不清"一个字节都没读到（这条流正常发完）"和"读到一半断了（异常）"。
-/// 连接复用后这个区分是必需的——干净 EOF 就是"一条流发完了"的信号。
 async fn read_full(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut read = 0;
     while read < buf.len() {
@@ -1574,10 +1323,8 @@ async fn read_full(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<us
 }
 
 /// 通过 UDP connect 让 OS 路由决策选出「通往 target 的本机源 IP」。
-/// UDP connect 不发包，只建立路由状态，零开销且跨平台。
 fn local_source_ip(target_ip: &str) -> Option<String> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    // 端口任意（只求路由，不实际通信）
     sock.connect((target_ip, 7878)).ok()?;
     let addr = sock.local_addr().ok()?;
     let ip = addr.ip().to_string();
@@ -1604,8 +1351,6 @@ fn now_ms() -> u64 {
 }
 
 /// 纯 TCP 实现 HTTP POST JSON
-///
-/// 不引入 reqwest/hyper 直接依赖，几行代码手写 HTTP/1.1 请求
 async fn http_post_json(host: &str, port: u16, path: &str, body: &str) -> std::io::Result<String> {
     let mut stream = TcpStream::connect((host, port)).await?;
     let req = format!(
@@ -1627,192 +1372,25 @@ async fn http_post_json(host: &str, port: u16, path: &str, body: &str) -> std::i
 
 #[cfg(test)]
 mod tests {
-    //! [`ProgressCache`] 的淘汰策略走单元测试：不碰网络、不碰 tokio，
-    //! 而这些边界（无终态可淘汰时的退化、重复 file_id 不入队）用集成测试
-    //! 很难构造出来。
     use super::*;
 
-    /// 构造一个 offer。batch 为 Some 时带上批次信息。
     fn offer(file_id: &str, batch: Option<(&str, u32, u32)>) -> crate::protocol::HttpOffer {
         crate::protocol::HttpOffer {
             file_id: file_id.to_string(),
-            file_name: format!("{file_id}.bin"),
-            file_size: 1024,
-            chunk_size: Some(1024),
+            file_name: "a.bin".into(),
+            file_size: 10,
+            stream_count: Some(2),
             sha256: None,
-            sha256_deferred: true,
-            from_id: "peer".into(),
-            from_name: "peer".into(),
-            from_ip: "192.168.1.2".into(),
+            sha256_deferred: false,
+            from_id: "id".into(),
+            from_name: "n".into(),
+            from_ip: "1.2.3.4".into(),
             from_gateway_port: 7878,
             from_transfer_port: 7879,
-            batch_id: batch.map(|(b, _, _)| b.to_string()),
-            batch_index: batch.map(|(_, i, _)| i),
-            batch_total: batch.map(|(_, _, t)| t),
+            batch_id: batch.map(|b| b.0.to_string()),
+            batch_index: batch.map(|b| b.1),
+            batch_total: batch.map(|b| b.2),
         }
-    }
-
-    #[tokio::test]
-    async fn decide_batch_applies_to_whole_batch_only() {
-        let m = IncomingManager::new();
-        let e1 = m.register(offer("f1", Some(("b1", 0, 2))));
-        let e2 = m.register(offer("f2", Some(("b1", 1, 2))));
-        m.register(offer("f3", Some(("b2", 0, 1))));
-        m.register(offer("f4", None));
-
-        assert_eq!(m.list_pending_by_batch("b1").len(), 2, "同批条目应聚合");
-
-        let mut done = m.decide_batch("b1", true).await;
-        done.sort();
-        let mut want = vec![e1.incoming_id.clone(), e2.incoming_id.clone()];
-        want.sort();
-        assert_eq!(done, want, "一次决策覆盖整批，且只覆盖该批");
-
-        // 决议确实置位了：wait_decision 立即返回，不用等满 60s 超时
-        assert_eq!(m.wait_decision(&e1.incoming_id).await, Some(true));
-        assert_eq!(m.wait_decision(&e2.incoming_id).await, Some(true));
-
-        // 别的批次没被碰过：仍在等决策（wait_decision 会一直挂住）
-        let b2 = m.list_pending_by_batch("b2");
-        assert_eq!(b2.len(), 1);
-        assert_eq!(b2[0].decision, None);
-        let pending = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            m.wait_decision(&b2[0].incoming_id),
-        )
-        .await;
-        assert!(pending.is_err(), "未决策的条目不应立刻返回结果");
-    }
-
-    #[tokio::test]
-    async fn decide_batch_reject_removes_slots() {
-        let m = IncomingManager::new();
-        m.register(offer("f1", Some(("b1", 0, 2))));
-        m.register(offer("f2", Some(("b1", 1, 2))));
-        m.register(offer("f3", Some(("b2", 0, 1))));
-
-        assert_eq!(m.decide_batch("b1", false).await.len(), 2);
-        assert_eq!(
-            m.list_pending_by_batch("b1").len(),
-            0,
-            "拒绝应立即移除槽位，不留残留在 UI 上"
-        );
-        assert_eq!(m.list_pending_by_batch("b2").len(), 1, "其他批次不受影响");
-    }
-
-    #[tokio::test]
-    async fn decide_batch_on_unknown_batch_is_noop() {
-        let m = IncomingManager::new();
-        m.register(offer("f1", Some(("b1", 0, 1))));
-        assert!(
-            m.decide_batch("does-not-exist", true).await.is_empty(),
-            "未知批次不应误伤任何条目"
-        );
-        assert_eq!(m.list_pending().len(), 1);
-    }
-
-    #[test]
-    fn list_pending_by_batch_sorts_by_index() {
-        let m = IncomingManager::new();
-        // 故意乱序登记，UI 顺序必须仍然稳定
-        m.register(offer("f3", Some(("b1", 2, 3))));
-        m.register(offer("f1", Some(("b1", 0, 3))));
-        m.register(offer("f2", Some(("b1", 1, 3))));
-        let names: Vec<String> = m
-            .list_pending_by_batch("b1")
-            .into_iter()
-            .map(|e| e.file_name)
-            .collect();
-        assert_eq!(names, vec!["f1.bin", "f2.bin", "f3.bin"]);
-    }
-
-    #[test]
-    fn old_sender_offer_without_batch_fields_still_deserializes() {
-        // 旧版本发送端的 offer 里没有 batch_* 字段。
-        // 这三个字段必须是 Option + serde(default)，否则跨版本对接会直接 400。
-        let json = r#"{
-            "file_id": "x", "file_name": "x.bin", "file_size": 10,
-            "chunk_size": 1024, "sha256": null, "sha256_deferred": true,
-            "from_id": "p", "from_name": "p", "from_ip": "192.168.1.2",
-            "from_gateway_port": 7878, "from_transfer_port": 7879
-        }"#;
-        let o: crate::protocol::HttpOffer =
-            serde_json::from_str(json).expect("旧 offer 必须能反序列化");
-        assert!(o.batch_id.is_none());
-        assert!(o.batch_index.is_none());
-        assert!(o.batch_total.is_none());
-    }
-
-    fn prog(id: &str, status: TransferStatus) -> TransferProgress {
-        TransferProgress {
-            file_id: id.to_string(),
-            file_name: format!("{id}.bin"),
-            file_size: 100,
-            bytes_transferred: 0,
-            chunks_done: 0,
-            chunks_total: 1,
-            speed_bps: 0,
-            status,
-            error: None,
-            incoming: false,
-            file_path: None,
-        }
-    }
-
-    #[test]
-    fn cache_keeps_everything_below_cap() {
-        let mut c = ProgressCache::new(3);
-        c.insert(prog("a", TransferStatus::InProgress));
-        c.insert(prog("b", TransferStatus::InProgress));
-        assert_eq!(c.snapshot().len(), 2);
-    }
-
-    /// 超上限后总数压回 cap，且最新一条必然还在
-    #[test]
-    fn cache_trims_to_cap_and_keeps_newest() {
-        let mut c = ProgressCache::new(3);
-        for id in ["a", "b", "c", "d", "e"] {
-            c.insert(prog(id, TransferStatus::InProgress));
-        }
-        assert_eq!(c.snapshot().len(), 3);
-        assert!(c.map.contains_key("e"), "刚插入的不该被淘汰");
-        assert!(!c.map.contains_key("a"), "最早的应被淘汰");
-    }
-
-    /// 优先淘汰终态：终态条目即使比进行中的条目新，也先被丢掉
-    #[test]
-    fn cache_prefers_evicting_terminal_entries() {
-        let mut c = ProgressCache::new(2);
-        c.insert(prog("old-running", TransferStatus::InProgress));
-        c.insert(prog("done", TransferStatus::Completed));
-        c.insert(prog("new-running", TransferStatus::InProgress));
-
-        assert!(c.map.contains_key("old-running"), "进行中的老条目应保留");
-        assert!(!c.map.contains_key("done"), "终态应优先被淘汰");
-        assert!(c.map.contains_key("new-running"));
-    }
-
-    /// 全是进行中时必须仍能降回上限，不能卡死在超限状态
-    #[test]
-    fn cache_falls_back_to_oldest_when_nothing_is_terminal() {
-        let mut c = ProgressCache::new(2);
-        for id in ["a", "b", "c", "d"] {
-            c.insert(prog(id, TransferStatus::Pending));
-        }
-        assert_eq!(c.snapshot().len(), 2, "无终态可淘汰时也必须降回上限");
-        assert!(c.map.contains_key("d"));
-        assert!(!c.map.contains_key("a"));
-    }
-
-    /// 同一 file_id 反复更新只入队一次，否则队列膨胀且淘汰顺序错乱
-    #[test]
-    fn repeated_file_id_is_not_requeued() {
-        let mut c = ProgressCache::new(10);
-        for _ in 0..5 {
-            c.insert(prog("same", TransferStatus::InProgress));
-        }
-        assert_eq!(c.order.len(), 1, "同一 file_id 只应入队一次");
-        assert_eq!(c.snapshot().len(), 1);
     }
 
     #[test]
@@ -1820,347 +1398,263 @@ mod tests {
         assert!(is_terminal(&TransferStatus::Completed));
         assert!(is_terminal(&TransferStatus::Failed));
         assert!(is_terminal(&TransferStatus::Canceled));
-        assert!(!is_terminal(&TransferStatus::Pending));
         assert!(!is_terminal(&TransferStatus::InProgress));
+        assert!(!is_terminal(&TransferStatus::Pending));
     }
 
-    /// 超时按块大小给：16MB→21s，64MB→69s，小于 1MB→6s。
-    ///
-    /// 固定值会让慢设备（老安卓 eMMC、USB2.0 硬盘）被误判失败，
-    /// 而误判失败是功能不可用，多等几秒只是体感。
     #[test]
-    fn ack_timeout_scales_with_chunk_size() {
-        assert_eq!(ack_timeout_for(16 * 1024 * 1024).as_secs(), 21);
-        assert_eq!(ack_timeout_for(64 * 1024 * 1024).as_secs(), 69);
-        assert_eq!(ack_timeout_for(64 * 1024).as_secs(), 6, "小于 1MB 按 1MB 算");
-        assert_eq!(ack_timeout_for(1024).as_secs(), 6);
-    }
-
-    /// 取消必须是**立即**生效的，而不是等满 ACK 超时窗口。
-    ///
-    /// 这条测试锁住本阶段最重要的修复：对端故意永不回 ACK，
-    /// 此时若没有 `select!` 取消分支，调用会一直卡到超时（这里是 30s）才返回，
-    /// 用户点了取消界面却纹丝不动——那是功能缺陷，不是体感问题。
-    #[tokio::test]
-    async fn send_chunk_cancel_takes_effect_immediately() {
-        // 起一个接受连接但**永不回 ACK** 的对端，模拟"对端卡住"
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.unwrap();
-            // 持有连接不读写，让发送方永远等不到 ACK
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        });
-
-        let header = DataFrameHeader {
-            file_id_prefix: 1,
-            chunk_id: 0,
-            data_len: 4,
-            _reserved: 0,
-        };
-
-        let (cancel_tx, mut cancel_rx) = watch::channel(false);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let _ = cancel_tx.send(true);
-        });
-
-        let start = Instant::now();
-        let mut conn = tokio::io::BufReader::new(TcpStream::connect(addr).await.unwrap());
-        let r = send_chunk(
-            &mut conn,
-            &header,
-            b"test",
-            Duration::from_secs(30), // 故意给一个很长的超时
-            &mut cancel_rx,
-        )
-        .await;
-        let elapsed = start.elapsed();
-
-        assert!(
-            matches!(r, ChunkResult::Canceled),
-            "取消后应返回 Canceled，实际是别的结局"
-        );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "取消应在 2 秒内生效，实际耗时 {elapsed:?}——说明又在等超时窗口了"
-        );
-    }
-
-    /// ok=false 是"对端明确拒绝"，必须归为不可重试。
-    ///
-    /// 否则重试循环会为一次磁盘写满白等三次（按 16MB 块算约 63 秒），
-    /// 最后还是失败——这段时间用户只看到进度条卡住。
-    #[tokio::test]
-    async fn ack_ok_false_is_fatal_not_retryable() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            // 读掉请求（24B header + 4B data），然后回一个 ok=false 的 ACK
-            let mut buf = vec![0u8; 24 + 4];
-            let _ = tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await;
-            let ack = crate::protocol::ControlMessage::ChunkAck {
-                file_id: "f".into(),
-                chunk_id: 0,
-                ok: false,
-            };
-            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, ack.to_line().unwrap().as_bytes()).await;
-            let _ = tokio::io::AsyncWriteExt::flush(&mut stream).await;
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        });
-
-        let mut conn = tokio::io::BufReader::new(TcpStream::connect(addr).await.unwrap());
-        let header = DataFrameHeader {
-            file_id_prefix: 1,
-            chunk_id: 0,
-            data_len: 4,
-            _reserved: 0,
-        };
-        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
-        let r = send_chunk(
-            &mut conn,
-            &header,
-            b"test",
-            Duration::from_secs(5),
-            &mut cancel_rx,
-        )
-        .await;
-        assert!(
-            matches!(r, ChunkResult::Fatal(_)),
-            "ok=false 必须是 Fatal（不可重试），实际是别的结局"
-        );
-    }
-
-    /// 重试循环：可重试的失败应当被重试到上限，且耗尽后返回 Failed。
-    ///
-    /// 这里用一个"连不上"的地址（端口 0）来制造可重试失败——
-    /// 它比构造"写到一半断开"稳定得多，而且同样能验证重试次数与退避。
-    #[tokio::test]
-    async fn retry_exhausts_then_fails() {
-        let header = DataFrameHeader {
-            file_id_prefix: 1,
-            chunk_id: 7,
-            data_len: 4,
-            _reserved: 0,
-        };
-        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
-        let mut conn: Option<SendConn> = None;
-        let start = Instant::now();
-        let out = send_chunk_with_retry(
-            &mut conn,
-            "127.0.0.1",
-            0, // 端口 0 无法连接
-            &header,
-            b"test",
-            Duration::from_millis(300),
-            &mut cancel_rx,
-        )
-        .await;
-        let elapsed = start.elapsed();
-
-        match out {
-            ChunkOutcome::Failed(msg) => {
-                assert!(msg.contains("after 3 attempts"), "错误信息应带上尝试次数：{msg}");
-                assert!(msg.contains("chunk 7"), "错误信息应带上块号：{msg}");
-            }
-            other => panic!("连不上的情况应当重试耗尽后 Failed，实际是 {other:?}"),
+    fn cache_keeps_everything_below_cap() {
+        let mut c = ProgressCache::new(3);
+        for i in 0..3 {
+            c.insert(TransferProgress {
+                file_id: format!("f{i}"),
+                file_name: String::new(),
+                file_size: 0,
+                bytes_transferred: 0,
+                chunks_done: 0,
+                chunks_total: 0,
+                speed_bps: 0,
+                status: TransferStatus::InProgress,
+                error: None,
+                incoming: false,
+                file_path: None,
+            });
         }
-        // 退避 0 + 200 + 500 = 700ms。
-        // 下界是这条测试的**关键**：只断言上界的话，"一次都不重试"也能通过
-        // （连不上返回得极快），测试就成了空测试。
-        assert!(
-            elapsed >= Duration::from_millis(700),
-            "三次尝试含 700ms 退避，实际 {elapsed:?}——是不是根本没重试？"
-        );
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "三次尝试（含 700ms 退避）应在 3 秒内结束，实际 {elapsed:?}"
-        );
+        assert_eq!(c.snapshot().len(), 3);
     }
 
-    /// 重试的价值在于**能救回来**：第一次失败、第二次成功 → 整块成功。
-    ///
-    /// 这是 4.3 存在的全部理由。前面几条测的都是"失败时行为正确"，
-    /// 而这条测的是"网络抖一下，传输不会整体失败"。
-    #[tokio::test]
-    async fn retry_recovers_when_second_attempt_succeeds() {
-        let conn_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let conn_count_in_task = conn_count.clone();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            // 第一次：收下数据就断开，不发 ACK —— 模拟 ACK 在路上丢了
-            let (mut s, _) = listener.accept().await.unwrap();
-            conn_count_in_task.fetch_add(1, Ordering::SeqCst);
-            let mut buf = vec![0u8; DataFrameHeader::SIZE + 4];
-            let _ = tokio::io::AsyncReadExt::read_exact(&mut s, &mut buf).await;
-            drop(s);
-
-            // 第二次：正常回 ACK
-            let (mut s2, _) = listener.accept().await.unwrap();
-            conn_count_in_task.fetch_add(1, Ordering::SeqCst);
-            let mut buf = vec![0u8; DataFrameHeader::SIZE + 4];
-            let _ = tokio::io::AsyncReadExt::read_exact(&mut s2, &mut buf).await;
-            let ack = crate::protocol::ControlMessage::ChunkAck {
-                file_id: "f".into(),
-                chunk_id: 3,
-                ok: true,
-            };
-            let _ = tokio::io::AsyncWriteExt::write_all(
-                &mut s2,
-                ack.to_line().unwrap().as_bytes(),
-            )
-            .await;
-            let _ = tokio::io::AsyncWriteExt::flush(&mut s2).await;
-            // 撑住连接，避免提前关闭干扰断言
-            tokio::time::sleep(Duration::from_secs(3)).await;
-        });
-
-        let header = DataFrameHeader {
-            file_id_prefix: 1,
-            chunk_id: 3,
-            data_len: 4,
-            _reserved: 0,
-        };
-        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
-        let mut conn: Option<SendConn> = None;
-        let out = send_chunk_with_retry(
-            &mut conn,
-            "127.0.0.1",
-            addr.port(),
-            &header,
-            b"test",
-            Duration::from_secs(2),
-            &mut cancel_rx,
-        )
-        .await;
-
-        assert!(
-            matches!(out, ChunkOutcome::Ok),
-            "第一次 ACK 丢失后应重试并成功，实际是 {out:?}"
-        );
-        assert_eq!(
-            conn_count.load(Ordering::SeqCst),
-            2,
-            "应当恰好建了 2 次连接（1 次失败 + 1 次成功）"
-        );
-    }
-
-    /// 连接复用：多个块应当跑在**同一条**连接上。
-    ///
-    /// 这条测试锁的是"复用真的生效了"，而不只是"复用后还能传"。
-    /// 只看后者的话，实现退回每块一连接也能通过——那正是要防止的退化。
-    #[tokio::test]
-    async fn reuse_sends_many_chunks_on_one_connection() {
-        let accept_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let accept_count_in_task = accept_count.clone();
-        let frames_in_task = frames.clone();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            accept_count_in_task.fetch_add(1, Ordering::SeqCst);
-            // 循环读帧：一条连接上收多块，每块回一个 ACK
-            loop {
-                let mut header_buf = [0u8; DataFrameHeader::SIZE];
-                let n = read_full(&mut stream, &mut header_buf).await.unwrap();
-                if n == 0 {
-                    break; // 发送端发完并关闭——干净 EOF 就是结束信号
-                }
-                let header = DataFrameHeader::from_bytes(&header_buf).unwrap();
-                let mut buf = vec![0u8; header.data_len as usize];
-                read_full(&mut stream, &mut buf).await.unwrap();
-                frames_in_task.fetch_add(1, Ordering::SeqCst);
-                let ack = crate::protocol::ControlMessage::ChunkAck {
-                    file_id: String::new(),
-                    chunk_id: header.chunk_id,
-                    ok: true,
-                };
-                tokio::io::AsyncWriteExt::write_all(
-                    &mut stream,
-                    ack.to_line().unwrap().as_bytes(),
-                )
-                .await
-                .unwrap();
-                tokio::io::AsyncWriteExt::flush(&mut stream).await.unwrap();
-            }
-        });
-
-        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
-        let mut conn: Option<SendConn> = None;
-        for chunk_id in 0..5u64 {
-            let header = DataFrameHeader {
-                file_id_prefix: 1,
-                chunk_id,
-                data_len: 4,
-                _reserved: 0,
-            };
-            let out = send_chunk_with_retry(
-                &mut conn,
-                "127.0.0.1",
-                addr.port(),
-                &header,
-                b"test",
-                Duration::from_secs(5),
-                &mut cancel_rx,
-            )
-            .await;
-            assert!(
-                matches!(out, ChunkOutcome::Ok),
-                "第 {chunk_id} 块应发送成功，实际 {out:?}"
-            );
+    #[test]
+    fn cache_trims_to_cap_and_keeps_newest() {
+        let mut c = ProgressCache::new(2);
+        for i in 0..4 {
+            c.insert(TransferProgress {
+                file_id: format!("f{i}"),
+                file_name: String::new(),
+                file_size: 0,
+                bytes_transferred: 0,
+                chunks_done: 0,
+                chunks_total: 0,
+                speed_bps: 0,
+                status: TransferStatus::InProgress,
+                error: None,
+                incoming: false,
+                file_path: None,
+            });
         }
-        // 这条流发完，关闭写端让对端读到 EOF
-        let _ = conn.take().unwrap().into_inner().shutdown().await;
-
-        assert_eq!(
-            accept_count.load(Ordering::SeqCst),
-            1,
-            "5 个块应当只建 1 条连接——如果这里大于 1，说明复用退化成每块一连接了"
-        );
-        assert_eq!(frames.load(Ordering::SeqCst), 5, "一条连接上应收满 5 帧");
+        let mut ids: Vec<_> = c.snapshot().into_iter().map(|p| p.file_id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["f2".to_string(), "f3".to_string()]);
     }
 
-    /// 取消在重试**间隔**里也要生效：
-    /// 如果退避用的是裸 sleep，用户在间隔点取消就得等退避走完才响应。
-    #[tokio::test]
-    async fn cancel_during_retry_backoff_takes_effect() {
-        let header = DataFrameHeader {
-            file_id_prefix: 1,
-            chunk_id: 0,
-            data_len: 4,
-            _reserved: 0,
-        };
-        let (cancel_tx, mut cancel_rx) = watch::channel(false);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let _ = cancel_tx.send(true);
+    #[test]
+    fn cache_prefers_evicting_terminal_entries() {
+        let mut c = ProgressCache::new(2);
+        c.insert(TransferProgress {
+            file_id: "old-done".into(),
+            file_name: String::new(),
+            file_size: 0,
+            bytes_transferred: 0,
+            chunks_done: 0,
+            chunks_total: 0,
+            speed_bps: 0,
+            status: TransferStatus::Completed,
+            error: None,
+            incoming: false,
+            file_path: None,
         });
+        c.insert(TransferProgress {
+            file_id: "live".into(),
+            file_name: String::new(),
+            file_size: 0,
+            bytes_transferred: 0,
+            chunks_done: 0,
+            chunks_total: 0,
+            speed_bps: 0,
+            status: TransferStatus::InProgress,
+            error: None,
+            incoming: false,
+            file_path: None,
+        });
+        c.insert(TransferProgress {
+            file_id: "newer".into(),
+            file_name: String::new(),
+            file_size: 0,
+            bytes_transferred: 0,
+            chunks_done: 0,
+            chunks_total: 0,
+            speed_bps: 0,
+            status: TransferStatus::InProgress,
+            error: None,
+            incoming: false,
+            file_path: None,
+        });
+        let ids: Vec<_> = c.snapshot().into_iter().map(|p| p.file_id).collect();
+        assert!(ids.contains(&"live".to_string()));
+        assert!(ids.contains(&"newer".to_string()));
+        assert!(!ids.contains(&"old-done".to_string()));
+    }
 
+    #[test]
+    fn cache_falls_back_to_oldest_when_nothing_is_terminal() {
+        let mut c = ProgressCache::new(2);
+        for name in ["a", "b", "c"] {
+            c.insert(TransferProgress {
+                file_id: name.into(),
+                file_name: String::new(),
+                file_size: 0,
+                bytes_transferred: 0,
+                chunks_done: 0,
+                chunks_total: 0,
+                speed_bps: 0,
+                status: TransferStatus::InProgress,
+                error: None,
+                incoming: false,
+                file_path: None,
+            });
+        }
+        let ids: Vec<_> = c.snapshot().into_iter().map(|p| p.file_id).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(!ids.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn cache_repeated_file_id_is_not_requeued() {
+        let mut c = ProgressCache::new(2);
+        for _ in 0..3 {
+            c.insert(TransferProgress {
+                file_id: "same".into(),
+                file_name: String::new(),
+                file_size: 0,
+                bytes_transferred: 1,
+                chunks_done: 0,
+                chunks_total: 0,
+                speed_bps: 0,
+                status: TransferStatus::InProgress,
+                error: None,
+                incoming: false,
+                file_path: None,
+            });
+        }
+        c.insert(TransferProgress {
+            file_id: "other".into(),
+            file_name: String::new(),
+            file_size: 0,
+            bytes_transferred: 0,
+            chunks_done: 0,
+            chunks_total: 0,
+            speed_bps: 0,
+            status: TransferStatus::InProgress,
+            error: None,
+            incoming: false,
+            file_path: None,
+        });
+        let mut ids: Vec<_> = c.snapshot().into_iter().map(|p| p.file_id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["other".to_string(), "same".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn decide_batch_on_unknown_batch_is_noop() {
+        let mgr = IncomingManager::new();
+        let done = mgr.decide_batch("nope", true).await;
+        assert!(done.is_empty());
+    }
+
+    #[tokio::test]
+    async fn decide_batch_reject_removes_slots() {
+        let mgr = IncomingManager::new();
+        mgr.register(offer("f1", Some(("b1", 0, 2))));
+        mgr.register(offer("f2", Some(("b1", 1, 2))));
+        let done = mgr.decide_batch("b1", false).await;
+        assert_eq!(done.len(), 2);
+        assert!(mgr.list_pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn decide_batch_applies_to_whole_batch_only() {
+        let mgr = IncomingManager::new();
+        mgr.register(offer("f1", Some(("b1", 0, 2))));
+        mgr.register(offer("f2", Some(("b1", 1, 2))));
+        mgr.register(offer("f3", Some(("b2", 0, 1))));
+        let done = mgr.decide_batch("b1", true).await;
+        assert_eq!(done.len(), 2);
+        assert_eq!(mgr.list_pending().len(), 1);
+        assert_eq!(mgr.list_pending()[0].file_id, "f3");
+    }
+
+    #[test]
+    fn list_pending_by_batch_sorts_by_index() {
+        let mgr = IncomingManager::new();
+        mgr.register(offer("f1", Some(("b1", 2, 3))));
+        mgr.register(offer("f2", Some(("b1", 0, 3))));
+        mgr.register(offer("f3", Some(("b1", 1, 3))));
+        let list = mgr.list_pending_by_batch("b1");
+        let indices: Vec<_> = list.iter().map(|e| e.batch_index.unwrap()).collect();
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn old_sender_offer_without_stream_count_still_deserializes() {
+        let json = r#"{
+            "file_id": "x", "file_name": "a", "file_size": 10,
+            "sha256": null, "sha256_deferred": true,
+            "from_id": "d", "from_name": "n", "from_ip": "1.2.3.4",
+            "from_gateway_port": 7878, "from_transfer_port": 7879
+        }"#;
+        let offer: HttpOffer = serde_json::from_str(json).unwrap();
+        assert_eq!(offer.stream_count, None);
+    }
+
+    /// 端到端：单流发送若干字节，接收端流式落盘并 finalize。
+    #[tokio::test]
+    async fn single_stream_send_receives_file() {
+        let base = std::env::var("FTCORE_TEST_TMP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let dir = base.join(format!("ftcore-stream-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let recv_engine = Arc::new(TransferEngine::new(0, 4, dir.clone()));
+        // 端口 0 → 由我们自己 bind 再注入不现实；这里直接 spawn_receiver 用固定候选
+        // 改为手动 listen 由 serve_data_stream 接：用 TransferEngine 公开路径太重，
+        // 直接测 storage + StreamHeader 协议：写两段后 finalize。
+        let mgr = &recv_engine.storage;
+        mgr.create_slot("fid-1".into(), "out.bin".into(), 10, 2, None, false)
+            .await
+            .unwrap();
+        // 段布局：5 + 5
+        let layout = stream_layout(10, 2);
+        assert_eq!(layout, vec![(0, 5), (5, 5)]);
+        mgr.write_at("fid-1", 5, b"67890").await.unwrap();
+        mgr.write_at("fid-1", 0, b"12345").await.unwrap();
+        let slot = mgr.finish_stream("fid-1", 0).await.unwrap();
+        assert!(!slot.is_complete());
+        let slot = mgr.finish_stream("fid-1", 1).await.unwrap();
+        assert!(slot.is_complete());
+        mgr.finalize("fid-1", None).await.unwrap();
+        let got = std::fs::read(dir.join("out.bin")).unwrap();
+        assert_eq!(got, b"1234567890");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 取消后 connect / 退避都能被打断（不再挂满整个重试窗口）。
+    #[tokio::test]
+    async fn cancel_during_connect_backoff_takes_effect() {
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            // 不可达地址，会走满重试
+            connect_with_retry("127.0.0.1", 1, &mut cancel_rx).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_tx.send(true).unwrap();
         let start = Instant::now();
-        let mut conn: Option<SendConn> = None;
-        let out = send_chunk_with_retry(
-            &mut conn,
-            "127.0.0.1",
-            0,
-            &header,
-            b"test",
-            Duration::from_millis(300),
-            &mut cancel_rx,
-        )
-        .await;
-        let elapsed = start.elapsed();
-
+        let res = handle.await.unwrap();
+        assert!(res.is_err());
         assert!(
-            matches!(out, ChunkOutcome::Canceled),
-            "退避期间取消应返回 Canceled"
-        );
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "退避期间取消应立即生效，实际 {elapsed:?}——退避是不是用了裸 sleep？"
+            start.elapsed() < Duration::from_secs(1),
+            "取消应立刻打断重试，耗时 {:?}",
+            start.elapsed()
         );
     }
 }

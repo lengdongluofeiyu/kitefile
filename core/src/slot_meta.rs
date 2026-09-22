@@ -3,18 +3,19 @@
 //! **本阶段只落类型和序列化，不写文件。**
 //!
 //! 为什么现在就写：格式先定死并锁进测试，将来做跨重启续传（N3）时
-//! 就能"只填数据、不改格式"。等到真要做续传时再设计，会发现当初
-//! 随手定的结构有坑（比如位图用布尔数组，640 块要 3KB+）。
-//! 格式定义见 docs/design-phase4-error-recovery.md §4.1。
+//! 就能"只填数据、不改格式"。流式传输下位图按「流」而不是按 chunk，
+//! 条目数最多 `parallel_streams`（通常 ≤8），位图开销可忽略。
+//! 格式定义见 docs/design-phase4-error-recovery.md §4.1（chunk 字段已废弃）。
 //!
 //! 字段只增不改：新增字段必须给默认值，保证旧 meta 仍能被读出。
+//! 版本号不认识就丢弃（`from_json`），不猜字段语义。
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 /// 当前元数据格式版本
-pub const SLOT_META_VERSION: u32 = 1;
+pub const SLOT_META_VERSION: u32 = 2;
 
 /// 位打包的接收位图 → base64。
 ///
@@ -50,11 +51,11 @@ pub struct SlotMeta {
     pub file_id: String,
     pub file_name: String,
     pub file_size: u64,
-    pub chunk_size: usize,
-    pub chunk_count: u64,
+    /// 发送方声明的并行流数（分段布局由此决定）
+    pub stream_count: u32,
     /// 整文件 sha256；deferred 补发尚未到达时为 null
     pub sha256: Option<String>,
-    /// [`pack_bitmap`] 的结果再过一层 base64
+    /// 各流完成位，[`pack_bitmap`] 后再 base64
     pub bitmap: String,
     /// 槽位创建时间（Unix 秒），用于将来的 .part 过期清理
     pub created_at: u64,
@@ -75,11 +76,10 @@ impl SlotMeta {
             file_id: slot.file_id.clone(),
             file_name: slot.file_name.clone(),
             file_size: slot.file_size,
-            chunk_size: slot.chunk_size,
-            chunk_count: slot.chunk_count,
+            stream_count: slot.stream_count,
             sha256: slot.sha256.clone(),
             bitmap: base64::engine::general_purpose::STANDARD
-                .encode(pack_bitmap(&slot.received_chunks)),
+                .encode(pack_bitmap(&slot.streams_done)),
             created_at: now_secs(),
             peer_id: peer_id.to_string(),
             source_mtime,
@@ -108,11 +108,11 @@ impl SlotMeta {
     }
 
     /// 位图解码回布尔数组
-    pub fn received_chunks(&self) -> Option<Vec<bool>> {
+    pub fn streams_done(&self) -> Option<Vec<bool>> {
         let raw = base64::engine::general_purpose::STANDARD
             .decode(&self.bitmap)
             .ok()?;
-        Some(unpack_bitmap(&raw, self.chunk_count as usize))
+        Some(unpack_bitmap(&raw, self.stream_count as usize))
     }
 }
 
@@ -170,10 +170,9 @@ mod tests {
             file_id: "uuid-1".into(),
             file_name: "a.mp4".into(),
             file_size: 10737418240,
-            chunk_size: 16777216,
-            chunk_count: 640,
+            stream_count: 8,
             sha256: None,
-            bitmap: base64::engine::general_purpose::STANDARD.encode(vec![0u8; 80]),
+            bitmap: base64::engine::general_purpose::STANDARD.encode(vec![0u8; 1]),
             created_at: 1757000000,
             peer_id: "dev-1".into(),
             source_mtime: None,
@@ -184,8 +183,7 @@ mod tests {
             "file_id",
             "file_name",
             "file_size",
-            "chunk_size",
-            "chunk_count",
+            "stream_count",
             "sha256",
             "bitmap",
             "created_at",
@@ -210,8 +208,7 @@ mod tests {
             file_id: "u".into(),
             file_name: "a".into(),
             file_size: 4,
-            chunk_size: 4,
-            chunk_count: 1,
+            stream_count: 1,
             sha256: None,
             bitmap: String::new(),
             created_at: 1,
@@ -220,10 +217,13 @@ mod tests {
         };
         assert!(SlotMeta::from_json(&base.to_json().unwrap()).is_some());
 
-        // 把 version 改成 2：必须返回 None，而不是解析出一个字段错位的结构
-        let v2 = base.to_json().unwrap().replace("\"version\":1", "\"version\":2");
+        // 旧版本（1）必须丢弃：字段语义已变（chunk → stream）
+        let v1 = base.to_json().unwrap().replace(
+            &format!("\"version\":{}", SLOT_META_VERSION),
+            "\"version\":1",
+        );
         assert!(
-            SlotMeta::from_json(&v2).is_none(),
+            SlotMeta::from_json(&v1).is_none(),
             "不认识的 version 必须丢弃"
         );
         // 烂 JSON 也不能 panic
@@ -232,23 +232,22 @@ mod tests {
 
     #[test]
     fn bitmap_roundtrips_through_base64() {
-        let mut chunks = vec![false; 100];
-        for i in (0..100).step_by(3) {
-            chunks[i] = true;
+        let mut done = vec![false; 8];
+        for i in (0..8).step_by(3) {
+            done[i] = true;
         }
         let meta = SlotMeta {
             version: SLOT_META_VERSION,
             file_id: "u".into(),
             file_name: "a".into(),
             file_size: 400,
-            chunk_size: 4,
-            chunk_count: 100,
+            stream_count: 8,
             sha256: None,
-            bitmap: base64::engine::general_purpose::STANDARD.encode(pack_bitmap(&chunks)),
+            bitmap: base64::engine::general_purpose::STANDARD.encode(pack_bitmap(&done)),
             created_at: 1,
             peer_id: "p".into(),
             source_mtime: None,
         };
-        assert_eq!(meta.received_chunks(), Some(chunks));
+        assert_eq!(meta.streams_done(), Some(done));
     }
 }
