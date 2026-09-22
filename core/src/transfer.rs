@@ -81,6 +81,9 @@ const PROGRESS_CACHE_CAP: usize = 200;
 /// 进度推送节流：整个传输每 100ms 最多一条 InProgress
 const PROGRESS_PUSH_INTERVAL: Duration = Duration::from_millis(100);
 
+/// 速度采样窗口：收发两端统一 1 秒更新一次，避免 100ms 级抖动让速度乱跳
+const SPEED_SAMPLE_WINDOW: Duration = Duration::from_secs(1);
+
 /// 流式读写缓冲。够大摊薄 syscall，够小让进度平滑、内存友好。
 const STREAM_IO_BUF: usize = 256 * 1024;
 
@@ -371,8 +374,8 @@ pub struct TransferEngine {
     progress_bus: TokioMutex<Option<Arc<broadcast::Sender<TransferProgress>>>>,
     /// 全量进度快照：file_id → 最近一条进度（GET /api/transfers 用）
     progress_cache: Arc<Mutex<ProgressCache>>,
-    /// 接收方速率统计：file_id → (首 字节 时间, 上次已收字节数)
-    recv_speed_state: TokioMutex<HashMap<String, (Instant, u64)>>,
+    /// 接收方速率统计：file_id → (上次采样时刻, 上次 bytes, 上次速度)
+    recv_speed_state: TokioMutex<HashMap<String, (Instant, u64, u64)>>,
     /// 已接受的 incoming：file_id → (发送方 IP, 发送方 gateway 端口)
     /// 接收方取消时用于通知发送方联动取消
     incoming_endpoints: TokioMutex<HashMap<String, (String, u16)>>,
@@ -672,20 +675,19 @@ impl TransferEngine {
         let bytes_done = slot.bytes_received.min(slot.file_size);
         let speed_bps = {
             let mut state = self.recv_speed_state.lock().await;
-            // (上次采样时刻, 上次 bytes_done)：速度 = 两次采样的字节差 / 时间差。
-            // 累计均值（total/elapsed）会表现为「开头很快、越传越慢」——
-            // 那是平均值在收敛，不是真的掉速。
+            // (上次采样时刻, 上次 bytes, 上次速度)：每 SPEED_SAMPLE_WINDOW 更新一次。
+            // 窗口太短会让速度随调度抖动乱跳；累计均值又会「越传越慢」。
             let ent = state
                 .entry(file_id.to_string())
-                .or_insert_with(|| (Instant::now(), bytes_done));
-            let dt = ent.0.elapsed().as_secs_f64();
-            if dt >= 0.15 {
+                .or_insert_with(|| (Instant::now(), bytes_done, 0));
+            let dt = ent.0.elapsed();
+            if dt >= SPEED_SAMPLE_WINDOW {
                 let db = bytes_done.saturating_sub(ent.1);
-                *ent = (Instant::now(), bytes_done);
-                (db as f64 / dt) as u64
+                let sps = (db as f64 / dt.as_secs_f64()) as u64;
+                *ent = (Instant::now(), bytes_done, sps);
+                sps
             } else {
-                // 采样间隔太短，沿用上次结果（0 表示还没测出）
-                0
+                ent.2
             }
         };
         self.publish_progress(TransferProgress {
@@ -1115,7 +1117,7 @@ impl TransferEngine {
         let last_push = Arc::new(TokioMutex::new(Instant::now()
             .checked_sub(PROGRESS_PUSH_INTERVAL)
             .unwrap_or_else(Instant::now)));
-        let last_sample = Arc::new(TokioMutex::new((Instant::now(), 0u64)));
+        let last_sample = Arc::new(TokioMutex::new((Instant::now(), 0u64, 0u64)));
 
         let mut handles = Vec::new();
         for (stream_id, &(start_offset, seg_len)) in layout.iter().enumerate() {
@@ -1208,8 +1210,8 @@ struct SendProgress {
     streams_done: Arc<AtomicU64>,
     bytes_done: Arc<AtomicU64>,
     last_push: Arc<TokioMutex<Instant>>,
-    /// (上次采样时刻, 上次 bytes_done)，算**瞬时**速度用
-    last_sample: Arc<TokioMutex<(Instant, u64)>>,
+    /// (上次采样时刻, 上次 bytes, 上次速度)，1 秒窗口算瞬时速度
+    last_sample: Arc<TokioMutex<(Instant, u64, u64)>>,
 }
 
 impl SendProgress {
@@ -1222,16 +1224,17 @@ impl SendProgress {
             *last = Instant::now();
         }
         let bd = self.bytes_done.load(Ordering::Relaxed);
-        // 瞬时速度 = Δbytes/Δt。累计均值（total/elapsed）会「开头很快、越传越慢」。
+        // 1 秒窗口的瞬时速度：窗口内沿用上次值，避免 100ms 抖动
         let speed_bps = {
             let mut s = self.last_sample.lock().await;
-            let dt = s.0.elapsed().as_secs_f64();
-            if dt >= 0.05 {
+            let dt = s.0.elapsed();
+            if dt >= SPEED_SAMPLE_WINDOW {
                 let db = bd.saturating_sub(s.1);
-                *s = (Instant::now(), bd);
-                (db as f64 / dt) as u64
+                let sps = (db as f64 / dt.as_secs_f64()) as u64;
+                *s = (Instant::now(), bd, sps);
+                sps
             } else {
-                0
+                s.2
             }
         };
         push_progress(&self.progress_tx, TransferProgress {
