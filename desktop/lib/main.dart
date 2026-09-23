@@ -128,8 +128,7 @@ class TrayService with TrayListener {
   }
 
   Future<void> _showWindow() async {
-    await windowManager.show();
-    await windowManager.focus();
+    await bringAppToForeground();
   }
 
   Future<void> _exitCompletely() async {
@@ -144,6 +143,27 @@ class TrayService with TrayListener {
 }
 
 final TrayService trayService = TrayService();
+
+/// 把主窗口拉到前台（点通知 / 点托盘时用）。
+///
+/// Windows 有前台锁：单独 `show()+focus()` 经常只是「显示了但没置顶」。
+/// 先短暂 `alwaysOnTop` 骗过前台限制，再取消置顶。
+Future<void> bringAppToForeground() async {
+  try {
+    if (await windowManager.isMinimized()) {
+      await windowManager.restore();
+    }
+    await windowManager.setSkipTaskbar(false);
+    await windowManager.show();
+    await windowManager.setAlwaysOnTop(true);
+    await windowManager.focus();
+    await Future.delayed(const Duration(milliseconds: 180));
+    await windowManager.setAlwaysOnTop(false);
+    await windowManager.focus();
+  } catch (e) {
+    debugPrint('[Window] bring to foreground failed: $e');
+  }
+}
 
 /// 守护进程管理器
 ///
@@ -560,8 +580,9 @@ class _HomePageState extends State<HomePage> with WindowListener {
     try {
       final n = LocalNotification(
         title: 'FTCore 仍在后台运行',
-        body: '已最小化到系统托盘（隐藏图标区）。双击托盘图标可打开主界面；来文件时会再通知你。',
+        body: '已最小化到系统托盘（隐藏图标区）。点击通知或托盘图标可打开主界面。',
       );
+      n.onClick = bringAppToForeground;
       n.show();
     } catch (e) {
       debugPrint('[Notify] tray resident failed: $e');
@@ -578,10 +599,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
         title: '${entry.fromName} 想发送文件',
         body: '${entry.fileName}（${formatBytes(entry.fileSize)}）\n点击打开 FTCore 接收',
       );
-      n.onClick = () {
-        windowManager.show();
-        windowManager.focus();
-      };
+      n.onClick = bringAppToForeground;
       n.show();
     } catch (e) {
       debugPrint('[Notify] incoming failed: $e');
@@ -598,10 +616,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
         title: '已接收 ${p.fileName}',
         body: '点击打开 FTCore 查看',
       );
-      n.onClick = () {
-        windowManager.show();
-        windowManager.focus();
-      };
+      n.onClick = bringAppToForeground;
       n.show();
     } catch (e) {
       debugPrint('[Notify] received failed: $e');
