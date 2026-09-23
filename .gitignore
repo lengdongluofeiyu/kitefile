@@ -14,6 +14,15 @@ dist/
 # ===== Node 依赖 =====
 node_modules/
 
+# ===== 本机覆盖（含绝对路径，勿提交）=====
+core/.cargo/config.toml
+scripts/local-env.ps1
+scripts/local-env.sh
+mobile/android/local.properties
+mobile/android/key.properties
+*.keystore
+*.jks
+
 # ===== Android / Gradle 构建中间产物 =====
 .gradle/
 .cxx/
@@ -33,6 +42,9 @@ Thumbs.db
 
 # ===== 日志 =====
 *.log
+
+# ===== Flutter / Gradle build 目录 =====
+**/build/
 
 # ===== 依赖锁文件：必须提交 =====
 # 本项目是应用（core 含 bin target），锁文件保证构建可复现。

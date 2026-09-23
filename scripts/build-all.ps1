@@ -1,4 +1,4 @@
-﻿# FTCore 一键构建脚本
+# FTCore 一键构建脚本
 #
 # 用法：
 #   .\scripts\build-all.ps1                    # 全量构建
@@ -68,29 +68,61 @@ $DistDir      = Join-Path $ProjectRoot 'dist'
 $DistWindows   = Join-Path $DistDir 'windows'
 $DistAndroid   = Join-Path $DistDir 'android'
 
-# ===== 环境变量（与开发期保持一致：全部 E 盘） =====
-$env:CARGO_HOME        = 'E:\zheten2.0\.deps\cargo'
-$env:RUSTUP_HOME       = 'E:\zheten2.0\.deps\rustup'
-$env:PUB_CACHE         = 'E:\zheten2.0\.deps\pub-cache'
-# JDK 21：Gradle 9.1 的兼容上限是 JDK 24，JDK 25 会让 Gradle/AGP 直接报错。
-# 原 C:\jdk22 已在清盘时删除，勿再指回 C 盘。
-$env:JAVA_HOME         = 'D:\jdk21\jdk-21.0.12.1+1'
-$env:ANDROID_HOME      = 'E:\zheten2.0\.deps\android-sdk'
-$env:ANDROID_SDK_ROOT  = 'E:\zheten2.0\.deps\android-sdk'
-$env:GRADLE_USER_HOME  = 'E:\zheten2.0\.deps\gradle'
-# TEMP/TMP 必须一起重定向：rustc 与 MSVC link.exe 默认把临时文件、.pdb 写进 %TEMP%
-# （用户目录下，C 盘）。C 盘写满时的症状是 rustc ICE（encode_metadata 里 expect 失败）
-# 加 LNK1201（写 pdb 失败），看起来像编译器 bug，实际是磁盘空间不足。
-# 同样的坑也坑 Dart：frontend_server（kernel_snapshot_program）写临时文件失败时会
-# **静默 exit 1**，日志里只有 "Target kernel_snapshot_program failed: Exception"，
-# 没有任何 Dart 报错行——很容易误判成代码问题。实测重定向 TEMP 后同样的代码能编过。
-$env:TEMP              = 'E:\zheten2.0\.deps\tmp'
-$env:TMP               = $env:TEMP
-$env:PATH              = "$env:CARGO_HOME\bin;$env:JAVA_HOME\bin;$env:ANDROID_HOME\cmdline-tools\latest\bin;$env:ANDROID_HOME\platform-tools;$env:PATH"
+# ===== 环境变量 =====
+# 优先：进程环境 → scripts/local-env.ps1（本机、勿提交）→ 默认用户目录。
+if (Test-Path (Join-Path $PSScriptRoot 'local-env.ps1')) {
+    . (Join-Path $PSScriptRoot 'local-env.ps1')
+    Write-Host '[env] loaded scripts/local-env.ps1' -ForegroundColor DarkGray
+}
+if (-not $env:CARGO_HOME) { $env:CARGO_HOME = Join-Path $env:USERPROFILE '.cargo' }
+if (-not $env:PUB_CACHE)  { $env:PUB_CACHE  = Join-Path $env:LOCALAPPDATA 'Pub\Cache' }
+if (-not $env:JAVA_HOME) {
+    # Gradle 9.1 兼容上限 JDK 24，推荐 17–21
+    Write-Host '[env] JAVA_HOME 未设置，Gradle 可能失败（需要 JDK 17–21）' -ForegroundColor Yellow
+}
+if (-not $env:ANDROID_HOME -and $env:ANDROID_SDK_ROOT) { $env:ANDROID_HOME = $env:ANDROID_SDK_ROOT }
+if (-not $env:ANDROID_HOME) {
+    Write-Host '[env] ANDROID_HOME 未设置，Android 构建将失败' -ForegroundColor Yellow
+}
+if ($env:ANDROID_HOME) { $env:ANDROID_SDK_ROOT = $env:ANDROID_HOME }
+if (-not $env:GRADLE_USER_HOME) { $env:GRADLE_USER_HOME = Join-Path $env:USERPROFILE '.gradle' }
+# TEMP：C 盘写满会让 rustc/linker/Dart frontend_server 神秘失败
+if (-not $env:TEMP) { $env:TEMP = [System.IO.Path]::GetTempPath() }
+if (-not $env:TMP)  { $env:TMP  = $env:TEMP }
+if (-not $env:FTCORE_TEST_TMP) { $env:FTCORE_TEST_TMP = $env:TEMP }
 
-# 临时目录不存在就建一个（首次在新机器上跑时）
+# Flutter Windows 构建需要 %PROGRAMFILES(X86)%；精简环境里可能没有
+if (-not (Test-Path env:'ProgramFiles(x86)')) {
+    ${env:ProgramFiles(x86)} = 'C:\Program Files (x86)'
+}
+
+# Android NDK 链接器：若未在 core/.cargo/config.toml 写死路径，则从 SDK 探测并导出
+if (-not $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER -and $env:ANDROID_HOME) {
+    $ndkRoot = Join-Path $env:ANDROID_HOME 'ndk'
+    if (Test-Path $ndkRoot) {
+        $ndkVer = Get-ChildItem $ndkRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+        if ($ndkVer) {
+            $clang = Join-Path $ndkVer.FullName 'toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android24-clang.cmd'
+            if (-not (Test-Path $clang)) {
+                $clang = Get-ChildItem (Join-Path $ndkVer.FullName 'toolchains\llvm\prebuilt') -Recurse -Filter 'aarch64-linux-android*-clang.cmd' -ErrorAction SilentlyContinue |
+                    Select-Object -First 1 -ExpandProperty FullName
+            }
+            if ($clang) {
+                $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = $clang
+                Write-Host "[env] NDK linker = $clang" -ForegroundColor DarkGray
+            }
+        }
+    }
+}
+
+$env:PATH = "$env:CARGO_HOME\bin;$(if ($env:JAVA_HOME) { \"$env:JAVA_HOME\bin;\" });$(if ($env:ANDROID_HOME) { \"$env:ANDROID_HOME\cmdline-tools\latest\bin;$env:ANDROID_HOME\platform-tools;\" });$env:PATH"
+
+# 临时目录不存在就建一个
 if (-not (Test-Path $env:TEMP)) {
     New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
+}
+if ($env:FTCORE_TEST_TMP -and -not (Test-Path $env:FTCORE_TEST_TMP)) {
+    New-Item -ItemType Directory -Path $env:FTCORE_TEST_TMP -Force | Out-Null
 }
 
 # ===== 工具函数 =====

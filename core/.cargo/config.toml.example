@@ -1,0 +1,10 @@
+# 复制为同目录 config.toml 后按本机路径修改（config.toml 若只是注释可整文件覆盖）。
+# 也可以不用本文件，改为设置环境变量：
+#   CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
+
+[target.aarch64-linux-android]
+# Windows 示例：
+# linker = "C:/Users/you/AppData/Local/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android24-clang.cmd"
+# Linux/macOS 示例：
+# linker = "/home/you/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+linker = "REPLACE_ME/aarch64-linux-android24-clang"

@@ -64,26 +64,20 @@ KITS_W='C:\Program Files (x86)\Windows Kits\10'
 export LIB="$MSVC_W\\lib\\x64;$KITS_W\\Lib\\$SDK_VER\\um\\x64;$KITS_W\\Lib\\$SDK_VER\\ucrt\\x64"
 export INCLUDE="$MSVC_W\\include;$KITS_W\\Include\\$SDK_VER\\um;$KITS_W\\Include\\$SDK_VER\\ucrt;$KITS_W\\Include\\$SDK_VER\\shared"
 
-# 4. 一切"可写"的东西都放 E 盘：依赖缓存、编译产物、临时文件。
-#    C 盘空间紧张时 link.exe 的失败非常隐蔽（进程被杀、退出码 1181 混在一起），
-#    与其事后排查，不如一开始就不往 C 盘写。
-# 注意：CARGO_HOME / RUSTUP_HOME 必须与 scripts/build-all.ps1 里设的**同一个目录**，
-# 否则开发期和发布构建会各下一份依赖缓存（我就是这么多出来一份 184MB 的）。
-export CARGO_HOME="E:\\zheten2.0\\.deps\\cargo"
-# RUSTUP_HOME 同样必须对齐 build-all.ps1：**Android 的 target 装在 E 盘这一份里**。
-# 漏了它就会回落到 C:\Users\<你>\.rustup，那里只有 x86_64-pc-windows-msvc，
-# 交叉编译时报 "can't find crate for core / 考虑 rustup target add aarch64-linux-android"
-# ——看起来像 target 没装，实际是找错了工具链目录。
-export RUSTUP_HOME="E:\\zheten2.0\\.deps\\rustup"
-# 刻意**不设** CARGO_TARGET_DIR：产物留在 core/target（同样在 E 盘，不占 C 盘），
-# 与 scripts/build-all.ps1 的假设一致——脚本是从 `core\target\release\` 拷产物的。
-# 各设一个等于编译两遍、白占一份几 GB 的磁盘。
-mkdir -p "E:\\zheten2.0\\.deps\\tmp" 2>/dev/null || true
-export TEMP="E:\\zheten2.0\\.deps\\tmp"
-export TMP="$TEMP"
-# 集成测试的临时目录也跟着走（storage_test / gateway_test 会读它）
-export FTCORE_TEST_TMP="E:\\zheten2.0\\.deps\\tmp"
+# 4. 可选本机覆盖（绝对路径写在这里，勿提交）
+if [[ -f "$REPO_ROOT/scripts/local-env.sh" ]]; then
+    # shellcheck source=/dev/null
+    . "$REPO_ROOT/scripts/local-env.sh"
+    echo "[rust-env] loaded scripts/local-env.sh"
+fi
+# 缓存目录：环境变量优先；未设置则用默认用户目录（不写死盘符）
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+export TEMP="${TEMP:-${TMPDIR:-/tmp}}"
+export TMP="${TMP:-$TEMP}"
+export FTCORE_TEST_TMP="${FTCORE_TEST_TMP:-$TEMP}"
+mkdir -p "$TEMP" "$FTCORE_TEST_TMP" 2>/dev/null || true
 
 cd "$REPO_ROOT/core"
-echo "[rust-env] VS=$VS_WIN  MSVC=$MSVC_VER  SDK=$SDK_VER"
+echo "[rust-env] VS=$VS_WIN  MSVC=$MSVC_VER  SDK=$SDK_VER  CARGO_HOME=$CARGO_HOME"
 exec "$@"

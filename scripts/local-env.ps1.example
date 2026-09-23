@@ -1,0 +1,14 @@
+# 本机构建环境（不要提交）。复制为 local-env.ps1 后按需修改。
+# 由 scripts/build-all.ps1 在存在时自动加载。
+
+$env:FTCORE_DEPS_ROOT   = 'E:\zheten2.0\.deps'
+$env:CARGO_HOME         = 'E:\zheten2.0\.deps\cargo'
+$env:RUSTUP_HOME        = 'E:\zheten2.0\.deps\rustup'
+$env:PUB_CACHE          = 'E:\zheten2.0\.deps\pub-cache'
+$env:JAVA_HOME          = 'D:\jdk21\jdk-21.0.12.1+1'
+$env:ANDROID_HOME       = 'E:\zheten2.0\.deps\android-sdk'
+$env:ANDROID_SDK_ROOT   = $env:ANDROID_HOME
+$env:GRADLE_USER_HOME   = 'E:\zheten2.0\.deps\gradle'
+$env:TEMP               = 'E:\zheten2.0\.deps\tmp'
+$env:TMP                = $env:TEMP
+$env:FTCORE_TEST_TMP    = 'E:\zheten2.0\.deps\tmp'

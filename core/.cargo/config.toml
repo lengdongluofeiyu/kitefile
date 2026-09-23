@@ -1,6 +1,0 @@
-# Android 交叉编译配置（aarch64，NDK r28）
-# 用法：cargo build --release --target aarch64-linux-android
-# 产物：target/aarch64-linux-android/release/libftcore.so → mobile/android/app/src/main/jniLibs/arm64-v8a/
-
-[target.aarch64-linux-android]
-linker = "E:\\zheten2.0\\.deps\\android-sdk\\ndk\\28.2.13676358\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android24-clang.cmd"

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    name: Rust core
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - name: Test
+        run: cargo test --all-targets
+        env:
+          FTCORE_TEST_TMP: ${{ runner.temp }}
+
+  analyze:
+    name: Flutter analyze
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [desktop, mobile]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Pub get
+        working-directory: ${{ matrix.module }}
+        run: flutter pub get
+      - name: Analyze
+        working-directory: ${{ matrix.module }}
+        run: flutter analyze
