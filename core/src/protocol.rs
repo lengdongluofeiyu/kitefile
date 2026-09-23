@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 2;
-pub const SERVICE_TYPE: &str = "_ftcore._tcp.local.";
+pub const SERVICE_TYPE: &str = "_kitefile._tcp.local.";
 
 /// 数据流头：每条 TCP 连接一次，后跟 `data_len` 字节原始数据。
 ///

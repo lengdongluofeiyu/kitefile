@@ -304,7 +304,7 @@ async fn access_guard(req: Request, next: Next, allow_remote_admin: bool) -> Res
 }
 
 async fn root_handler() -> impl IntoResponse {
-    "ftcore gateway is running. See /api/* for endpoints."
+    "kitefile gateway is running. See /api/* for endpoints."
 }
 
 async fn whoami(State(state): State<AppState>) -> Json<WhoAmI> {
@@ -422,7 +422,7 @@ async fn list_files(State(state): State<AppState>) -> Json<Vec<String>> {
     if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
         while let Ok(Some(entry)) = rd.next_entry().await {
             if let Some(name) = entry.file_name().to_str() {
-                // 过滤：隐藏标记文件（.ftcore-save-dir 等）与传输中的临时文件
+                // 过滤：隐藏标记文件（.kitefile-save-dir 等）与传输中的临时文件
                 if name.starts_with('.') || name.ends_with(".part") {
                     continue;
                 }

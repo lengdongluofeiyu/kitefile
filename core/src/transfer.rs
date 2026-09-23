@@ -1704,7 +1704,7 @@ mod tests {
         let base = std::env::var("FTCORE_TEST_TMP")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::env::temp_dir());
-        let dir = base.join(format!("ftcore-stream-e2e-{}", std::process::id()));
+        let dir = base.join(format!("kitefile-stream-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

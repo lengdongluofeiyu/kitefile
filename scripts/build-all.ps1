@@ -1,4 +1,4 @@
-# FTCore 一键构建脚本
+# KiteFile 一键构建脚本
 #
 # 用法：
 #   .\scripts\build-all.ps1                    # 全量构建
@@ -130,12 +130,12 @@ function Write-Step([string]$msg) { Write-Host "`n[*] $msg" -ForegroundColor Cya
 function Write-Ok([string]$msg)   { Write-Host "    [OK] $msg" -ForegroundColor Green }
 function Write-Err([string]$msg)  { Write-Host "    [ERR] $msg" -ForegroundColor Red }
 
-# 停止运行中的 FTCore 进程（daemon / 桌面端）。
+# 停止运行中的 KiteFile 进程（daemon / 桌面端）。
 # 产物文件被这些进程锁定会导致 Copy-Item / Remove-Item 失败；
 # 桌面端下次启动时会自动重新拉起 daemon，无需担心。
 function Stop-FtcoreProcesses {
     $stopped = $false
-    foreach ($name in 'ftcore-cli', 'ftcore_desktop') {
+    foreach ($name in 'kitefile-cli', 'kitefile_desktop') {
         $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
         if ($procs) {
             $procs | Stop-Process -Force
@@ -222,9 +222,9 @@ if (-not $SkipRust) {
         Pop-Location
     }
     # 拷贝 Rust 守护进程与 FFI 库到 dist\windows\
-    Copy-Item "$CoreDir\target\release\ftcore-cli.exe" $DistWindows -Force
-    Copy-Item "$CoreDir\target\release\ftcore.dll"     $DistWindows -Force
-    Write-Ok "ftcore-cli.exe + ftcore.dll 已拷贝到 dist\windows\"
+    Copy-Item "$CoreDir\target\release\kitefile-cli.exe" $DistWindows -Force
+    Copy-Item "$CoreDir\target\release\kitefile.dll"     $DistWindows -Force
+    Write-Ok "kitefile-cli.exe + kitefile.dll 已拷贝到 dist\windows\"
 }
 
 # ===== 2. Windows 桌面端 =====
@@ -235,8 +235,8 @@ if (-not $SkipWindows) {
         Pop-Location
     }
     $srcRelease = "$DesktopDir\build\windows\x64\runner\Release"
-    # 清空旧的 windows 输出（保留 ftcore-cli.exe / ftcore.dll，因为下面会再拷一遍）
-    Get-ChildItem $DistWindows -Force | Where-Object { $_.Name -notin @('ftcore-cli.exe','ftcore.dll') } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    # 清空旧的 windows 输出（保留 kitefile-cli.exe / kitefile.dll，因为下面会再拷一遍）
+    Get-ChildItem $DistWindows -Force | Where-Object { $_.Name -notin @('kitefile-cli.exe','kitefile.dll') } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     # 拷贝全部 Flutter 产物
     Copy-Item "$srcRelease\*" $DistWindows -Recurse -Force
     Write-Ok "Windows 桌面端已拷贝到 dist\windows\"
@@ -252,8 +252,8 @@ if (-not $SkipAndroid) {
     }
     $jniLibs = Join-Path $MobileDir 'android\app\src\main\jniLibs\arm64-v8a'
     New-Item -ItemType Directory -Force -Path $jniLibs | Out-Null
-    Copy-Item "$CoreDir\target\aarch64-linux-android\release\libftcore.so" $jniLibs -Force
-    Write-Ok "libftcore.so 已拷贝到 jniLibs\arm64-v8a\"
+    Copy-Item "$CoreDir\target\aarch64-linux-android\release\libkitefile.so" $jniLibs -Force
+    Write-Ok "libkitefile.so 已拷贝到 jniLibs\arm64-v8a\"
 
     # 3b. Flutter APK（会自动打包 jniLibs）
     Invoke-Build 'Android APK (Flutter)' {
@@ -267,7 +267,7 @@ if (-not $SkipAndroid) {
 
 # ===== 4. 生成 manifest =====
 $lines = @()
-$lines += 'FTCore 构建清单'
+$lines += 'KiteFile 构建清单'
 $lines += '=========================================='
 $lines += "构建时间: $buildTime"
 $lines += "构建机器: $env:COMPUTERNAME"
@@ -277,10 +277,10 @@ $lines += '产物列表:'
 $lines += '---'
 $lines += '[Windows 桌面端]'
 $lines += '路径: dist\windows\'
-$lines += '启动文件: ftcore_desktop.exe'
-$lines += '辅助文件: ftcore-cli.exe (守护进程), ftcore.dll (FFI 库)'
+$lines += '启动文件: kitefile_desktop.exe'
+$lines += '辅助文件: kitefile-cli.exe (守护进程), kitefile.dll (FFI 库)'
 $lines += ''
-if (Test-Path "$DistWindows\ftcore_desktop.exe") {
+if (Test-Path "$DistWindows\kitefile_desktop.exe") {
     Get-ChildItem $DistWindows -Recurse -File | ForEach-Object {
         $rel = $_.FullName.Substring($DistWindows.Length + 1)
         $sizeKB = [math]::Round($_.Length/1KB,1)
@@ -305,7 +305,7 @@ if (Test-Path "$DistAndroid\app-release.apk") {
 $lines += ''
 $lines += '=========================================='
 $lines += '运行说明:'
-$lines += '1. Windows: 进入 dist\windows\，双击 ftcore_desktop.exe（守护进程会自动拉起）'
+$lines += '1. Windows: 进入 dist\windows\，双击 kitefile_desktop.exe（守护进程会自动拉起）'
 $lines += '2. Android: 用 adb install -r dist\android\app-release.apk 安装到手机'
 
 $manifestPath = Join-Path $DistDir 'dist.manifest.txt'
@@ -318,9 +318,9 @@ Write-Host "  构建完成" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "产物目录: $DistDir"
 Write-Host ""
-if (Test-Path "$DistWindows\ftcore_desktop.exe") {
+if (Test-Path "$DistWindows\kitefile_desktop.exe") {
     $size = (Get-ChildItem $DistWindows -Recurse | Measure-Object Length -Sum).Sum
-    Write-Host ("  Windows:  dist\windows\ftcore_desktop.exe  (总 {0} MB)" -f [math]::Round($size/1MB,1))
+    Write-Host ("  Windows:  dist\windows\kitefile_desktop.exe  (总 {0} MB)" -f [math]::Round($size/1MB,1))
 }
 if (Test-Path "$DistAndroid\app-release.apk") {
     $size = (Get-Item "$DistAndroid\app-release.apk").Length

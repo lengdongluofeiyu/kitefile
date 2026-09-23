@@ -1,7 +1,7 @@
-/// FTCore Rust 引擎 FFI 绑定（Android 嵌入模式）
+/// KiteFile Rust 引擎 FFI 绑定（Android 嵌入模式）
 ///
-/// 打包在 APK 中的 libftcore.so（jniLibs/arm64-v8a/），
-/// 启动时调用 ftcore_init 在 App 进程内拉起完整 daemon：
+/// 打包在 APK 中的 libkitefile.so（jniLibs/arm64-v8a/），
+/// 启动时调用 kitefile_init 在 App 进程内拉起完整 daemon：
 /// - mDNS 设备发现（失败自动降级离线模式）
 /// - TCP 传输引擎（监听 7879）
 /// - HTTP/WebSocket 网关（监听 127.0.0.1:7878）
@@ -18,7 +18,7 @@ import 'dart:io' show Platform;
 
 import 'package:flutter/services.dart';
 
-// Rust: i32 ftcore_init(*const c_char, *const c_char)
+// Rust: i32 kitefile_init(*const c_char, *const c_char)
 typedef _FtcoreInitNative = Int32 Function(
   Pointer<Uint8> deviceName,
   Pointer<Uint8> receiveDir,
@@ -39,7 +39,7 @@ final _MallocDart _malloc = DynamicLibrary.process()
 final _FreeDart _free = DynamicLibrary.process()
     .lookupFunction<_FreeNative, _FreeDart>('free');
 
-const MethodChannel _nativeChannel = MethodChannel('ftcore/native');
+const MethodChannel _nativeChannel = MethodChannel('kitefile/native');
 
 /// Android：应用专属外部存储目录（无需存储权限）
 Future<String?> _externalFilesDir() async {
@@ -80,16 +80,16 @@ Pointer<Uint8> _toNativeUtf8(String s) {
 /// [deviceName]：设备显示名（null 用默认）。
 /// 返回 true 表示 daemon 已在本进程内运行。
 Future<bool> initFtcoreDaemon({String? deviceName}) async {
-  if (!Platform.isAndroid) return false; // 仅 Android 打包了 libftcore.so
+  if (!Platform.isAndroid) return false; // 仅 Android 打包了 libkitefile.so
 
-  final lib = DynamicLibrary.open('libftcore.so');
+  final lib = DynamicLibrary.open('libkitefile.so');
   final init = lib
-      .lookupFunction<_FtcoreInitNative, _FtcoreInitDart>('ftcore_init');
+      .lookupFunction<_FtcoreInitNative, _FtcoreInitDart>('kitefile_init');
 
   // 接收目录：应用专属外部存储（无权限问题，文件管理器可见）
   String? receiveDir;
   final dir = await _externalFilesDir();
-  if (dir != null) receiveDir = '$dir/ftcore';
+  if (dir != null) receiveDir = '$dir/kitefile';
 
   // 默认设备名用机型（调用方未显式指定时）
   deviceName ??= await _deviceModel();

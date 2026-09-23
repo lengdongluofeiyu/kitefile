@@ -3,7 +3,7 @@
 //! 每个测试用独立端口对（gateway/transfer），支持并行运行。
 //! 全链路测试：A 发送 → B 确认 → 多流传输 → 校验落盘 → 双端进度。
 
-use ftcore::{DiscoveryService, EngineConfig, HttpGateway, TransferEngine};
+use kitefile::{DiscoveryService, EngineConfig, HttpGateway, TransferEngine};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -42,7 +42,7 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     let base = std::env::var("FTCORE_TEST_TMP")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
-    let dir = base.join(format!("ftcore-gw-test-{}-{}", tag, std::process::id()));
+    let dir = base.join(format!("kitefile-gw-test-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -237,7 +237,7 @@ async fn test_devices_and_root() {
     // 根路由
     let (status, body) = http(18002, "GET", "/", None).await;
     assert_eq!(status, 200);
-    assert!(String::from_utf8_lossy(&body).contains("ftcore gateway"));
+    assert!(String::from_utf8_lossy(&body).contains("kitefile gateway"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -250,7 +250,7 @@ async fn test_files_list_and_download() {
     let dir = temp_dir("files");
     let _ = start_stack(18003, 18103, &dir, 2).await;
 
-    let content = b"hello-ftcore-download".to_vec();
+    let content = b"hello-kitefile-download".to_vec();
     std::fs::write(dir.join("a.txt"), &content).unwrap();
 
     // 列表
@@ -818,7 +818,7 @@ async fn read_ws_event(
 
 // ============ 访问分级（阶段 2） ============
 
-use ftcore::gateway::{classify, path_matches, AccessPolicy};
+use kitefile::gateway::{classify, path_matches, AccessPolicy};
 
 /// 取一个非回环的本机 IPv4 地址。
 ///
@@ -1103,7 +1103,7 @@ fn test_offer_without_stream_count_deserializes() {
         "from_id":"d1","from_name":"n1","from_ip":"127.0.0.1",
         "from_gateway_port":7878,"from_transfer_port":7879
     }"#;
-    let offer: ftcore::protocol::HttpOffer = serde_json::from_str(body).unwrap();
+    let offer: kitefile::protocol::HttpOffer = serde_json::from_str(body).unwrap();
     assert_eq!(offer.stream_count, None, "旧版本 offer 没有该字段，应为 None");
     assert_eq!(offer.file_size, 1024);
 }

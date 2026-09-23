@@ -150,7 +150,7 @@ export default function App() {
   return (
     <div className="app">
       <header className="header">
-        <h1>FTCore</h1>
+        <h1>KiteFile</h1>
         <span className="subtitle">局域网文件传输</span>
         <div className="badge-row">
           <span className={`badge ${daemonAvailable ? 'ok' : 'warn'}`}>
@@ -175,7 +175,7 @@ export default function App() {
         ) : (
           <div className="me">
             {daemonAvailable === false
-              ? '未连接到本机守护进程。运行 `ftcore-cli daemon` 后重启本页。'
+              ? '未连接到本机守护进程。运行 `kitefile-cli daemon` 后重启本页。'
               : '加载中…'}
           </div>
         )}

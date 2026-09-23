@@ -1,7 +1,7 @@
 //! mDNS 设备发现
 //!
 //! 使用 mdns-sd crate 注册本机服务并发现局域网内其他设备。
-//! 服务类型：`_ftcore._tcp.local.`
+//! 服务类型：`_kitefile._tcp.local.`
 
 use crate::protocol::SERVICE_TYPE;
 use crate::Result;
@@ -17,7 +17,7 @@ use tracing::{info, warn};
 pub type DeviceId = String;
 
 /// 身份持久化标记文件名（存放在 daemon 数据目录下，与接收目录标记同目录）
-const IDENTITY_MARKER: &str = ".ftcore-identity";
+const IDENTITY_MARKER: &str = ".kitefile-identity";
 
 /// 设备身份：id（mDNS 服务实例名，全网唯一）+ 显示名。
 ///

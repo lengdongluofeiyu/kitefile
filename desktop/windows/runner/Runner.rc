@@ -90,12 +90,12 @@ BEGIN
         BLOCK "040904e4"
         BEGIN
             VALUE "CompanyName", "com.example" "\0"
-            VALUE "FileDescription", "ftcore_desktop" "\0"
+            VALUE "FileDescription", "kitefile_desktop" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "ftcore_desktop" "\0"
+            VALUE "InternalName", "kitefile_desktop" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 com.example. All rights reserved." "\0"
-            VALUE "OriginalFilename", "ftcore_desktop.exe" "\0"
-            VALUE "ProductName", "ftcore_desktop" "\0"
+            VALUE "OriginalFilename", "kitefile_desktop.exe" "\0"
+            VALUE "ProductName", "kitefile_desktop" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

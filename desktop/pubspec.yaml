@@ -1,5 +1,5 @@
-name: ftcore_desktop
-description: "FTCore 局域网文件传输 - 桌面端（Windows / macOS）"
+name: kitefile_desktop
+description: "KiteFile 局域网文件传输 - 桌面端（Windows / macOS）"
 publish_to: 'none'
 
 version: 1.0.0+1

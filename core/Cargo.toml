@@ -1,19 +1,19 @@
 [package]
-name = "ftcore"
+name = "kitefile"
 version = "0.1.0"
 edition = "2021"
 description = "LAN file transfer core engine (discovery + transfer + HTTP gateway)"
 license = "MIT"
 
 [lib]
-name = "ftcore"
+name = "kitefile"
 path = "src/lib.rs"
 # cdylib 用于 Flutter / 原生端通过 FFI 直接调用
 # rlib 用于纯 Rust 依赖（CLI、单元测试）
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "ftcore-cli"
+name = "kitefile-cli"
 path = "src/bin/cli.rs"
 
 [dependencies]

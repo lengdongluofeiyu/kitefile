@@ -1,9 +1,9 @@
 //! CLI 入口：用于测试核心引擎，无需 UI
 //!
 //! 用法：
-//!     ftcore-cli daemon [--remote-admin]   启动守护进程（发现 + 接收 + HTTP 网关）
-//!     ftcore-cli list-devices              列出已发现的设备
-//!     ftcore-cli send <ip> <path>          向对端发送文件
+//!     kitefile-cli daemon [--remote-admin]   启动守护进程（发现 + 接收 + HTTP 网关）
+//!     kitefile-cli list-devices              列出已发现的设备
+//!     kitefile-cli send <ip> <path>          向对端发送文件
 //!
 //! `--remote-admin`：把「仅本机」那一档 HTTP 接口（发文件 / 读接收目录 / 改配置）
 //! 也对局域网放开，用于开发期拿一台设备遥控另一台。默认关闭。
@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("ftcore=info".parse()?))
+        .with_env_filter(EnvFilter::from_default_env().add_directive("kitefile=info".parse()?))
         .init();
 
     let args: Vec<String> = std::env::args().collect();
@@ -33,23 +33,23 @@ async fn main() -> anyhow::Result<()> {
             send(ip, path).await
         }
         _ => {
-            eprintln!("ftcore-cli <daemon [--remote-admin] | list-devices | send <ip> <path>>");
+            eprintln!("kitefile-cli <daemon [--remote-admin] | list-devices | send <ip> <path>>");
             Ok(())
         }
     }
 }
 
 async fn run_daemon(allow_remote_admin: bool) -> anyhow::Result<()> {
-    let mut config = ftcore::EngineConfig::default();
+    let mut config = kitefile::EngineConfig::default();
     config.allow_remote_admin = allow_remote_admin;
 
     // 端口退避：默认端口可能落在系统保留区间（Windows 上 Hyper-V / WSL /
     // Docker 会动态保留成片端口），bind 失败报 os error 10013。
     // 必须在构造 discovery / transfer 之前定下来——mDNS 的 TXT 会把实际端口
     // 广播出去，对端靠它建连。
-    let gateway_port = ftcore::pick_available_port(ftcore::GATEWAY_PORT_CANDIDATES)
+    let gateway_port = kitefile::pick_available_port(kitefile::GATEWAY_PORT_CANDIDATES)
         .unwrap_or_else(|| os_pick_port(config.gateway_port));
-    let transfer_port = ftcore::pick_available_port(ftcore::TRANSFER_PORT_CANDIDATES)
+    let transfer_port = kitefile::pick_available_port(kitefile::TRANSFER_PORT_CANDIDATES)
         .unwrap_or_else(|| os_pick_port(config.transfer_port));
     if gateway_port != config.gateway_port || transfer_port != config.transfer_port {
         warn!(
@@ -62,21 +62,21 @@ async fn run_daemon(allow_remote_admin: bool) -> anyhow::Result<()> {
 
     // 身份持久化：id/名称复用上次的，重启后 mDNS 注册同一服务实例，
     // 对端设备表按 id 覆盖同一条记录（否则每次重启都被当成“新设备”）
-    let identity = ftcore::discovery::load_or_create_identity(
+    let identity = kitefile::discovery::load_or_create_identity(
         &config.receive_dir,
         &config.device_name,
     );
     config.device_name = identity.name.clone();
 
-    let discovery = Arc::new(ftcore::DiscoveryService::new(
+    let discovery = Arc::new(kitefile::DiscoveryService::new(
         config.device_name.clone(),
         identity.id,
         config.gateway_port,
         config.transfer_port,
-        Some(ftcore::discovery::identity_marker_path(&config.receive_dir)),
+        Some(kitefile::discovery::identity_marker_path(&config.receive_dir)),
     )?);
 
-    let transfer = Arc::new(ftcore::TransferEngine::new(
+    let transfer = Arc::new(kitefile::TransferEngine::new(
         config.transfer_port,
         config.parallel_streams,
         config.receive_dir.clone(),
@@ -85,15 +85,15 @@ async fn run_daemon(allow_remote_admin: bool) -> anyhow::Result<()> {
     Arc::clone(&transfer).spawn_receiver().await?;
     Arc::clone(&discovery).spawn_event_loop(tokio::runtime::Handle::current());
 
-    let gateway = ftcore::HttpGateway::new(discovery, transfer, Arc::new(config.clone()));
+    let gateway = kitefile::HttpGateway::new(discovery, transfer, Arc::new(config.clone()));
     gateway.run(config.gateway_port).await?;
     Ok(())
 }
 
 async fn list_devices() -> anyhow::Result<()> {
-    let config = ftcore::EngineConfig::default();
+    let config = kitefile::EngineConfig::default();
     let self_id = "list-only".to_string();
-    let discovery = Arc::new(ftcore::DiscoveryService::new(
+    let discovery = Arc::new(kitefile::DiscoveryService::new(
         config.device_name,
         self_id,
         config.gateway_port,
@@ -140,7 +140,7 @@ async fn http_get_body(host: &str, port: u16, path: &str) -> Option<String> {
 /// 对端可能因为默认端口被系统保留而退避到备选，所以不能假定 7878/7879。
 /// 依次试候选 gateway 端口，命中后从 whoami 响应里读出它实际通告的端口。
 async fn probe_peer_ports(ip: &str) -> anyhow::Result<(u16, u16)> {
-    for &p in ftcore::GATEWAY_PORT_CANDIDATES {
+    for &p in kitefile::GATEWAY_PORT_CANDIDATES {
         let Some(body) = http_get_body(ip, p, "/api/whoami").await else {
             continue;
         };
@@ -157,7 +157,7 @@ async fn probe_peer_ports(ip: &str) -> anyhow::Result<(u16, u16)> {
     }
     Err(anyhow::anyhow!(
         "peer {ip} 在候选端口 {:?} 上都没有响应，确认对端 daemon 已启动且在同一网段",
-        ftcore::GATEWAY_PORT_CANDIDATES
+        kitefile::GATEWAY_PORT_CANDIDATES
     ))
 }
 
@@ -170,15 +170,15 @@ fn os_pick_port(preferred: u16) -> u16 {
 }
 
 async fn send(ip: String, path: String) -> anyhow::Result<()> {
-    let mut config = ftcore::EngineConfig::default();
+    let mut config = kitefile::EngineConfig::default();
 
     // CLI send 需要本机 gateway 可达（接收方回包 /api/incoming-resp 会打过来），
     // 因此拉起完整栈：discovery + receiver + gateway。
     // 若本机已有 daemon 占用默认端口，则退避到备选端口。
     // 退避：CLI 常和常驻 daemon 同时存在，两边都要能起得来
-    let gateway_port = ftcore::pick_available_port(ftcore::GATEWAY_PORT_CANDIDATES)
+    let gateway_port = kitefile::pick_available_port(kitefile::GATEWAY_PORT_CANDIDATES)
         .unwrap_or_else(|| os_pick_port(config.gateway_port));
-    let transfer_port = ftcore::pick_available_port(ftcore::TRANSFER_PORT_CANDIDATES)
+    let transfer_port = kitefile::pick_available_port(kitefile::TRANSFER_PORT_CANDIDATES)
         .unwrap_or_else(|| os_pick_port(config.transfer_port));
     if gateway_port != config.gateway_port || transfer_port != config.transfer_port {
         warn!(
@@ -190,14 +190,14 @@ async fn send(ip: String, path: String) -> anyhow::Result<()> {
     config.transfer_port = transfer_port;
 
     let self_id = format!("cli-{}", uuid::Uuid::new_v4().simple());
-    let discovery = Arc::new(ftcore::DiscoveryService::new(
+    let discovery = Arc::new(kitefile::DiscoveryService::new(
         config.device_name.clone(),
         self_id.clone(),
         gateway_port,
         transfer_port,
         None, // 一次性 CLI 发送，临时身份即可
     )?);
-    let transfer = Arc::new(ftcore::TransferEngine::new(
+    let transfer = Arc::new(kitefile::TransferEngine::new(
         transfer_port,
         config.parallel_streams,
         config.receive_dir.clone(),
@@ -207,7 +207,7 @@ async fn send(ip: String, path: String) -> anyhow::Result<()> {
     discovery.clone().spawn_event_loop(tokio::runtime::Handle::current());
 
     // gateway 后台运行（主要用途：接收 /api/incoming-resp 回包）
-    let gateway = ftcore::HttpGateway::new(discovery.clone(), transfer.clone(), Arc::new(config.clone()));
+    let gateway = kitefile::HttpGateway::new(discovery.clone(), transfer.clone(), Arc::new(config.clone()));
     tokio::spawn(async move {
         if let Err(e) = gateway.run(gateway_port).await {
             tracing::error!(error = %e, "gateway exited");

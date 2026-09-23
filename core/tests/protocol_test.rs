@@ -1,6 +1,6 @@
 //! 协议层测试：StreamHeader / WsEvent 序列化
 
-use ftcore::protocol::{StreamHeader, WsEvent};
+use kitefile::protocol::{StreamHeader, WsEvent};
 
 #[test]
 fn test_stream_header_roundtrip() {
@@ -29,7 +29,7 @@ fn test_stream_header_too_short() {
 
 #[test]
 fn test_ws_event_progress_flatten() {
-    let p = ftcore::transfer::TransferProgress {
+    let p = kitefile::transfer::TransferProgress {
         file_id: "fid".into(),
         file_name: "a.bin".into(),
         file_size: 10,
@@ -37,7 +37,7 @@ fn test_ws_event_progress_flatten() {
         chunks_done: 1,
         chunks_total: 2,
         speed_bps: 100,
-        status: ftcore::transfer::TransferStatus::InProgress,
+        status: kitefile::transfer::TransferStatus::InProgress,
         error: None,
         incoming: false,
         file_path: None,
@@ -52,7 +52,7 @@ fn test_ws_event_progress_flatten() {
 
 #[test]
 fn test_ws_event_incoming_shape() {
-    let entry = ftcore::protocol::IncomingEntry {
+    let entry = kitefile::protocol::IncomingEntry {
         incoming_id: "inc-1".into(),
         file_id: "fid".into(),
         file_name: "a.bin".into(),

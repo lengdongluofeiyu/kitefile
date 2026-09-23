@@ -1,4 +1,4 @@
-# ftcore_desktop
+# kitefile_desktop
 
 A new Flutter project.
 

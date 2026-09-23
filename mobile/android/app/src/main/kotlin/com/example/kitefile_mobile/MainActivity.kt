@@ -1,4 +1,4 @@
-package com.example.ftcore_mobile
+package com.example.kitefile_mobile
 
 import android.content.ActivityNotFoundException
 import android.content.Intent
@@ -16,7 +16,7 @@ import java.io.File
 
 class MainActivity : FlutterActivity() {
     companion object {
-        private const val CHANNEL = "ftcore/native"
+        private const val CHANNEL = "kitefile/native"
         private const val PICK_FILES_REQUEST = 4201
     }
 

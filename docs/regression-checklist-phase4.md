@@ -12,13 +12,13 @@
 
 | 端 | 路径 | 说明 |
 |---|---|---|
-| Android | `dist/android/app-release.apk`（49.4MB） | 已含 `libftcore.so`（2.4MB，aarch64） |
-| Windows | `dist/windows/ftcore_desktop.exe` + `ftcore.dll` | 直接双击 exe 即可 |
+| Android | `dist/android/app-release.apk`（49.4MB） | 已含 `libkitefile.so`（2.4MB，aarch64） |
+| Windows | `dist/windows/kitefile_desktop.exe` + `kitefile.dll` | 直接双击 exe 即可 |
 
 ### 安装 / 运行
 
 1. 手机：把 APK 传上去安装。**先卸掉旧版本**，避免版本号一致导致覆盖失败。
-2. Windows：进 `dist/windows/`，双击 `ftcore_desktop.exe`。
+2. Windows：进 `dist/windows/`，双击 `kitefile_desktop.exe`。
 3. **两端必须是同一版构建**。混版本时 4.0 的行为会退化（见 §7 兼容性警告）。
 
 ### 网络条件（最容易翻车的一条）
@@ -35,7 +35,7 @@
 
 | # | 步骤 | 预期 |
 |---|---|---|
-| 1.1 | 两端都打开应用 | 各自出现在对方的设备列表里（mDNS `_ftcore._tcp.local.`） |
+| 1.1 | 两端都打开应用 | 各自出现在对方的设备列表里（mDNS `_kitefile._tcp.local.`） |
 | 1.2 | Windows → 手机，发一个 **10MB 左右**的文件 | 手机弹窗 → 点接受 → 进度走到 100% → 显示完成 |
 | 1.3 | 打开收到的文件 | 能正常打开，大小与源文件一致 |
 | 1.4 | 反向：手机 → Windows，同样发一次 | 同样成功 |
@@ -110,7 +110,7 @@
 | 6.1 | 传一个大文件（用 4MB 以上的 chunk_size 时 chunk 数才够明显） | 传输速度相比旧版应有可感知提升（省掉了每块的 connect + TLS 式握手开销） |
 | 6.2 | 观察是否出现"大量 connect 失败" | 不应出现 |
 
-> ⚠️ **这一项在真机上很难直接观测**：Flutter 端加载的是 `libftcore.so`，
+> ⚠️ **这一项在真机上很难直接观测**：Flutter 端加载的是 `libkitefile.so`，
 > 库里没有初始化 tracing subscriber，**core 的日志在手机上看不到**（见 §8）。
 > 只能通过吞吐变化和稳定性间接判断。
 
@@ -128,7 +128,7 @@
 ## 8. 已知可观测性缺口
 
 移动端/桌面端加载动态库时，**core 的 `tracing` 日志没有任何输出目标**
-（`tracing_subscriber` 只在 `ftcore-cli` 里初始化）。后果是真机上只能看 UI 表现，
+（`tracing_subscriber` 只在 `kitefile-cli` 里初始化）。后果是真机上只能看 UI 表现，
 看不到 `warn!` 级别的重试、取消、超时记录，排查只能靠猜。
 
 想在真机上看日志，需要先把日志落地（属于阶段「B1 开发者选项 UI」范围）：

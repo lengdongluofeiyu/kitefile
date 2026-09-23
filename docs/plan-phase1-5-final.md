@@ -1,4 +1,4 @@
-# FTCore 修复方案（第三轮定稿）
+# KiteFile 修复方案（第三轮定稿）
 
 日期：2026-09-03
 本轮工作：核对代码实际状态 → 复核前两轮裁决 → 补充新发现 → 标注存疑项
@@ -533,7 +533,7 @@ $env:TMP  = $env:TEMP
 
 | 项 | 内容 |
 |---|---|
-| 密钥 | `HKDF-SHA256(pairing_token, salt = file_id, info = "ftcore-data")`；file_id 续传复用 → salt 稳定（P1-2） |
+| 密钥 | `HKDF-SHA256(pairing_token, salt = file_id, info = "kitefile-data")`；file_id 续传复用 → salt 稳定（P1-2） |
 | nonce | **96-bit 全随机，随密文发送**（P0-3）；断言做硬失败 |
 | 帧布局 | `[24B header][12B nonce][ciphertext][16B tag]`，`data_len = 12 + ct + 16`（N7） |
 | 内存 | `Vec::with_capacity(read_len + 28)` + `encrypt_in_place`，不多分配 16MB（N8） |
@@ -546,11 +546,11 @@ $env:TMP  = $env:TEMP
 
 ### 阶段 5c · Dart 共享 package
 
-结构 `filetransfer/packages/ftcore_client/`（`src/api.dart` / `models.dart` / `format.dart` / `transfers.dart`）。
+结构 `filetransfer/packages/kitefile_client/`（`src/api.dart` / `models.dart` / `format.dart` / `transfers.dart`）。
 
 - **baseUrl 注入**，不写常量（桌面端固定 127.0.0.1:7878，移动端 `_daemonHost` 可变）
 - **平台差异留在各自 app**：桌面「打开所在文件夹」、移动端 FileProvider / SAF；共享包只定义 `abstract class FileOpener`
-- 路径依赖 `path: ../packages/ftcore_client`，不发包
+- 路径依赖 `path: ../packages/kitefile_client`，不发包
 - **迁移顺序**：models + format + http（纯函数、零风险）→ WS 状态管理（有状态、要回归）→ 弹窗级复用（收益递减，可不做）
 
 ---

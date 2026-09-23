@@ -6,7 +6,7 @@
 //! 注意：
 //! - 当前桌面端选择"应用 + 守护进程"模式（通过 HTTP 通信），更易调试
 //! - 嵌入式集成（iOS / Android 资源约束）使用本 FFI 接口
-//! - 函数命名约定：`ftcore_*`，参数全部为 C 兼容类型
+//! - 函数命名约定：`kitefile_*`，参数全部为 C 兼容类型
 //! - 字符串：传入 const char*（UTF-8），返回 const char* 由调用方负责释放
 //!
 //! 构建为动态库：在 Cargo.toml 中 `crate-type = ["cdylib", "rlib"]`
@@ -33,7 +33,7 @@ pub struct FfiContext {
 //
 // 用 Mutex 而不是 `static mut`：后者在多线程下读写是数据竞争（Rust 2024 起
 // 连"取一个共享引用"都会告警），而守护进程里的 gateway 线程与调用方线程
-// 会同时碰这个变量。OnceLock 在这里不适用——`ftcore_shutdown` 需要把它置回
+// 会同时碰这个变量。OnceLock 在这里不适用——`kitefile_shutdown` 需要把它置回
 // None，而 OnceLock 只能写一次。
 static CONTEXT: Mutex<Option<Arc<FfiContext>>> = Mutex::new(None);
 static INIT_LOCK: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -62,13 +62,13 @@ fn store(ptr_slot: &'static Mutex<Option<CString>>, s: CString) -> *const c_char
 
 /// 初始化引擎。device_name / receive_dir 为 null 时使用默认值。
 /// （Android 上建议由调用方传入应用专属外部存储目录，如
-///   /storage/emulated/0/Android/data/<pkg>/files/ftcore，无需存储权限）
+///   /storage/emulated/0/Android/data/<pkg>/files/kitefile，无需存储权限）
 /// 返回 0 表示成功，-1 表示失败。
 ///
 /// # Safety
 /// `device_name` / `receive_dir` 必须是合法的 C 字符串（可为 null）
 #[no_mangle]
-pub unsafe extern "C" fn ftcore_init(
+pub unsafe extern "C" fn kitefile_init(
     device_name: *const c_char,
     receive_dir: *const c_char,
 ) -> i32 {
@@ -211,12 +211,12 @@ pub unsafe extern "C" fn ftcore_init(
 }
 
 /// 获取本机信息 JSON：{"id","name","platform","gateway_port","transfer_port"}
-/// 返回的字符串由 ftcore 负责管理，调用方不应释放；下一次调用后可能失效。
+/// 返回的字符串由 kitefile 负责管理，调用方不应释放；下一次调用后可能失效。
 ///
 /// # Safety
-/// 仅在 ftcore_init 成功后调用
+/// 仅在 kitefile_init 成功后调用
 #[no_mangle]
-pub unsafe extern "C" fn ftcore_whoami_json() -> *const c_char {
+pub unsafe extern "C" fn kitefile_whoami_json() -> *const c_char {
     static LAST: Mutex<Option<CString>> = Mutex::new(None);
     // clone 出 Arc 就立刻释放锁，不要持着锁去做 JSON 序列化
     let ctx = match lock(&CONTEXT).clone() {
@@ -236,7 +236,7 @@ pub unsafe extern "C" fn ftcore_whoami_json() -> *const c_char {
 
 /// 获取当前已发现的设备列表 JSON 数组
 #[no_mangle]
-pub unsafe extern "C" fn ftcore_list_devices_json() -> *const c_char {
+pub unsafe extern "C" fn kitefile_list_devices_json() -> *const c_char {
     static LAST: Mutex<Option<CString>> = Mutex::new(None);
     let ctx = match lock(&CONTEXT).clone() {
         Some(c) => c,
@@ -255,7 +255,7 @@ pub unsafe extern "C" fn ftcore_list_devices_json() -> *const c_char {
 /// - file_path：UTF-8 C 字符串
 /// 返回 file_id（UTF-8 C 字符串，调用方不释放），失败返回 null
 #[no_mangle]
-pub unsafe extern "C" fn ftcore_send_file(
+pub unsafe extern "C" fn kitefile_send_file(
     target_ip: *const c_char,
     target_port: u16,
     file_path: *const c_char,
@@ -335,6 +335,6 @@ pub unsafe extern "C" fn ftcore_send_file(
 
 /// 释放引擎资源（应用退出时调用）
 #[no_mangle]
-pub unsafe extern "C" fn ftcore_shutdown() {
+pub unsafe extern "C" fn kitefile_shutdown() {
     *lock(&CONTEXT) = None;
 }

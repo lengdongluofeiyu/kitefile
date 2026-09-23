@@ -108,7 +108,7 @@ impl ReceiveSlot {
 }
 
 /// 接收目录持久化标记文件名（存放在启动时的默认目录下）
-const SAVE_DIR_MARKER: &str = ".ftcore-save-dir";
+const SAVE_DIR_MARKER: &str = ".kitefile-save-dir";
 
 /// 接收管理器：维护所有正在接收的文件
 pub struct StorageManager {

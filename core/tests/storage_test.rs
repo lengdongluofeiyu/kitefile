@@ -1,6 +1,6 @@
 //! Storage 层测试：按偏移流式写入、段完成、finalize 校验、abort
 
-use ftcore::storage::StorageManager;
+use kitefile::storage::StorageManager;
 
 /// 测试用的接收目录。
 ///
@@ -11,7 +11,7 @@ fn temp_recv_dir(tag: &str) -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
     let dir = base.join(format!(
-        "ftcore-storage-test-{}-{}",
+        "kitefile-storage-test-{}-{}",
         tag,
         std::process::id()
     ));

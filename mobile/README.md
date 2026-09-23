@@ -1,4 +1,4 @@
-# ftcore_mobile
+# kitefile_mobile
 
 A new Flutter project.
 

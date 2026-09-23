@@ -10,11 +10,11 @@ import 'package:local_notifier/local_notifier.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
-/// FTCore 桌面端
+/// KiteFile 桌面端
 ///
 /// 架构：Flutter UI（dart）→ HTTP 调用本机 Rust 守护进程（127.0.0.1:7878）
 /// Rust 守护进程在桌面端启动时由 main() 自动拉起（生产环境）；
-/// 用户也可手动在 `core/` 目录运行 `cargo run --bin ftcore-cli daemon`。
+/// 用户也可手动在 `core/` 目录运行 `cargo run --bin kitefile-cli daemon`。
 ///
 /// 跨平台策略：
 /// - Windows / macOS：window_manager 控制窗口
@@ -46,7 +46,7 @@ void main() async {
     // 系统通知（Windows toast）：窗口隐藏时来文件提醒
     try {
       await localNotifier.setup(
-        appName: 'FTCore',
+        appName: 'KiteFile',
         shortcutPolicy: ShortcutPolicy.requireCreate,
       );
     } catch (e) {
@@ -55,7 +55,7 @@ void main() async {
     WindowOptions windowOptions = const WindowOptions(
       size: Size(900, 700),
       minimumSize: Size(500, 400),
-      title: 'FTCore',
+      title: 'KiteFile',
     );
     windowManager.waitUntilReadyToShow(windowOptions, () async {
       // 不拦截的话点 × 窗口直接没了，onWindowClose 里的「进托盘/完全退出」弹窗根本弹不出来
@@ -70,7 +70,7 @@ void main() async {
   // 托盘图标常驻（隐藏图标区），窗口关掉后仍可唤起 / 完全退出
   trayService.init();
 
-  runApp(const FTCoreApp());
+  runApp(const KiteFileApp());
 }
 
 /// 系统托盘：窗口隐藏后仍驻留，可唤起主界面或完全退出（含守护进程）
@@ -84,7 +84,7 @@ class TrayService with TrayListener {
     try {
       final iconPath = await _extractIcon();
       await trayManager.setIcon(iconPath);
-      await trayManager.setToolTip('FTCore - 局域网文件传输');
+      await trayManager.setToolTip('KiteFile - 局域网文件传输');
       await trayManager.setContextMenu(Menu(items: [
         MenuItem(key: 'show_window', label: '显示主界面'),
         MenuItem.separator(),
@@ -100,7 +100,7 @@ class TrayService with TrayListener {
   Future<String> _extractIcon() async {
     final data = await rootBundle.load('assets/tray_icon.ico');
     final f = File(
-        '${Directory.systemTemp.path}${Platform.pathSeparator}ftcore_tray_icon.ico');
+        '${Directory.systemTemp.path}${Platform.pathSeparator}kitefile_tray_icon.ico');
     await f.writeAsBytes(data.buffer.asUint8List(), flush: true);
     return f.path;
   }
@@ -170,7 +170,7 @@ Future<void> bringAppToForeground() async {
 /// 职责：
 /// - 启动时逐个探测 `kGatewayPortCandidates` 上 /api/whoami 是否响应
 ///   - 已响应：说明已有 daemon（用户手动启过 / 上次未退出），直接复用
-///   - 未响应：spawn 一个 ftcore-cli.exe daemon 子进程
+///   - 未响应：spawn 一个 kitefile-cli.exe daemon 子进程
 /// - 子进程用 detached 模式：UI 崩溃不会拖死 daemon，正在传的文件不会断
 /// - 「完全退出」时才 kill 子进程；「最小化到托盘」只藏窗口，daemon 继续跑
 class DaemonManager {
@@ -192,10 +192,10 @@ class DaemonManager {
       return;
     }
 
-    // 2. 没在跑 → 找 ftcore-cli.exe 并 spawn
+    // 2. 没在跑 → 找 kitefile-cli.exe 并 spawn
     final exePath = await _findDaemonExe();
     if (exePath == null) {
-      debugPrint('[DaemonManager] ftcore-cli.exe 未找到，请将 dist/windows/ 一起分发');
+      debugPrint('[DaemonManager] kitefile-cli.exe 未找到，请将 dist/windows/ 一起分发');
       return;
     }
 
@@ -264,7 +264,7 @@ class DaemonManager {
     return false;
   }
 
-  /// 查找 ftcore-cli.exe 路径
+  /// 查找 kitefile-cli.exe 路径
   /// 1. 与本程序同目录（dist/windows/ 部署模式）
   /// 2. 开发模式：相对路径到 core/target/release/
   /// 3. 开发模式：core/target/debug/
@@ -272,15 +272,15 @@ class DaemonManager {
     final exeDir = File(Platform.resolvedExecutable).parent;
     final candidates = <String>[
       // 1. 与 desktop exe 同目录（生产部署：dist/windows/）
-      '${exeDir.path}${Platform.pathSeparator}ftcore-cli.exe',
+      '${exeDir.path}${Platform.pathSeparator}kitefile-cli.exe',
       // 2. 开发模式：desktop/build/... 上溯 5 级到 filetransfer/core/target/release/
       //    （不依赖绝对路径，仓库放任意盘符都能找到）
       for (var d = exeDir; d.path.length > 3; d = d.parent)
-        '${d.path}${Platform.pathSeparator}core${Platform.pathSeparator}target${Platform.pathSeparator}release${Platform.pathSeparator}ftcore-cli.exe',
+        '${d.path}${Platform.pathSeparator}core${Platform.pathSeparator}target${Platform.pathSeparator}release${Platform.pathSeparator}kitefile-cli.exe',
       for (var d = exeDir; d.path.length > 3; d = d.parent)
-        '${d.path}${Platform.pathSeparator}core${Platform.pathSeparator}target${Platform.pathSeparator}debug${Platform.pathSeparator}ftcore-cli.exe',
+        '${d.path}${Platform.pathSeparator}core${Platform.pathSeparator}target${Platform.pathSeparator}debug${Platform.pathSeparator}kitefile-cli.exe',
       // 3. 同目录上一级（备选）
-      '${exeDir.parent.path}${Platform.pathSeparator}ftcore-cli.exe',
+      '${exeDir.parent.path}${Platform.pathSeparator}kitefile-cli.exe',
     ];
     for (final p in candidates) {
       final f = File(p);
@@ -292,13 +292,13 @@ class DaemonManager {
   }
 }
 
-class FTCoreApp extends StatelessWidget {
-  const FTCoreApp({super.key});
+class KiteFileApp extends StatelessWidget {
+  const KiteFileApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'FTCore',
+      title: 'KiteFile',
       theme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.dark,
@@ -554,7 +554,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
       context: context,
       barrierDismissible: false,
       builder: (_) => AlertDialog(
-        title: const Text('关闭 FTCore'),
+        title: const Text('关闭 KiteFile'),
         content: const Text(
           '· 选「最小化到托盘」：窗口隐藏、守护进程后台接收；\n'
           '  其他设备仍能发现本机并传文件，来文件会弹系统通知。\n\n'
@@ -579,7 +579,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
   void _notifyTrayResident() {
     try {
       final n = LocalNotification(
-        title: 'FTCore 仍在后台运行',
+        title: 'KiteFile 仍在后台运行',
         body: '已最小化到系统托盘（隐藏图标区）。点击通知或托盘图标可打开主界面。',
       );
       n.onClick = bringAppToForeground;
@@ -597,7 +597,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
       if (visible && !minimized) return;
       final n = LocalNotification(
         title: '${entry.fromName} 想发送文件',
-        body: '${entry.fileName}（${formatBytes(entry.fileSize)}）\n点击打开 FTCore 接收',
+        body: '${entry.fileName}（${formatBytes(entry.fileSize)}）\n点击打开 KiteFile 接收',
       );
       n.onClick = bringAppToForeground;
       n.show();
@@ -614,7 +614,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
       if (visible && !minimized) return;
       final n = LocalNotification(
         title: '已接收 ${p.fileName}',
-        body: '点击打开 FTCore 查看',
+        body: '点击打开 KiteFile 查看',
       );
       n.onClick = bringAppToForeground;
       n.show();
@@ -1160,7 +1160,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  '默认：系统 Downloads/ftcore/。更改后，之后接收的文件将保存到新位置。',
+                  '默认：系统 Downloads/kitefile/。更改后，之后接收的文件将保存到新位置。',
                   style: const TextStyle(fontSize: 12, color: Colors.grey),
                 ),
               ],
@@ -1219,7 +1219,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('FTCore'),
+        title: const Text('KiteFile'),
         actions: [
           IconButton(
             icon: const Icon(Icons.settings_outlined),
@@ -1272,7 +1272,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
             Text('本机', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
             if (_me == null)
-              const Text('正在拉起守护进程… 若持续未就绪，请检查 ftcore-cli.exe 是否在程序目录。')
+              const Text('正在拉起守护进程… 若持续未就绪，请检查 kitefile-cli.exe 是否在程序目录。')
             else
               Wrap(
                 spacing: 16,

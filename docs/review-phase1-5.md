@@ -1,7 +1,7 @@
-# FTCore 修复方案（阶段 1-5）审查意见
+# KiteFile 修复方案（阶段 1-5）审查意见
 
 审查日期：2026-09-03
-审查对象：构建者出具的《FTCore 修复方案（定稿）》阶段 1-5
+审查对象：构建者出具的《KiteFile 修复方案（定稿）》阶段 1-5
 审查方式：逐条核实源码证据，不采信方案中的自述结论
 
 ---
@@ -229,7 +229,7 @@ AES-GCM 在同一密钥下重用 nonce，会泄露认证子密钥 H，攻击者�
 
 **方案原文**
 
-- 5b：`key = HKDF(pairing_token, salt = transfer 的 file_id, info = "ftcore-data")`
+- 5b：`key = HKDF(pairing_token, salt = transfer 的 file_id, info = "kitefile-data")`
 - 4：续传身份识别用 `(file_name, file_size, chunk_size)`，接收方检查已存在的 .part
 
 **根因**
@@ -258,7 +258,7 @@ AES-GCM 在同一密钥下重用 nonce，会泄露认证子密钥 H，攻击者�
 
 **方案原文**
 
-> 每设备一个持久 token（32 字节随机，存 .ftcore-identity，和 device id/name 同文件）
+> 每设备一个持久 token（32 字节随机，存 .kitefile-identity，和 device id/name 同文件）
 > 「取消信任」按钮：清掉一条记录，下次对方来连重新走配对弹窗
 
 **根因**

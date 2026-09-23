@@ -252,29 +252,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ftcore"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "futures-util",
- "if-addrs",
- "mdns-sd",
- "parking_lot",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "futures-channel"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -463,6 +440,29 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kitefile"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "futures-util",
+ "if-addrs",
+ "mdns-sd",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

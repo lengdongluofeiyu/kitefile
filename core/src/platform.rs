@@ -47,30 +47,30 @@ pub fn default_receive_dir() -> std::path::PathBuf {
     #[cfg(target_os = "android")]
     {
         // Android：使用应用专属外部存储
-        std::path::PathBuf::from("/sdcard/Download/ftcore")
+        std::path::PathBuf::from("/sdcard/Download/kitefile")
     }
     #[cfg(target_os = "ios")]
     {
         // iOS：使用 Documents（sandboxed）
-        std::path::PathBuf::from("Documents/ftcore")
+        std::path::PathBuf::from("Documents/kitefile")
     }
     #[cfg(target_os = "macos")]
     {
         std::env::var("HOME")
-            .map(|h| std::path::PathBuf::from(h).join("Downloads/ftcore"))
-            .unwrap_or_else(|_| std::path::PathBuf::from("ftcore"))
+            .map(|h| std::path::PathBuf::from(h).join("Downloads/kitefile"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("kitefile"))
     }
     #[cfg(target_os = "windows")]
     {
         std::env::var("USERPROFILE")
-            .map(|h| std::path::PathBuf::from(h).join("Downloads/ftcore"))
-            .unwrap_or_else(|_| std::path::PathBuf::from("ftcore"))
+            .map(|h| std::path::PathBuf::from(h).join("Downloads/kitefile"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("kitefile"))
     }
     #[cfg(target_os = "linux")]
     {
         std::env::var("HOME")
-            .map(|h| std::path::PathBuf::from(h).join("Downloads/ftcore"))
-            .unwrap_or_else(|_| std::path::PathBuf::from("ftcore"))
+            .map(|h| std::path::PathBuf::from(h).join("Downloads/kitefile"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("kitefile"))
     }
     #[cfg(not(any(
         target_os = "windows",
@@ -80,7 +80,7 @@ pub fn default_receive_dir() -> std::path::PathBuf {
         target_os = "linux"
     )))]
     {
-        std::path::PathBuf::from("ftcore")
+        std::path::PathBuf::from("kitefile")
     }
 }
 

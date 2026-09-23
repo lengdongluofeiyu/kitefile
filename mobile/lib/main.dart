@@ -10,7 +10,7 @@ import 'package:flutter/services.dart';
 import 'ffi.dart';
 
 /// Android 原生方法通道（打开文件 / 存储权限）
-const MethodChannel _nativeChannel = MethodChannel('ftcore/native');
+const MethodChannel _nativeChannel = MethodChannel('kitefile/native');
 
 /// 用系统默认应用打开文件（ACTION_VIEW + FileProvider）
 ///
@@ -28,25 +28,25 @@ Future<String?> openFileNative(String path) async {
   }
 }
 
-/// FTCore 移动端（Android / iOS）
+/// KiteFile 移动端（Android / iOS）
 ///
 /// 架构：
-/// - Android：App 启动时通过 FFI（libftcore.so）在本进程内拉起 Rust daemon，
+/// - Android：App 启动时通过 FFI（libkitefile.so）在本进程内拉起 Rust daemon，
 ///   Dart UI 统一走 HTTP/WS 调用 127.0.0.1:7878 —— 手机是平等的传输节点。
 /// - 远程模式：设置弹窗切换到对端 IP，可当“遥控器”控制远端 daemon（开发调试用）。
 /// - iOS：daemon 嵌入预留（接口一致）。
 
 void main() {
-  runApp(const FTCoreApp());
+  runApp(const KiteFileApp());
 }
 
-class FTCoreApp extends StatelessWidget {
-  const FTCoreApp({super.key});
+class KiteFileApp extends StatelessWidget {
+  const KiteFileApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'FTCore',
+      title: 'KiteFile',
       theme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.dark,
@@ -289,12 +289,12 @@ class _HomePageState extends State<HomePage> {
       final ok = await initFtcoreDaemon();
       if (kDebugMode) {
         // ignore: avoid_print
-        print('[ftcore] embedded daemon init: $ok');
+        print('[kitefile] embedded daemon init: $ok');
       }
     } catch (e) {
       if (kDebugMode) {
         // ignore: avoid_print
-        print('[ftcore] embedded daemon failed: $e');
+        print('[kitefile] embedded daemon failed: $e');
       }
     }
     await _initDaemon();
@@ -682,7 +682,7 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('FTCore'),
+        title: const Text('KiteFile'),
         actions: [
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12),

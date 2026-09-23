@@ -46,7 +46,7 @@ scripts/    构建脚本
 
 产物：
 
-- `dist/windows/ftcore_desktop.exe`（旁路 `ftcore-cli.exe` / `ftcore.dll`）
+- `dist/windows/kitefile_desktop.exe`（旁路 `kitefile-cli.exe` / `kitefile.dll`）
 - `dist/android/app-release.apk`
 
 ### 手动构建
@@ -59,7 +59,7 @@ cargo build --release
 
 # Android arm64（先配好 ANDROID_NDK_HOME 或 core/.cargo/config.toml）
 cargo build --release --target aarch64-linux-android
-cp target/aarch64-linux-android/release/libftcore.so \
+cp target/aarch64-linux-android/release/libkitefile.so \
   ../mobile/android/app/src/main/jniLibs/arm64-v8a/
 
 # 桌面端
@@ -96,7 +96,7 @@ cd ../mobile && flutter pub get && flutter build apk --release
 │  设备 A    │◄─────────►│  设备 B    │
 │ Flutter UI │           │ Flutter UI │
 │     ▼      │           │     ▲      │
-│ ftcore-cli │  HTTP 握手 │ ftcore-cli │
+│ kitefile-cli │  HTTP 握手 │ kitefile-cli │
 │  (daemon)  │◄─────────►│  (daemon)  │
 │     ▼      │           │     ▲      │
 │  N 路 TCP  │──────────►│  流式落盘  │
