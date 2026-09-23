@@ -1,8 +1,8 @@
-# Sparrow
+# KiteFile
 
-> 麻雀传信 —— 局域网秒传文件。Windows / Android，免数据线、免中转服务器。
+> 轻如风筝的局域网文件传输。Windows / Android，免数据线、免中转服务器。
 
-Sparrow 在同一局域网内通过 **mDNS 发现 + 多路 TCP 直传** 互传文件，数据不出网关。
+KiteFile 在同一局域网内通过 **mDNS 发现 + 多路 TCP 直传** 互传文件，数据不出网关。
 
 ## 特性
 
@@ -85,7 +85,7 @@ cd ../mobile && flutter pub get && flutter build apk --release
 ## 使用
 
 1. 两台设备装好客户端，连同一 Wi-Fi / 有线局域网
-2. 打开 Sparrow，设备列表会自动出现对端
+2. 打开 KiteFile，设备列表会自动出现对端
 3. 点发送 → 选文件 → 对端确认（默认 60 秒内）
 4. 桌面端点 **×** 可「最小化到托盘」，后台仍可接收；系统通知可点回主界面
 
