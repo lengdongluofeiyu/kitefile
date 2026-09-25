@@ -1,3 +1,8 @@
+> **⚠️ 历史设计文档（已被取代）**：本文中的停等 / chunk ACK 传输模型已于
+> 提交 `341f63c` 废弃——现行实现是「多流 TCP 顺序写、无分块 ACK、整文件
+> sha256 传完后经 /api/verify 补发」。以 `core/src/transfer.rs` 注释与
+> `docs/repair-plan-reliability.md` 为准；保留本文仅作历史决策记录。
+
 # 阶段 4 · 错误恢复模型设计（已评审定案）
 
 > 本文是方案 `plan-phase1-5-final.md` 阶段 4 的**前置设计**。

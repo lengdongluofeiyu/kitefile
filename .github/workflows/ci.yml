@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# SDK 版本钉死（工作流 D）：Flutter 与本地开发一致（3.44.2-stable），
+# Rust 用 stable；Android targetSdk/compileSdk 在 build.gradle.kts 内钉死。
+env:
+  FLUTTER_VERSION: "3.44.2"
+
 jobs:
   core:
     name: Rust core
@@ -25,19 +30,113 @@ jobs:
           FTCORE_TEST_TMP: ${{ runner.temp }}
 
   analyze:
-    name: Flutter analyze
+    name: Flutter analyze + test
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        module: [desktop, mobile]
+        # packages/kitefile_shared：工作流 C 的共享业务层（双端唯一源）
+        module: [desktop, mobile, packages/kitefile_shared]
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
       - name: Pub get
         working-directory: ${{ matrix.module }}
         run: flutter pub get
       - name: Analyze
         working-directory: ${{ matrix.module }}
         run: flutter analyze
+      - name: Test
+        working-directory: ${{ matrix.module }}
+        run: flutter test
+
+  build-windows:
+    name: Windows 桌面构建 + daemon 冒烟
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - name: Pub get
+        working-directory: desktop
+        run: flutter pub get
+      - name: Build Windows
+        working-directory: desktop
+        run: flutter build windows --release
+      - name: Build daemon（冒烟用）
+        working-directory: core
+        run: cargo build --release --bin kitefile-cli
+      - name: daemon 启动冒烟（whoami 200 即通过）
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath "core\target\release\kitefile-cli.exe" `
+            -ArgumentList "daemon" -PassThru `
+            -RedirectStandardOutput "daemon.log" `
+            -RedirectStandardError "daemon.err.log"
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            try {
+              $r = Invoke-WebRequest -UseBasicParsing `
+                -Uri "http://127.0.0.1:7878/api/whoami" -TimeoutSec 2
+              if ($r.StatusCode -eq 200) { $ok = $true; break }
+            } catch { Start-Sleep -Milliseconds 500 }
+          }
+          if (-not $ok) {
+            Write-Host "::error::daemon 冒烟失败：whoami 30s 内未就绪"
+            if (Test-Path daemon.log) { Get-Content daemon.log }
+            if (Test-Path daemon.err.log) { Get-Content daemon.err.log }
+            exit 1
+          }
+          Write-Host "daemon 冒烟通过"
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+
+  build-android:
+    name: Android APK（arm64）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Rust core Android arm64
+        working-directory: core
+        run: |
+          if [ -n "$ANDROID_NDK_ROOT" ] && [ -d "$ANDROID_NDK_ROOT" ]; then
+            NDK="$ANDROID_NDK_ROOT"
+          else
+            NDK="$(ls -d "$ANDROID_HOME/ndk"/* | sort -V | tail -n1)"
+          fi
+          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          test -f "$CLANG"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CLANG" >> "$GITHUB_ENV"
+          cargo build --release --target aarch64-linux-android
+      - name: 同步 jniLibs
+        run: cp core/target/aarch64-linux-android/release/libkitefile.so mobile/android/app/src/main/jniLibs/arm64-v8a/
+      - name: Build APK
+        working-directory: mobile
+        run: |
+          flutter pub get
+          flutter build apk --release
+      - name: 上传 APK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: kitefile-android-arm64
+          path: mobile/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error

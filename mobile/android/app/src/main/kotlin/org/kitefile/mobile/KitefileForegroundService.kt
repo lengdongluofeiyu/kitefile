@@ -1,4 +1,4 @@
-package com.example.kitefile_mobile
+package org.kitefile.mobile
 
 import android.app.Notification
 import android.app.NotificationChannel

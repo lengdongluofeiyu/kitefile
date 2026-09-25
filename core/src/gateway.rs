@@ -437,9 +437,9 @@ async fn peer_resumed(
     StatusCode::OK
 }
 
-/// POST /api/verify/:file_id —— 发送方在全部 chunk ACK 后补发整文件 sha256。
+/// POST /api/verify/:file_id —— 发送方在**全部数据流发送完成后**补发整文件 sha256。
 ///
-/// 接收方据此做最终校验并 finalize（sha256 边传边算，offer 不再携带哈希，
+/// 接收方据此做最终校验并 finalize（sha256 传完再算，offer 不携带哈希，
 /// 大文件弹窗即时出现）。body: {"sha256": "<hex>" 或 null}
 #[derive(Debug, Deserialize)]
 struct VerifyRequest {

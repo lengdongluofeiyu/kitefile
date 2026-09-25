@@ -7,12 +7,15 @@
     <!-- 传输中前台保活（A3.7）：进程内 daemon 被杀 = 传输中断 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
-    <!-- 自定义保存位置到公共目录（如 /sdcard/Download）时需要 -->
+    <!-- 自定义保存位置到公共目录（如 /sdcard/Download）时需要：
+         默认接收目录是应用专属外部存储（无需任何存储权限），
+         仅当用户在设置里显式切换到公共目录才走「所有文件访问」授权页。
+         WRITE 仅覆盖 API ≤ 29 的旧设备（30+ 由 MANAGE 覆盖）；
+         READ 已移除（工作流 D 权限最小化：MANAGE/应用专属目录均不需要）。 -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>
     <application
-        android:label="kitefile_mobile"
+        android:label="KiteFile"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true">

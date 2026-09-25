@@ -1,3 +1,8 @@
+> **⚠️ 历史设计文档（已被取代）**：本文中的停等 / chunk ACK 传输模型已于
+> 提交 `341f63c` 废弃——现行实现是「多流 TCP 顺序写、无分块 ACK、整文件
+> sha256 传完后经 /api/verify 补发」。以 `core/src/transfer.rs` 注释与
+> `docs/repair-plan-reliability.md` 为准；保留本文仅作历史决策记录。
+
 # KiteFile 修复方案（第三轮定稿）
 
 日期：2026-09-03

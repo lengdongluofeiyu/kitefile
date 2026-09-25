@@ -1,4 +1,4 @@
-package com.example.kitefile_mobile
+package org.kitefile.mobile
 
 import android.content.ActivityNotFoundException
 import android.content.Intent
