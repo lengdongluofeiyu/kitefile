@@ -24,6 +24,9 @@ use crate::discovery::DiscoveryService;
 /// FFI 上下文句柄（不透明指针）
 pub struct FfiContext {
     pub runtime_handle: tokio::runtime::Handle,
+    /// 进程内 tokio 运行时：shutdown 时随上下文一起丢弃，
+    /// 从而中止 gateway / receiver / discovery 等 spawn 出去的任务。
+    pub runtime: tokio::runtime::Runtime,
     pub discovery: Arc<DiscoveryService>,
     pub transfer: Arc<TransferEngine>,
     pub config: Arc<EngineConfig>,
@@ -33,10 +36,12 @@ pub struct FfiContext {
 //
 // 用 Mutex 而不是 `static mut`：后者在多线程下读写是数据竞争（Rust 2024 起
 // 连"取一个共享引用"都会告警），而守护进程里的 gateway 线程与调用方线程
-// 会同时碰这个变量。OnceLock 在这里不适用——`kitefile_shutdown` 需要把它置回
-// None，而 OnceLock 只能写一次。
+// 会同时碰这个变量。
+//
+// **没有 OnceLock 门闩**（A3.7）：init/shutdown 必须对称——shutdown 把槽位置回
+// None 后，下一次 init 要能完整重建上下文。OnceLock「只准写一次」会让
+// 二次 init 永远拿不到新上下文（daemon 起不来），已删除。
 static CONTEXT: Mutex<Option<Arc<FfiContext>>> = Mutex::new(None);
-static INIT_LOCK: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 /// 取锁，被毒化时也照常使用里面的数据。
 ///
@@ -65,6 +70,9 @@ fn store(ptr_slot: &'static Mutex<Option<CString>>, s: CString) -> *const c_char
 ///   /storage/emulated/0/Android/data/<pkg>/files/kitefile，无需存储权限）
 /// 返回 0 表示成功，-1 表示失败。
 ///
+/// **对称性（A3.7）**：已初始化时幂等返回 0；`kitefile_shutdown` 之后
+/// 槽位为空，本函数可完整重建上下文（不再有「只准写一次」的全局门闩）。
+///
 /// # Safety
 /// `device_name` / `receive_dir` 必须是合法的 C 字符串（可为 null）
 #[no_mangle]
@@ -72,142 +80,137 @@ pub unsafe extern "C" fn kitefile_init(
     device_name: *const c_char,
     receive_dir: *const c_char,
 ) -> i32 {
-    INIT_LOCK.get_or_init(|| {
-        let device_name = if device_name.is_null() {
-            None
-        } else {
-            CStr::from_ptr(device_name).to_str().ok().map(String::from)
-        };
-        let receive_dir = if receive_dir.is_null() {
-            None
-        } else {
-            CStr::from_ptr(receive_dir).to_str().ok().map(String::from)
-        };
+    // 幂等：已在运行直接成功（重复 init 不重建、不报错）
+    if lock(&CONTEXT).is_some() {
+        return 0;
+    }
 
-        let mut config = EngineConfig::default();
-        if let Some(name) = device_name {
-            config.device_name = name;
+    let device_name = if device_name.is_null() {
+        None
+    } else {
+        CStr::from_ptr(device_name).to_str().ok().map(String::from)
+    };
+    let receive_dir = if receive_dir.is_null() {
+        None
+    } else {
+        CStr::from_ptr(receive_dir).to_str().ok().map(String::from)
+    };
+
+    let mut config = EngineConfig::default();
+    if let Some(name) = device_name {
+        config.device_name = name;
+    }
+    if let Some(dir) = receive_dir {
+        config.receive_dir = std::path::PathBuf::from(dir);
+    }
+
+    let runtime = match Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!("failed to create runtime: {}", e);
+            return -1;
         }
-        if let Some(dir) = receive_dir {
-            config.receive_dir = std::path::PathBuf::from(dir);
+    };
+    let runtime_handle = runtime.handle().clone();
+
+    // 端口退避。必须在构造 discovery / transfer **之前**定下来：
+    // mDNS 的 TXT 会把实际端口广播出去，对端靠它建连，所以这里改端口
+    // 对端依然能正确发现；反过来若先按 7878 注册 mDNS、再发现绑不上，
+    // 对端就会拿着一个错误的端口去连。
+    //
+    // 为什么要退避：Windows 上 Hyper-V / WSL / Docker 会动态保留成片 TCP
+    // 端口，7878 可能正好落在保留区，bind 失败报 os error 10013，
+    // 且保留区间每次开机都可能变 —— 症状是 daemon 间歇性起不来。
+    if let Some(p) = crate::pick_available_port(crate::GATEWAY_PORT_CANDIDATES) {
+        if p != config.gateway_port {
+            warn!(from = config.gateway_port, to = p, "gateway port unavailable, fell back");
+            config.gateway_port = p;
         }
-
-        let runtime = match Runtime::new() {
-            Ok(rt) => rt,
-            Err(e) => {
-                error!("failed to create runtime: {}", e);
-                return;
-            }
-        };
-        let runtime_handle = runtime.handle().clone();
-
-        // 端口退避。必须在构造 discovery / transfer **之前**定下来：
-        // mDNS 的 TXT 会把实际端口广播出去，对端靠它建连，所以这里改端口
-        // 对端依然能正确发现；反过来若先按 7878 注册 mDNS、再发现绑不上，
-        // 对端就会拿着一个错误的端口去连。
-        //
-        // 为什么要退避：Windows 上 Hyper-V / WSL / Docker 会动态保留成片 TCP
-        // 端口，7878 可能正好落在保留区，bind 失败报 os error 10013，
-        // 且保留区间每次开机都可能变 —— 症状是 daemon 间歇性起不来。
-        if let Some(p) = crate::pick_available_port(crate::GATEWAY_PORT_CANDIDATES) {
-            if p != config.gateway_port {
-                warn!(from = config.gateway_port, to = p, "gateway port unavailable, fell back");
-                config.gateway_port = p;
-            }
-        } else {
-            warn!("no gateway port available; will try default and likely fail");
+    } else {
+        warn!("no gateway port available; will try default and likely fail");
+    }
+    if let Some(p) = crate::pick_available_port(crate::TRANSFER_PORT_CANDIDATES) {
+        if p != config.transfer_port {
+            warn!(from = config.transfer_port, to = p, "transfer port unavailable, fell back");
+            config.transfer_port = p;
         }
-        if let Some(p) = crate::pick_available_port(crate::TRANSFER_PORT_CANDIDATES) {
-            if p != config.transfer_port {
-                warn!(from = config.transfer_port, to = p, "transfer port unavailable, fell back");
-                config.transfer_port = p;
-            }
-        } else {
-            warn!("no transfer port available; will try default and likely fail");
+    } else {
+        warn!("no transfer port available; will try default and likely fail");
+    }
+
+    // 身份持久化：id/名称复用上次的，重启后 mDNS 注册同一服务实例，
+    // 对端设备表按 id 覆盖同一条记录（否则每次重启都被当成“新设备”）
+    let identity = crate::discovery::load_or_create_identity(
+        &config.receive_dir,
+        &config.device_name,
+    );
+    config.device_name = identity.name.clone();
+    let self_id = identity.id;
+    let identity_path =
+        Some(crate::discovery::identity_marker_path(&config.receive_dir));
+
+    let discovery = match DiscoveryService::new(
+        config.device_name.clone(),
+        self_id.clone(),
+        config.gateway_port,
+        config.transfer_port,
+        identity_path.clone(),
+    ) {
+        Ok(d) => Arc::new(d),
+        Err(e) => {
+            // mDNS 不可用（如组播被路由器/系统限制）不阻塞引擎：
+            // 降级为离线模式，传输与网关功能照常
+            warn!("discovery init failed, fallback to offline mode: {}", e);
+            Arc::new(DiscoveryService::new_offline(
+                config.device_name.clone(),
+                self_id,
+                identity_path,
+            ))
         }
+    };
 
-        // 身份持久化：id/名称复用上次的，重启后 mDNS 注册同一服务实例，
-        // 对端设备表按 id 覆盖同一条记录（否则每次重启都被当成“新设备”）
-        let identity = crate::discovery::load_or_create_identity(
-            &config.receive_dir,
-            &config.device_name,
-        );
-        config.device_name = identity.name.clone();
-        let self_id = identity.id;
-        let identity_path =
-            Some(crate::discovery::identity_marker_path(&config.receive_dir));
+    let transfer = Arc::new(TransferEngine::new(
+        config.transfer_port,
+        config.parallel_streams,
+        config.receive_dir.clone(),
+    ));
 
-        let discovery = match DiscoveryService::new(
-            config.device_name.clone(),
-            self_id.clone(),
-            config.gateway_port,
-            config.transfer_port,
-            identity_path.clone(),
-        ) {
-            Ok(d) => Arc::new(d),
-            Err(e) => {
-                // mDNS 不可用（如组播被路由器/系统限制）不阻塞引擎：
-                // 降级为离线模式，传输与网关功能照常
-                warn!("discovery init failed, fallback to offline mode: {}", e);
-                Arc::new(DiscoveryService::new_offline(
-                    config.device_name.clone(),
-                    self_id,
-                    identity_path,
-                ))
-            }
-        };
-
-        let transfer = Arc::new(TransferEngine::new(
-            config.transfer_port,
-            config.parallel_streams,
-            config.receive_dir.clone(),
-        ));
-
-        let ctx = Arc::new(FfiContext {
-            runtime_handle: runtime_handle.clone(),
-            discovery,
-            transfer,
-            config: Arc::new(config),
-        });
-
-        // spawn 接收端
-        let ctx_clone = ctx.clone();
-        runtime_handle.spawn(async move {
-            if let Err(e) = ctx_clone.transfer.clone().spawn_receiver().await {
-                error!("receiver spawn failed: {}", e);
-            }
-        });
-
-        // spawn 发现事件循环
-        let handle = runtime_handle.clone();
-        let discovery_clone = ctx.discovery.clone();
-        runtime_handle.spawn(async move { discovery_clone.spawn_event_loop(handle) });
-
-        // spawn HTTP 网关
-        let ctx_clone = ctx.clone();
-        let port = ctx.config.gateway_port;
-        runtime_handle.spawn(async move {
-            let gateway = HttpGateway::new(
-                ctx_clone.discovery.clone(),
-                ctx_clone.transfer.clone(),
-                ctx_clone.config.clone(),
-            );
-            if let Err(e) = gateway.run(port).await {
-                error!("gateway run failed: {}", e);
-            }
-        });
-
-        // 保持 runtime 不被销毁
-        std::mem::forget(runtime);
-
-        *lock(&CONTEXT) = Some(ctx);
+    let ctx = Arc::new(FfiContext {
+        runtime_handle: runtime_handle.clone(),
+        runtime,
+        discovery,
+        transfer,
+        config: Arc::new(config),
     });
 
-    if lock(&CONTEXT).is_some() {
-        0
-    } else {
-        -1
-    }
+    // spawn 接收端：任务只持有 transfer（不持有 Arc<FfiContext>，
+    // 否则 shutdown 时上下文引用成环、runtime 永远放不掉）
+    let receiver_transfer = ctx.transfer.clone();
+    runtime_handle.spawn(async move {
+        if let Err(e) = receiver_transfer.clone().spawn_receiver().await {
+            error!("receiver spawn failed: {}", e);
+        }
+    });
+
+    // spawn 发现事件循环
+    let handle = runtime_handle.clone();
+    let discovery_clone = ctx.discovery.clone();
+    runtime_handle.spawn(async move { discovery_clone.spawn_event_loop(handle) });
+
+    // spawn HTTP 网关：同样只搬走所需 Arc，不搬 ctx
+    let gateway_discovery = ctx.discovery.clone();
+    let gateway_transfer = ctx.transfer.clone();
+    let gateway_config = ctx.config.clone();
+    let port = ctx.config.gateway_port;
+    runtime_handle.spawn(async move {
+        let gateway = HttpGateway::new(gateway_discovery, gateway_transfer, gateway_config);
+        if let Err(e) = gateway.run(port).await {
+            error!("gateway run failed: {}", e);
+        }
+    });
+
+    *lock(&CONTEXT) = Some(ctx);
+    0
 }
 
 /// 获取本机信息 JSON：{"id","name","platform","gateway_port","transfer_port"}
@@ -333,8 +336,62 @@ pub unsafe extern "C" fn kitefile_send_file(
     store(&LAST, CString::new(file_id).unwrap_or_default())
 }
 
-/// 释放引擎资源（应用退出时调用）
+/// 释放引擎资源（应用退出 / 重启 daemon 前调用）。
+///
+/// 对称性（A3.7）：
+/// - 丢弃上下文 → 随之丢弃进程内 tokio 运行时 → gateway / receiver /
+///   discovery 任务全部中止，监听端口释放；
+/// - 槽位置回 None，**之后可以再次 `kitefile_init`** 完整重建。
 #[no_mangle]
 pub unsafe extern "C" fn kitefile_shutdown() {
-    *lock(&CONTEXT) = None;
+    let ctx = lock(&CONTEXT).take();
+    if let Some(ctx) = ctx {
+        // 尽量走 shutdown_background：不等待 spawn_blocking（如哈希计算）
+        // 收尾，立即释放端口。失败（仍有并发 FFI 调用持有引用）时
+        // 随最后一个 Arc 丢弃触发 Runtime::drop，语义一致只是可能多等一会儿。
+        match Arc::try_unwrap(ctx) {
+            Ok(inner) => inner.runtime.shutdown_background(),
+            Err(_shared) => {
+                warn!("shutdown raced with in-flight FFI call; runtime will stop when last reference drops");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    /// A3.7：init / shutdown 对称。
+    /// - 首次 init 成功；已初始化时重复 init 幂等返回 0；
+    /// - shutdown 后可**再次 init**（回归点：旧实现用 OnceLock 门闩，
+    ///   shutdown 后二次 init 永远失败，daemon 起不来）。
+    #[test]
+    fn init_shutdown_init_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("kitefile-ffi-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cdir = CString::new(dir.to_string_lossy().as_bytes()).unwrap();
+
+        unsafe {
+            assert_eq!(
+                kitefile_init(std::ptr::null(), cdir.as_ptr()),
+                0,
+                "首次 init 应成功"
+            );
+            assert_eq!(
+                kitefile_init(std::ptr::null(), cdir.as_ptr()),
+                0,
+                "已初始化时重复 init 应幂等成功"
+            );
+            kitefile_shutdown();
+            assert_eq!(
+                kitefile_init(std::ptr::null(), cdir.as_ptr()),
+                0,
+                "shutdown 后必须能再次 init（对称性）"
+            );
+            kitefile_shutdown();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

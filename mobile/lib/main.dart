@@ -256,7 +256,7 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // 默认指向本机；用户可改成对端 IP
   String _daemonHost = '127.0.0.1';
   /// daemon 实际监听的网关端口。默认端口可能被系统保留（Android 上少见，
@@ -283,11 +283,39 @@ class _HomePageState extends State<HomePage> {
   WebSocket? _ws;
   Timer? _refreshTimer;
   bool _daemonOnline = false;
+  /// 前台保活服务当前是否已启动（A3.7；由进行中的传输驱动）
+  bool _keepAliveOn = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _bootstrap();
+  }
+
+  /// 应用生命周期（A3.7 手机存活）：
+  /// - resumed：回前台立即复核在线真值与实时通道（后台期间定时器/WS 回调
+  ///   可能被系统挂起，不能让徽标停在旧真值）；
+  /// - detached：对称关闭进程内 daemon（释放端口与任务，之后可再次 init）；
+  /// - paused/inactive：**不做假动作**——进程内 Rust 引擎照常传输，
+  ///   进度是真实状态；进程若被系统杀死，进度随内存清零，重启不会谎报仍在传。
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    switch (state) {
+      case AppLifecycleState.resumed:
+        _fetchWhoAmI();
+        if (_ws == null) _connectWs();
+        _refreshDevices();
+        _refreshReceivedFiles();
+        _refreshTransfers();
+        break;
+      case AppLifecycleState.detached:
+        shutdownFtcoreDaemon();
+        break;
+      default:
+        break;
+    }
   }
 
   /// 启动序列：
@@ -312,6 +340,7 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _ws?.close();
     _refreshTimer?.cancel();
     _hostController.dispose();
@@ -326,6 +355,7 @@ class _HomePageState extends State<HomePage> {
       _refreshReceiveDir();
       _refreshDevices();
       _refreshReceivedFiles();
+      _refreshTransfers();
       // 周期刷新同时复核 whoami：daemon 不可达后 3s 内徽标掉线（A3.6）
       _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
         _refreshDevices();
@@ -365,6 +395,42 @@ class _HomePageState extends State<HomePage> {
       final list = (jsonDecode(r) as List).cast<String>();
       if (mounted) setState(() => _receivedFiles = list);
     } catch (_) {}
+  }
+
+  /// 传输全量快照：daemon 缓存是权威状态（WS 断连期间的终态帧会丢，
+  /// 回前台时用它对齐，避免本地卡在「进行中」谎报）。
+  Future<void> _refreshTransfers() async {
+    try {
+      final r = await httpGet('$_httpBase/api/transfers');
+      final list = (jsonDecode(r) as Map<String, dynamic>)['transfers'] as List?;
+      if (list == null || !mounted) return;
+      setState(() {
+        for (final t in list) {
+          final p = TransferProgress.fromJson(t as Map<String, dynamic>);
+          if (p.fileId.isNotEmpty) _progress[p.fileId] = p;
+        }
+      });
+      _syncKeepAlive();
+    } catch (e) {
+      debugPrint('[kitefile] transfers snapshot failed: $e');
+    }
+  }
+
+  /// 前台保活联动（A3.7）：存在进行中的传输 → 启动原生前台服务；
+  /// 全部到终态（或只剩中断/取消/失败）→ 停止。
+  /// 失败仅打日志——保活是尽力而为，不阻断传输本身。
+  Future<void> _syncKeepAlive() async {
+    final active = _progress.values.any((p) =>
+        p.status == TransferStatus.inProgress ||
+        p.status == TransferStatus.pending);
+    if (active == _keepAliveOn) return;
+    _keepAliveOn = active;
+    try {
+      await _nativeChannel.invokeMethod(
+          active ? 'startTransferKeepAlive' : 'stopTransferKeepAlive');
+    } catch (e) {
+      debugPrint('[kitefile] keep-alive toggle($active) failed: $e');
+    }
   }
 
   Future<void> _reconnect(String host) async {
@@ -444,7 +510,10 @@ class _HomePageState extends State<HomePage> {
                 break;
               default:
                 final p = TransferProgress.fromJson(j);
-                if (mounted) setState(() => _progress[p.fileId] = p);
+                if (mounted) {
+                  setState(() => _progress[p.fileId] = p);
+                  _syncKeepAlive();
+                }
             }
           } catch (e) {
             debugPrint('[kitefile] ws message parse failed: $e');

@@ -4,6 +4,9 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
+    <!-- 传输中前台保活（A3.7）：进程内 daemon 被杀 = 传输中断 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
     <!-- 自定义保存位置到公共目录（如 /sdcard/Download）时需要 -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
@@ -35,6 +38,11 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- 传输中前台保活服务（A3.7）；仅在有进行中的传输时启动 -->
+        <service
+            android:name=".KitefileForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"/>
         <!-- 接收文件的“打开文件”功能：通过 FileProvider 分享只读 URI -->
         <provider
             android:name="androidx.core.content.FileProvider"

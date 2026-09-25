@@ -48,6 +48,25 @@ class MainActivity : FlutterActivity() {
                     // 不传的话 Rust 侧回退 USERNAME 环境变量——Android 上不存在，
                     // 默认名会变成 "device-xxxx" 这种无信息量的名字。
                     "getDeviceModel" -> result.success(android.os.Build.MODEL)
+                    // 传输中前台保活（A3.7）：有进行中的传输才启动/停止
+                    "startTransferKeepAlive" -> {
+                        try {
+                            val intent = Intent(this, KitefileForegroundService::class.java)
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                                startForegroundService(intent)
+                            } else {
+                                startService(intent)
+                            }
+                            result.success(true)
+                        } catch (e: Exception) {
+                            // 后台启动受限等场景：保活失败不阻断传输本身
+                            result.error("KEEP_ALIVE_FAILED", e.message, null)
+                        }
+                    }
+                    "stopTransferKeepAlive" -> {
+                        stopService(Intent(this, KitefileForegroundService::class.java))
+                        result.success(true)
+                    }
                     // 用系统默认应用打开接收到的文件（FileProvider 授权）
                     "openFile" -> {
                         val path = call.arguments as? String

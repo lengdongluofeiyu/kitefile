@@ -28,6 +28,10 @@ typedef _FtcoreInitDart = int Function(
   Pointer<Uint8> receiveDir,
 );
 
+// Rust: void kitefile_shutdown()
+typedef _FtcoreShutdownNative = Void Function();
+typedef _FtcoreShutdownDart = void Function();
+
 // libc malloc / free
 typedef _MallocNative = Pointer<Void> Function(IntPtr size);
 typedef _MallocDart = Pointer<Void> Function(int size);
@@ -100,5 +104,24 @@ Future<bool> initFtcoreDaemon({String? deviceName}) async {
   } finally {
     if (namePtr != nullptr) _free(namePtr.cast());
     if (dirPtr != nullptr) _free(dirPtr.cast());
+  }
+}
+
+/// 关闭进程内 Rust daemon（A3.7 对称生命周期）。
+///
+/// - 中止 gateway / 接收 / mDNS 任务并释放端口；
+/// - 之后可以再次 [`initFtcoreDaemon`] 完整重建（旧实现 shutdown 后无法二 init）。
+/// App 退出（detached）时调用；幂等，未初始化时是 no-op。
+Future<void> shutdownFtcoreDaemon() async {
+  if (!Platform.isAndroid) return;
+  try {
+    final lib = DynamicLibrary.open('libkitefile.so');
+    final shutdown = lib.lookupFunction<_FtcoreShutdownNative, _FtcoreShutdownDart>(
+      'kitefile_shutdown',
+    );
+    shutdown();
+  } catch (e) {
+    // ignore: avoid_print
+    print('[kitefile] embedded daemon shutdown failed: $e');
   }
 }
