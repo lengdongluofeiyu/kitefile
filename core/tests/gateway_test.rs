@@ -328,6 +328,52 @@ async fn test_resume_unknown_404() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 工作流 B：协议版本门槛——
+/// 携带不识别的版本 → 400 且**不注册** incoming；
+/// 携带当前版本 / 不携带版本（legacy 旧对端）→ 放行。
+#[tokio::test]
+async fn test_offer_version_gate() {
+    require_sockets!("test_offer_version_gate");
+    let dir = temp_dir("vergate");
+    let _ = start_stack(18051, 18151, &dir, 2).await;
+
+    // 版本不识别 → 400，不进待决定列表
+    let mut v = fake_offer("ver-bad", 10, 18151);
+    let mut offer: Value = serde_json::from_str(&v).unwrap();
+    offer["version"] = json!(9999);
+    v = offer.to_string();
+    let (status, _) = http(18051, "POST", "/api/incoming", Some(&v)).await;
+    assert_eq!(status, 400, "协议版本不识别必须直接拒绝");
+    let pending = http_json(18051, "GET", "/api/incoming", None).await;
+    assert_eq!(
+        pending.as_array().map(|a| a.len()),
+        Some(0),
+        "被拒绝的 offer 不得注册为待决定"
+    );
+
+    // 携带当前版本 → 200 注册
+    let mut offer: Value =
+        serde_json::from_str(&fake_offer("ver-ok", 10, 18151)).unwrap();
+    offer["version"] = json!(kitefile::protocol::PROTOCOL_VERSION);
+    let (status, _) = http(18051, "POST", "/api/incoming", Some(&offer.to_string())).await;
+    assert_eq!(status, 200);
+
+    // legacy 旧对端（无 version 字段）→ 放行
+    let (status, _) = http(
+        18051,
+        "POST",
+        "/api/incoming",
+        Some(&fake_offer("ver-legacy", 10, 18151)),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let pending = http_json(18051, "GET", "/api/incoming", None).await;
+    assert_eq!(pending.as_array().map(|a| a.len()), Some(2));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ============ incoming offer：登记 / 列表 / 接受 / 拒绝 ============
 
 fn fake_offer(file_id: &str, file_size: u64, from_gateway_port: u16) -> String {

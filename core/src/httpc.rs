@@ -59,6 +59,21 @@ pub async fn http_post_json_with(
     let body_start = response_str
         .find("\r\n\r\n")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no header/body sep"))?;
+
+    // 非 2xx 视为错误（工作流 B）：对端明确拒绝（协议版本不符、404 等）
+    // 必须让调用方看见，而不是把错误页当成功响应吞掉。
+    let status = response_str
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    if !(200..300).contains(&status) {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!("http status {}", status),
+        ));
+    }
     Ok(response_str[body_start + 4..].to_string())
 }
 

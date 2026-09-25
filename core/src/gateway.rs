@@ -585,7 +585,29 @@ struct IncomingAck {
 async fn incoming_offer(
     State(state): State<AppState>,
     Json(offer): Json<HttpOffer>,
-) -> Json<IncomingAck> {
+) -> Response {
+    // 协议版本门槛（工作流 B）：不识别的版本直接拒绝，不注册 incoming。
+    // 不携带版本的旧对端按 legacy 放行（Option 语义，见 HttpOffer::version）。
+    if let Some(v) = offer.version {
+        if v != crate::protocol::PROTOCOL_VERSION {
+            warn!(
+                file_id = %offer.file_id,
+                peer_version = v,
+                local_version = crate::protocol::PROTOCOL_VERSION,
+                "拒绝 offer：协议版本不匹配"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "protocol version mismatch: peer={}, local={}",
+                    v,
+                    crate::protocol::PROTOCOL_VERSION
+                ),
+            )
+                .into_response();
+        }
+    }
+
     let entry = state.transfer.incoming.register(offer);
     info!(incoming_id = %entry.incoming_id, file_id = %entry.file_id, "incoming offer registered");
 
@@ -648,6 +670,7 @@ async fn incoming_offer(
         pending: true,
         expires_in_seconds: crate::transfer::INCOMING_DECISION_TIMEOUT_SECS as u32,
     })
+    .into_response()
 }
 
 async fn list_incoming(State(state): State<AppState>) -> Json<Vec<IncomingEntry>> {

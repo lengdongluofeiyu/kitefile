@@ -147,6 +147,13 @@ pub struct HttpOffer {
     pub from_gateway_port: u16,
     /// 发送方 TCP transfer 端口（接收方回 Accept 后用，daemon 已知也行）
     pub from_transfer_port: u16,
+    /// 协议版本（[`PROTOCOL_VERSION`]）。接收方**门槛校验**（工作流 B）：
+    /// 版本不识别 → 直接 400 拒绝，不注册 incoming。
+    ///
+    /// `Option` + default：旧版本 offer 不携带该字段，按 legacy 兼容放行；
+    /// 携带但不等于本端版本 → 拒绝。
+    #[serde(default)]
+    pub version: Option<u32>,
 }
 
 /// 一次多选发送里，单个文件所属的批次信息。

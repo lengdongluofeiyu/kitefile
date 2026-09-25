@@ -59,6 +59,29 @@ class KiteFileApp extends StatelessWidget {
 
 // ============ 数据模型 ============
 
+// ---- JSON 安全解析助手（工作流 B：缺字段 / 错类型一律降级，禁止硬转崩溃）----
+
+/// JSON → int：null / 字符串数字 / 其它类型都安全降级。
+int _jsonInt(Object? v, [int fallback = 0]) {
+  if (v is num) return v.toInt();
+  if (v is String) return int.tryParse(v) ?? fallback;
+  return fallback;
+}
+
+/// JSON → int?：仅有效整数保留，其余降级 null。
+int? _jsonIntOrNull(Object? v) {
+  if (v is num) return v.toInt();
+  if (v is String) return int.tryParse(v);
+  return null;
+}
+
+/// JSON → String：非字符串（数字/null/对象）降级为 fallback。
+String _jsonStr(Object? v, [String fallback = '']) =>
+    v is String ? v : fallback;
+
+/// JSON → String?：仅字符串保留，其余降级 null。
+String? _jsonStrOrNull(Object? v) => v is String ? v : null;
+
 @immutable
 class Device {
   final String id;
@@ -77,12 +100,12 @@ class Device {
   });
 
   factory Device.fromJson(Map<String, dynamic> j) => Device(
-        id: j['id'] as String,
-        name: j['name'] as String,
-        ip: j['ip'] as String,
-        transferPort: (j['transfer_port'] as num).toInt(),
-        gatewayPort: (j['gateway_port'] as num).toInt(),
-        platform: j['platform'] as String,
+        id: _jsonStr(j['id']),
+        name: _jsonStr(j['name']),
+        ip: _jsonStr(j['ip']),
+        transferPort: _jsonInt(j['transfer_port'], 7879),
+        gatewayPort: _jsonInt(j['gateway_port'], 7878),
+        platform: _jsonStr(j['platform']),
       );
 }
 
@@ -102,11 +125,11 @@ class WhoAmI {
   });
 
   factory WhoAmI.fromJson(Map<String, dynamic> j) => WhoAmI(
-        id: j['id'] as String,
-        name: j['name'] as String,
-        platform: j['platform'] as String,
-        gatewayPort: (j['gateway_port'] as num).toInt(),
-        transferPort: (j['transfer_port'] as num).toInt(),
+        id: _jsonStr(j['id']),
+        name: _jsonStr(j['name']),
+        platform: _jsonStr(j['platform']),
+        gatewayPort: _jsonInt(j['gateway_port'], 7878),
+        transferPort: _jsonInt(j['transfer_port'], 7879),
       );
 }
 
@@ -170,18 +193,18 @@ class TransferProgress {
 
   /// 安全解析（工作流 B）：缺字段/错类型一律降级为安全默认，禁止硬转崩溃。
   factory TransferProgress.fromJson(Map<String, dynamic> j) => TransferProgress(
-        fileId: j['file_id'] as String? ?? '',
-        fileName: j['file_name'] as String? ?? '',
-        fileSize: ((j['file_size'] as num?) ?? 0).toInt(),
-        bytesTransferred: ((j['bytes_transferred'] as num?) ?? 0).toInt(),
-        chunksDone: ((j['chunks_done'] as num?) ?? 0).toInt(),
-        chunksTotal: ((j['chunks_total'] as num?) ?? 0).toInt(),
-        speedBps: ((j['speed_bps'] as num?) ?? 0).toInt(),
-        status: _parseStatus(j['status'] as String? ?? 'Pending'),
-        error: j['error'] as String?,
-        incoming: (j['incoming'] as bool?) ?? false,
-        filePath: j['file_path'] as String?,
-        retryNote: j['retry_note'] as String?,
+        fileId: _jsonStr(j['file_id']),
+        fileName: _jsonStr(j['file_name']),
+        fileSize: _jsonInt(j['file_size']),
+        bytesTransferred: _jsonInt(j['bytes_transferred']),
+        chunksDone: _jsonInt(j['chunks_done']),
+        chunksTotal: _jsonInt(j['chunks_total']),
+        speedBps: _jsonInt(j['speed_bps']),
+        status: _parseStatus(_jsonStr(j['status'], 'Pending')),
+        error: _jsonStrOrNull(j['error']),
+        incoming: j['incoming'] == true,
+        filePath: _jsonStrOrNull(j['file_path']),
+        retryNote: _jsonStrOrNull(j['retry_note']),
       );
 }
 
@@ -215,17 +238,17 @@ class IncomingEntry {
   });
 
   factory IncomingEntry.fromJson(Map<String, dynamic> j) => IncomingEntry(
-        incomingId: j['incoming_id'] as String,
-        fileId: j['file_id'] as String,
-        fileName: j['file_name'] as String,
-        fileSize: ((j['file_size'] as num?) ?? 0).toInt(),
-        sha256: j['sha256'] as String?,
-        fromId: j['from_id'] as String? ?? '',
-        fromName: j['from_name'] as String? ?? '',
-        fromIp: j['from_ip'] as String? ?? '',
-        batchId: j['batch_id'] as String?,
-        batchIndex: (j['batch_index'] as num?)?.toInt(),
-        batchTotal: (j['batch_total'] as num?)?.toInt(),
+        incomingId: _jsonStr(j['incoming_id']),
+        fileId: _jsonStr(j['file_id']),
+        fileName: _jsonStr(j['file_name']),
+        fileSize: _jsonInt(j['file_size']),
+        sha256: _jsonStrOrNull(j['sha256']),
+        fromId: _jsonStr(j['from_id']),
+        fromName: _jsonStr(j['from_name']),
+        fromIp: _jsonStr(j['from_ip']),
+        batchId: _jsonStrOrNull(j['batch_id']),
+        batchIndex: _jsonIntOrNull(j['batch_index']),
+        batchTotal: _jsonIntOrNull(j['batch_total']),
       );
 }
 
@@ -525,7 +548,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           if (mounted) setState(() => _daemonOnline = false);
           _ws = null;
           _fetchWhoAmI();
-          Future.delayed(const Duration(seconds: 5), _connectWs);
+          if (mounted) {
+            Future.delayed(const Duration(seconds: 5), () {
+              if (mounted) _connectWs();
+            });
+          }
         },
         onError: (Object e) {
           debugPrint('[kitefile] ws error: $e');
@@ -535,7 +562,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     } catch (e) {
       debugPrint('[kitefile] ws connect failed: $e');
       if (mounted) setState(() => _daemonOnline = false);
-      Future.delayed(const Duration(seconds: 5), _connectWs);
+      // mounted 保护：页面已销毁就不再重连（否则定时器泄漏/幽灵连接）
+      Future.delayed(const Duration(seconds: 5), () {
+        if (mounted) _connectWs();
+      });
     }
   }
 

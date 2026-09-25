@@ -1172,6 +1172,7 @@ impl TransferEngine {
                 batch_id: batch.as_ref().map(|b| b.batch_id.clone()),
                 batch_index: batch.as_ref().map(|b| b.index),
                 batch_total: batch.as_ref().map(|b| b.total),
+                version: Some(crate::protocol::PROTOCOL_VERSION),
             };
             let offer_json = match serde_json::to_string(&offer) {
                 Ok(s) => s,
@@ -2237,6 +2238,7 @@ mod tests {
             batch_id: batch.map(|b| b.0.to_string()),
             batch_index: batch.map(|b| b.1),
             batch_total: batch.map(|b| b.2),
+            version: Some(crate::protocol::PROTOCOL_VERSION),
         }
     }
 
