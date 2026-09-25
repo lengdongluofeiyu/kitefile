@@ -40,6 +40,7 @@
 //! （取不到时按非本机处理，会让本机 UI 全部 403）。
 
 use crate::discovery::DiscoveryService;
+use crate::httpc::http_post_json;
 use crate::protocol::{HttpIncomingResponse, HttpOffer, IncomingEntry, WsEvent};
 use crate::transfer::{TransferEngine, TransferProgress};
 use crate::{EngineConfig, Result};
@@ -59,8 +60,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tracing::{info, warn};
 
 #[derive(Clone)]
@@ -729,26 +728,4 @@ async fn ws_handler(
             },
         }
     }
-}
-
-/// 纯 TCP 实现 HTTP POST JSON
-///
-/// 不引入 reqwest/hyper，复用 tokio TcpStream
-async fn http_post_json(host: &str, port: u16, path: &str, body: &str) -> std::io::Result<String> {
-    let mut stream = TcpStream::connect((host, port)).await?;
-    let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path, host, port, body.len(), body
-    );
-    stream.write_all(req.as_bytes()).await?;
-    stream.flush().await?;
-
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
-
-    let response_str = String::from_utf8_lossy(&response);
-    let body_start = response_str
-        .find("\r\n\r\n")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no header/body sep"))?;
-    Ok(response_str[body_start + 4..].to_string())
 }

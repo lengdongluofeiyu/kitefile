@@ -16,6 +16,9 @@ pub mod storage;
 pub mod slot_meta;
 pub mod platform;
 pub mod ffi;
+pub mod timeouts;
+pub mod fault;
+pub mod httpc;
 
 pub use discovery::{Device, DeviceId, DiscoveryService};
 pub use transfer::{TransferEngine, TransferHandle, TransferProgress, TransferStatus};

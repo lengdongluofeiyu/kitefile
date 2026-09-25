@@ -17,10 +17,13 @@
 //! 跨平台实现：使用 `Seek + Read`，不依赖平台专属零拷贝 API。
 //! 后续可按平台用 cfg 切到 sendfile/TransmitFile 等优化。
 
+use crate::fault::{from_io, FailureKind, Phase, TransferFailure};
+use crate::httpc::http_post_json;
 use crate::protocol::{
     compute_stream_count, stream_layout, HttpIncomingResponse, HttpOffer, IncomingEntry, StreamHeader,
 };
 use crate::storage::StorageManager;
+use crate::timeouts::{with_connect_timeout, with_idle_timeout, IDLE_TIMEOUT};
 use crate::Result;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -573,13 +576,12 @@ impl TransferEngine {
     /// 服务一条数据流：读 [`StreamHeader`] → 流式落盘到对应偏移 → 标记该流完成。
     ///
     /// 一条连接只承载一段连续字节，没有分块 ACK。干净 EOF 且读满 `data_len` 即成功。
-    async fn serve_data_stream(self: Arc<Self>, mut stream: TcpStream) -> Result<()> {
+    /// 错误按 [`TransferFailure`] 分类返回（A3.4）：网络类可重试、协议/磁盘类不可重试。
+    async fn serve_data_stream(self: Arc<Self>, mut stream: TcpStream) -> std::result::Result<(), TransferFailure> {
         let mut header_buf = [0u8; StreamHeader::SIZE];
-        read_full(&mut stream, &mut header_buf)
-            .await
-            .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+        read_full(&mut stream, &mut header_buf, Phase::Recv).await?;
         let header = StreamHeader::from_bytes(&header_buf)
-            .map_err(|e| crate::CoreError::Transfer(format!("invalid stream header: {}", e)))?;
+            .map_err(|e| TransferFailure::protocol(format!("invalid stream header: {}", e)))?;
 
         let file_id = {
             let prefix = header.file_id_prefix;
@@ -587,8 +589,10 @@ impl TransferEngine {
             map.get(&prefix).cloned()
         };
         let Some(file_id) = file_id else {
+            // 槽位不存在：对端在未接受/已取消后仍发数据 → 协议违例，不可重试
+            // （对应状态机「resume 时槽位丢失 → Failed，禁止无限续」）
             warn!(prefix = header.file_id_prefix, "unknown file_id_prefix (no receive slot)");
-            return Err(crate::CoreError::Transfer(format!(
+            return Err(TransferFailure::protocol(format!(
                 "unknown file_id_prefix {} (no receive slot)",
                 header.file_id_prefix
             )));
@@ -598,17 +602,17 @@ impl TransferEngine {
             .storage
             .get_slot(&file_id)
             .await
-            .ok_or_else(|| crate::CoreError::Transfer(format!("no receive slot for {}", file_id)))?;
+            .ok_or_else(|| TransferFailure::protocol(format!("no receive slot for {}", file_id)))?;
 
         let seg_idx = header.stream_id as usize;
         let Some(&(seg_start, seg_len)) = slot.segments.get(seg_idx) else {
-            return Err(crate::CoreError::Transfer(format!(
+            return Err(TransferFailure::protocol(format!(
                 "stream_id {} out of range (stream_count={})",
                 header.stream_id, slot.stream_count
             )));
         };
         if header.start_offset != seg_start || header.data_len != seg_len {
-            return Err(crate::CoreError::Transfer(format!(
+            return Err(TransferFailure::protocol(format!(
                 "stream {} layout mismatch: header=({}, {}) expected=({}, {})",
                 header.stream_id, header.start_offset, header.data_len, seg_start, seg_len
             )));
@@ -621,10 +625,10 @@ impl TransferEngine {
                 .write(true)
                 .open(&slot.temp_path)
                 .await
-                .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+                .map_err(|e| from_io(&e, Phase::DiskWrite))?;
             file.seek(SeekFrom::Start(header.start_offset))
                 .await
-                .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+                .map_err(|e| from_io(&e, Phase::DiskWrite))?;
 
             let mut remaining = header.data_len;
             let mut buf = vec![0u8; STREAM_IO_BUF.min(header.data_len.max(1) as usize)];
@@ -633,18 +637,21 @@ impl TransferEngine {
                 .unwrap_or_else(Instant::now);
             while remaining > 0 {
                 let want = std::cmp::min(remaining as usize, buf.len());
-                let n = read_full(&mut stream, &mut buf[..want])
-                    .await
-                    .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+                let n = read_full(&mut stream, &mut buf[..want], Phase::Recv).await?;
                 if n == 0 {
-                    return Err(crate::CoreError::Transfer(format!(
-                        "truncated stream {} ({} bytes missing)",
-                        header.stream_id, remaining
-                    )));
+                    // 中途 EOF：对端进程死掉 / 链路断 → 网络类，可重试
+                    return Err(TransferFailure::new(
+                        FailureKind::UnexpectedEof,
+                        Phase::Recv,
+                        format!(
+                            "truncated stream {} ({} bytes missing)",
+                            header.stream_id, remaining
+                        ),
+                    ));
                 }
-                file.write_all(&buf[..n])
+                with_idle_timeout(file.write_all(&buf[..n]), IDLE_TIMEOUT)
                     .await
-                    .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+                    .map_err(|e| from_io(&e, Phase::DiskWrite))?;
                 remaining -= n as u64;
                 self.storage.add_bytes(&file_id, n as u64).await;
 
@@ -655,16 +662,16 @@ impl TransferEngine {
                     self.publish_recv_progress(&file_id).await;
                 }
             }
-            file.flush()
+            with_idle_timeout(file.flush(), IDLE_TIMEOUT)
                 .await
-                .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
+                .map_err(|e| from_io(&e, Phase::DiskWrite))?;
         }
 
         let slot = self
             .storage
             .finish_stream(&file_id, header.stream_id)
             .await
-            .ok_or_else(|| crate::CoreError::Transfer("slot vanished during stream".into()))?;
+            .ok_or_else(|| TransferFailure::protocol("slot vanished during stream"))?;
         self.publish_recv_progress(&file_id).await;
 
         // 全部流收齐后的收尾
@@ -1009,7 +1016,7 @@ impl TransferEngine {
                 .await
                 .insert(file_id_for_spawn.clone(), (target_ip.clone(), target_gateway_port));
             let engine_for_cleanup = engine.clone();
-            let mut result = engine
+            let result = engine
                 .do_send(
                     target_ip.clone(),
                     target_transfer_port,
@@ -1056,10 +1063,10 @@ impl TransferEngine {
                 )
                 .await
                 {
-                    result = Err(crate::CoreError::Transfer(format!(
-                        "notify verify: {}",
-                        e
-                    )));
+                    // 数据已全部送达，补发校验值失败不否定传输本身：
+                    // 接收方 120s 保险丝会跳过校验完成落盘（A3.8）。
+                    // 把这种通知失败标成「传输失败」是谎报（评审 3.6 精神）。
+                    warn!(file_id = %file_id_for_spawn, error = %e, "notify verify failed, receiver will fall back to fuse");
                 }
             }
             let final_progress = if canceled {
@@ -1091,19 +1098,23 @@ impl TransferEngine {
                         incoming: false,
                         file_path: None,
                     },
-                    Err(e) => TransferProgress {
-                        file_id: file_id_for_spawn.clone(),
-                        file_name: file_name_for_err.clone(),
-                        file_size,
-                        bytes_transferred: 0,
-                        chunks_done: 0,
-                        chunks_total: stream_count as u64,
-                        speed_bps: 0,
-                        status: TransferStatus::Failed,
-                        error: Some(e.to_string()),
-                        incoming: false,
-                        file_path: None,
-                    },
+                    Err(e) => {
+                        // UI 文案用 describe()（稳定中文短语），技术细节进日志
+                        warn!(file_id = %file_id_for_spawn, kind = ?e.kind, detail = %e.detail, "send failed");
+                        TransferProgress {
+                            file_id: file_id_for_spawn.clone(),
+                            file_name: file_name_for_err.clone(),
+                            file_size,
+                            bytes_transferred: 0,
+                            chunks_done: 0,
+                            chunks_total: stream_count as u64,
+                            speed_bps: 0,
+                            status: TransferStatus::Failed,
+                            error: Some(e.describe()),
+                            incoming: false,
+                            file_path: None,
+                        }
+                    }
                 }
             };
             push_progress(&progress_tx, final_progress).await;
@@ -1117,6 +1128,7 @@ impl TransferEngine {
     }
 
     /// 启动 N 条流，每条顺序发送一个字节区间。任一条失败即整体失败。
+    //（A3.2 起：失败会带结构化分类，供上层判定 Failed / Interrupted）
     #[allow(clippy::too_many_arguments)]
     async fn do_send(
         self: Arc<Self>,
@@ -1129,7 +1141,7 @@ impl TransferEngine {
         stream_count: u32,
         cancel_rx: watch::Receiver<bool>,
         progress_tx: mpsc::Sender<TransferProgress>,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), TransferFailure> {
         let file_id_prefix = file_id_prefix_u64(&file_id);
         let layout = stream_layout(file_size, stream_count);
         let bytes_done = Arc::new(AtomicU64::new(0));
@@ -1162,7 +1174,7 @@ impl TransferEngine {
                 if seg_len == 0 {
                     streams_done_shared.fetch_add(1, Ordering::Relaxed);
                     pctx.maybe_push().await;
-                    return Ok::<(), crate::CoreError>(());
+                    return Ok::<(), TransferFailure>(());
                 }
 
                 let mut conn = connect_with_retry(&target_ip, target_port, &mut cancel_rx).await?;
@@ -1173,11 +1185,11 @@ impl TransferEngine {
                     start_offset,
                     data_len: seg_len,
                 };
-                conn.write_all(&header.to_bytes())
+                with_idle_timeout(conn.write_all(&header.to_bytes()), IDLE_TIMEOUT)
                     .await
-                    .map_err(|e| crate::CoreError::Transfer(format!("write stream header: {}", e)))?;
+                    .map_err(|e| from_io(&e, Phase::Send))?;
 
-                // 顺序读文件区间 → 写 socket。失败即整传失败（无分块可重试）。
+                // 顺序读文件区间 → 写 socket。失败带结构化分类返回。
                 send_stream_body(
                     &mut conn,
                     &file_path,
@@ -1195,7 +1207,7 @@ impl TransferEngine {
             }));
         }
 
-        let mut first_err: Option<crate::CoreError> = None;
+        let mut first_err: Option<TransferFailure> = None;
         for h in handles {
             match h.await {
                 Ok(Ok(())) => {}
@@ -1203,10 +1215,12 @@ impl TransferEngine {
                     first_err.get_or_insert(e);
                 }
                 Err(e) => {
-                    first_err.get_or_insert(crate::CoreError::Transfer(format!(
-                        "send worker crashed: {}",
-                        e
-                    )));
+                    // worker panic：内部错误，不可重试
+                    first_err.get_or_insert(TransferFailure::new(
+                        FailureKind::Internal,
+                        Phase::Send,
+                        format!("send worker crashed: {}", e),
+                    ));
                 }
             }
         }
@@ -1274,17 +1288,20 @@ impl SendProgress {
 }
 
 /// 连接对端数据端口，带少量重试；取消可打断退避**与** connect。
+///
+/// connect 施加 [`timeouts::CONNECT_TIMEOUT`]（A3.1），失败按阶段分类为
+/// ConnectTimeout / ConnectFailed（均可重试，A3.4）。
 async fn connect_with_retry(
     target_ip: &str,
     target_port: u16,
     cancel_rx: &mut watch::Receiver<bool>,
-) -> Result<TcpStream> {
+) -> std::result::Result<TcpStream, TransferFailure> {
     const ATTEMPTS: u32 = 3;
     const BACKOFF_MS: [u64; 3] = [0, 200, 500];
-    let mut last_err = String::from("no attempt");
+    let mut last_err: Option<TransferFailure> = None;
     for attempt in 0..ATTEMPTS {
         if *cancel_rx.borrow() {
-            return Err(crate::CoreError::Transfer("canceled".into()));
+            return Err(TransferFailure::canceled("canceled"));
         }
         let backoff = BACKOFF_MS
             .get(attempt as usize)
@@ -1294,14 +1311,14 @@ async fn connect_with_retry(
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(backoff)) => {}
                 _ = cancel_rx.changed() => {
-                    return Err(crate::CoreError::Transfer("canceled".into()));
+                    return Err(TransferFailure::canceled("canceled"));
                 }
             }
         }
         let connect_result = tokio::select! {
-            r = TcpStream::connect((target_ip, target_port)) => r,
+            r = with_connect_timeout(TcpStream::connect((target_ip, target_port))) => r,
             _ = cancel_rx.changed() => {
-                return Err(crate::CoreError::Transfer("canceled".into()));
+                return Err(TransferFailure::canceled("canceled"));
             }
         };
         match connect_result {
@@ -1312,15 +1329,20 @@ async fn connect_with_retry(
                 return Ok(s);
             }
             Err(e) => {
-                last_err = format!("connect {}:{}: {}", target_ip, target_port, e);
                 warn!(attempt, error = %e, "connect failed, will retry");
+                last_err = Some(from_io(&e, Phase::Connect));
             }
         }
     }
-    Err(crate::CoreError::Transfer(last_err))
+    Err(last_err.unwrap_or_else(|| {
+        TransferFailure::new(FailureKind::ConnectFailed, Phase::Connect, "no attempt")
+    }))
 }
 
 /// 把文件区间顺序写入 socket，边写边推估计进度。取消立即生效。
+///
+/// 失败分类（A3.4）：本地读 → SourceError（不可重试）；
+/// socket 写（含空闲超时）→ 网络类（可重试）。
 async fn send_stream_body(
     conn: &mut TcpStream,
     file_path: &std::path::Path,
@@ -1328,57 +1350,73 @@ async fn send_stream_body(
     seg_len: u64,
     cancel_rx: &mut watch::Receiver<bool>,
     pctx: &SendProgress,
-) -> Result<()> {
+) -> std::result::Result<(), TransferFailure> {
     use std::io::SeekFrom;
     let mut file = tokio::fs::File::open(file_path)
         .await
-        .map_err(|e| crate::CoreError::Transfer(format!("open source: {}", e)))?;
+        .map_err(|e| from_io(&e, Phase::LocalRead))?;
     file.seek(SeekFrom::Start(start_offset))
         .await
-        .map_err(|e| crate::CoreError::Transfer(format!("seek source: {}", e)))?;
+        .map_err(|e| from_io(&e, Phase::LocalRead))?;
 
     let mut remaining = seg_len;
     let mut buf = vec![0u8; STREAM_IO_BUF];
     while remaining > 0 {
         if *cancel_rx.borrow() {
-            return Err(crate::CoreError::Transfer("canceled".into()));
+            return Err(TransferFailure::canceled("canceled"));
         }
         let want = std::cmp::min(remaining as usize, buf.len());
         let n = {
             // 用 select 响应取消：读文件时用户点取消也要尽快退出
             tokio::select! {
                 r = file.read(&mut buf[..want]) => {
-                    r.map_err(|e| crate::CoreError::Transfer(format!("read source: {}", e)))?
+                    r.map_err(|e| from_io(&e, Phase::LocalRead))?
                 }
                 _ = cancel_rx.changed() => {
-                    return Err(crate::CoreError::Transfer("canceled".into()));
+                    return Err(TransferFailure::canceled("canceled"));
                 }
             }
         };
         if n == 0 {
-            return Err(crate::CoreError::Transfer(format!(
-                "source truncated at offset {}",
-                start_offset + (seg_len - remaining)
-            )));
+            // 源文件在传输中被截断/删除：本地条件已坏，不可重试
+            return Err(TransferFailure::new(
+                FailureKind::SourceError,
+                Phase::LocalRead,
+                format!(
+                    "source truncated at offset {}",
+                    start_offset + (seg_len - remaining)
+                ),
+            ));
         }
-        conn.write_all(&buf[..n])
+        with_idle_timeout(conn.write_all(&buf[..n]), IDLE_TIMEOUT)
             .await
-            .map_err(|e| crate::CoreError::Transfer(format!("write data: {}", e)))?;
+            .map_err(|e| from_io(&e, Phase::Send))?;
         remaining -= n as u64;
         pctx.bytes_done.fetch_add(n as u64, Ordering::Relaxed);
         pctx.maybe_push().await;
     }
-    conn.flush()
+    with_idle_timeout(conn.flush(), IDLE_TIMEOUT)
         .await
-        .map_err(|e| crate::CoreError::Transfer(format!("flush: {}", e)))?;
+        .map_err(|e| from_io(&e, Phase::Send))?;
     Ok(())
 }
 
 /// 读满 buf，返回实际读到的字节数。**返回 0 = 对端已关闭（干净 EOF）**。
-async fn read_full(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
+///
+/// 每次底层 read 施加 [`IDLE_TIMEOUT`] 空闲上限（A3.1）：连续无字节到达
+/// 即收敛为 TimedOut，再按 `phase` 分类（Connect/Recv → 可重试的空闲超时）。
+async fn read_full(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    phase: Phase,
+) -> std::result::Result<usize, TransferFailure> {
     let mut read = 0;
     while read < buf.len() {
-        match stream.read(&mut buf[read..]).await? {
+        let n = match with_idle_timeout(stream.read(&mut buf[read..]), IDLE_TIMEOUT).await {
+            Ok(n) => n,
+            Err(e) => return Err(from_io(&e, phase)),
+        };
+        match n {
             0 => break,
             n => read += n,
         }
@@ -1414,30 +1452,11 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 纯 TCP 实现 HTTP POST JSON
-async fn http_post_json(host: &str, port: u16, path: &str, body: &str) -> std::io::Result<String> {
-    let mut stream = TcpStream::connect((host, port)).await?;
-    let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path, host, port, body.len(), body
-    );
-    stream.write_all(req.as_bytes()).await?;
-    stream.flush().await?;
-
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
-
-    let response_str = String::from_utf8_lossy(&response);
-    let body_start = response_str
-        .find("\r\n\r\n")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no header/body sep"))?;
-    Ok(response_str[body_start + 4..].to_string())
-}
-
 /// offer 投递：连不上的瞬时故障重试几次。
 ///
 /// 多文件批量发送时几个 offer 几乎同时出站，手机侧偶发 `ETIMEDOUT`
 /// （网络栈被打满 / 路由瞬时不可达）。一次失败就整文件判死太脆。
+/// 本函数与 `crate::httpc` 共用实现（超时见 timeouts 模块）。
 async fn http_post_json_retry(
     host: &str,
     port: u16,
@@ -1749,5 +1768,26 @@ mod tests {
             "取消应立刻打断重试，耗时 {:?}",
             start.elapsed()
         );
+    }
+
+    /// A3.1：对端 accept 后一个字节不发，read_full 必须收敛为空闲超时
+    /// （可重试类），而不是无限等待。虚拟时间推进，不真等 30s。
+    #[tokio::test(start_paused = true)]
+    async fn read_full_converges_on_silent_peer_via_idle_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _sock = listener.accept().await;
+            // 保持连接但从不发送数据
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut buf = [0u8; 8];
+        let res = read_full(&mut client, &mut buf, Phase::Recv).await;
+        let f = res.unwrap_err();
+        assert_eq!(f.kind, FailureKind::IdleTimeout);
+        assert!(f.is_retryable(), "空闲超时应可重试（A3.4）");
+        assert_eq!(f.describe(), "传输空闲超时");
     }
 }
