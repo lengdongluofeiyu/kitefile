@@ -1,0 +1,5 @@
+# Flutter/Dart 构建产物（与 desktop/mobile 各自 .gitignore 同约定）
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/

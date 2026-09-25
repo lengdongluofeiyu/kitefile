@@ -30,6 +30,9 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  # 双端共享业务层（工作流 C）：模型 / §3.5 文案 / 攒批决策只写一份
+  kitefile_shared:
+    path: ../packages/kitefile_shared
 
   # 系统文件选择器（SAF，无需存储权限，支持多选）
   file_picker: ^8.3.0

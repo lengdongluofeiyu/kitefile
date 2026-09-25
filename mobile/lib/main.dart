@@ -6,6 +6,11 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:kitefile_shared/kitefile_shared.dart';
+
+// 双端共享业务层（工作流 C）：模型 / §3.5 文案 / 攒批决策只写一份。
+// 再导出一次，让同包测试与代码 `import 'main.dart'` 也能拿到这些类型。
+export 'package:kitefile_shared/kitefile_shared.dart';
 
 import 'ffi.dart';
 
@@ -58,217 +63,7 @@ class KiteFileApp extends StatelessWidget {
 }
 
 // ============ 数据模型 ============
-
-// ---- JSON 安全解析助手（工作流 B：缺字段 / 错类型一律降级，禁止硬转崩溃）----
-
-/// JSON → int：null / 字符串数字 / 其它类型都安全降级。
-int _jsonInt(Object? v, [int fallback = 0]) {
-  if (v is num) return v.toInt();
-  if (v is String) return int.tryParse(v) ?? fallback;
-  return fallback;
-}
-
-/// JSON → int?：仅有效整数保留，其余降级 null。
-int? _jsonIntOrNull(Object? v) {
-  if (v is num) return v.toInt();
-  if (v is String) return int.tryParse(v);
-  return null;
-}
-
-/// JSON → String：非字符串（数字/null/对象）降级为 fallback。
-String _jsonStr(Object? v, [String fallback = '']) =>
-    v is String ? v : fallback;
-
-/// JSON → String?：仅字符串保留，其余降级 null。
-String? _jsonStrOrNull(Object? v) => v is String ? v : null;
-
-@immutable
-class Device {
-  final String id;
-  final String name;
-  final String ip;
-  final int transferPort;
-  final int gatewayPort;
-  final String platform;
-  const Device({
-    required this.id,
-    required this.name,
-    required this.ip,
-    required this.transferPort,
-    required this.gatewayPort,
-    required this.platform,
-  });
-
-  factory Device.fromJson(Map<String, dynamic> j) => Device(
-        id: _jsonStr(j['id']),
-        name: _jsonStr(j['name']),
-        ip: _jsonStr(j['ip']),
-        transferPort: _jsonInt(j['transfer_port'], 7879),
-        gatewayPort: _jsonInt(j['gateway_port'], 7878),
-        platform: _jsonStr(j['platform']),
-      );
-}
-
-@immutable
-class WhoAmI {
-  final String id;
-  final String name;
-  final String platform;
-  final int gatewayPort;
-  final int transferPort;
-  const WhoAmI({
-    required this.id,
-    required this.name,
-    required this.platform,
-    required this.gatewayPort,
-    required this.transferPort,
-  });
-
-  factory WhoAmI.fromJson(Map<String, dynamic> j) => WhoAmI(
-        id: _jsonStr(j['id']),
-        name: _jsonStr(j['name']),
-        platform: _jsonStr(j['platform']),
-        gatewayPort: _jsonInt(j['gateway_port'], 7878),
-        transferPort: _jsonInt(j['transfer_port'], 7879),
-      );
-}
-
-/// 传输状态（与 Rust `TransferStatus` 一一对应，契约测试锁定）。
-/// `interrupted` = 已中断（可「继续传输」），**不等于** failed/canceled（§3.5）。
-enum TransferStatus { pending, inProgress, completed, failed, canceled, interrupted }
-
-TransferStatus _parseStatus(String s) {
-  switch (s) {
-    case 'Pending':
-      return TransferStatus.pending;
-    case 'InProgress':
-      return TransferStatus.inProgress;
-    case 'Completed':
-      return TransferStatus.completed;
-    case 'Failed':
-      return TransferStatus.failed;
-    case 'Canceled':
-      return TransferStatus.canceled;
-    case 'Interrupted':
-      return TransferStatus.interrupted;
-    default:
-      return TransferStatus.pending;
-  }
-}
-
-@immutable
-class TransferProgress {
-  final String fileId;
-  final String fileName;
-  final int fileSize;
-  final int bytesTransferred;
-  final int chunksDone;
-  final int chunksTotal;
-  final int speedBps;
-  final TransferStatus status;
-  final String? error;
-
-  /// true = 接收方视角；false = 发送方视角
-  final bool incoming;
-
-  /// 接收完成后的最终保存路径（仅接收方 Completed 时有值）
-  final String? filePath;
-
-  /// 自动重试提示（如「第 2/3 次重试流 3…」）；非空时角标显示「重试中」
-  final String? retryNote;
-  const TransferProgress({
-    required this.fileId,
-    required this.fileName,
-    required this.fileSize,
-    required this.bytesTransferred,
-    required this.chunksDone,
-    required this.chunksTotal,
-    required this.speedBps,
-    required this.status,
-    required this.error,
-    this.incoming = false,
-    this.filePath,
-    this.retryNote,
-  });
-
-  /// 安全解析（工作流 B）：缺字段/错类型一律降级为安全默认，禁止硬转崩溃。
-  factory TransferProgress.fromJson(Map<String, dynamic> j) => TransferProgress(
-        fileId: _jsonStr(j['file_id']),
-        fileName: _jsonStr(j['file_name']),
-        fileSize: _jsonInt(j['file_size']),
-        bytesTransferred: _jsonInt(j['bytes_transferred']),
-        chunksDone: _jsonInt(j['chunks_done']),
-        chunksTotal: _jsonInt(j['chunks_total']),
-        speedBps: _jsonInt(j['speed_bps']),
-        status: _parseStatus(_jsonStr(j['status'], 'Pending')),
-        error: _jsonStrOrNull(j['error']),
-        incoming: j['incoming'] == true,
-        filePath: _jsonStrOrNull(j['file_path']),
-        retryNote: _jsonStrOrNull(j['retry_note']),
-      );
-}
-
-/// 接收方待决的传入请求（WS incoming 事件 / GET /api/incoming）
-@immutable
-class IncomingEntry {
-  final String incomingId;
-  final String fileId;
-  final String fileName;
-  final int fileSize;
-  final String? sha256;
-  final String fromId;
-  final String fromName;
-  final String fromIp;
-  /// 多文件批量发送时同批条目共享；单文件为 null
-  final String? batchId;
-  final int? batchIndex;
-  final int? batchTotal;
-  const IncomingEntry({
-    required this.incomingId,
-    required this.fileId,
-    required this.fileName,
-    required this.fileSize,
-    required this.sha256,
-    required this.fromId,
-    required this.fromName,
-    required this.fromIp,
-    this.batchId,
-    this.batchIndex,
-    this.batchTotal,
-  });
-
-  factory IncomingEntry.fromJson(Map<String, dynamic> j) => IncomingEntry(
-        incomingId: _jsonStr(j['incoming_id']),
-        fileId: _jsonStr(j['file_id']),
-        fileName: _jsonStr(j['file_name']),
-        fileSize: _jsonInt(j['file_size']),
-        sha256: _jsonStrOrNull(j['sha256']),
-        fromId: _jsonStr(j['from_id']),
-        fromName: _jsonStr(j['from_name']),
-        fromIp: _jsonStr(j['from_ip']),
-        batchId: _jsonStrOrNull(j['batch_id']),
-        batchIndex: _jsonIntOrNull(j['batch_index']),
-        batchTotal: _jsonIntOrNull(j['batch_total']),
-      );
-}
-
-/// daemon 网关端口候选：必须与 core 的 `GATEWAY_PORT_CANDIDATES` 一致。
-///
-/// 默认端口可能被系统保留（Windows 上 Hyper-V/WSL/Docker 会动态保留成片
-/// TCP 端口），此时 daemon 会退避到下一个候选，UI 不能只认 7878。
-const List<int> kGatewayPortCandidates = [7878, 17878, 27878];
-
-/// incoming 请求决策超时（秒）：与 core 的 `INCOMING_DECISION_TIMEOUT_SECS` 保持一致
-const int kDecisionTimeoutSecs = 60;
-
-/// 一次多选发送里，单个文件所属的批次信息（发给 daemon 用）
-class SendBatch {
-  final String batchId;
-  final int index;
-  final int total;
-  const SendBatch(
-      {required this.batchId, required this.index, required this.total});
-}
+// 模型与 JSON 安全解析已移至共享包 kitefile_shared（工作流 C，本文件顶部 export）。
 
 // ============ 主页 ============
 
@@ -298,11 +93,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final Map<String, TransferProgress> _progress = {};
   /// 待决定的传入请求（incoming_id → entry）
   final Map<String, IncomingEntry> _incoming = {};
-  /// 同批 incoming 暂存区：batch_id → 已到达的条目（攒够后合成一张卡片）
-  final Map<String, List<IncomingEntry>> _pendingBatch = {};
-  final Map<String, Timer> _batchTimers = {};
-  /// 已决定的批次：batch_id → 是否接受。迟到到达的同批条目沿用同一决定。
-  final Map<String, bool> _batchDecision = {};
+  /// 攒批—决策—迟到沿用状态机（工作流 C：共享实现，双端仅此一份）
+  late final BatchDecider _batchDecider;
   WebSocket? _ws;
   Timer? _refreshTimer;
   bool _daemonOnline = false;
@@ -313,6 +105,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _batchDecider = BatchDecider(
+      onShowSingle: (entry) {
+        if (mounted) _showIncomingDialog(entry);
+      },
+      onShowBatch: (batchId, entries) {
+        if (mounted) _showBatchDialog(batchId, entries);
+      },
+      onDecideSingle: (incomingId, accept, quiet) {
+        // 手机端单条决策无 quiet 分支（HTTP 失败同样只打日志）
+        _decideIncoming(incomingId, accept);
+      },
+    );
     _bootstrap();
   }
 
@@ -363,6 +167,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _batchDecider.dispose();
     WidgetsBinding.instance.removeObserver(this);
     _ws?.close();
     _refreshTimer?.cancel();
@@ -569,45 +374,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  /// 收到一个 incoming 请求。
-  ///
-  /// 同批的 offer 是对端连续 POST 来的，到达有先后但间隔极短。
-  /// 先攒 600ms，到齐（或超时）后合成一张卡片弹出，一次决定整批。
+  /// 收到一个 incoming 请求：登记后交给共享攒批状态机（工作流 C）。
   void _onIncoming(IncomingEntry entry) {
     if (!mounted) return;
     setState(() => _incoming[entry.incomingId] = entry);
-
-    final bid = entry.batchId;
-    if (bid == null) {
-      _showIncomingDialog(entry);
-      return;
-    }
-
-    // 该批次已经决定过了：迟到的条目沿用同一决定，别再弹窗烦用户
-    final decided = _batchDecision[bid];
-    if (decided != null) {
-      _decideIncoming(entry.incomingId, decided);
-      return;
-    }
-
-    final list = _pendingBatch.putIfAbsent(bid, () => []);
-    if (!list.any((e) => e.incomingId == entry.incomingId)) list.add(entry);
-
-    _batchTimers[bid]?.cancel();
-    if (list.length >= (entry.batchTotal ?? list.length)) {
-      _showBatchDialog(bid);
-    } else {
-      _batchTimers[bid] =
-          Timer(const Duration(milliseconds: 600), () => _showBatchDialog(bid));
-    }
+    _batchDecider.handle(entry);
   }
 
-  /// 批量接收弹窗：一次确认整批（60 秒未接受自动超时）
-  void _showBatchDialog(String batchId) {
-    _batchTimers.remove(batchId)?.cancel();
-    final entries = _pendingBatch.remove(batchId);
-    if (entries == null || entries.isEmpty || !mounted) return;
-    entries.sort((a, b) => (a.batchIndex ?? 0).compareTo(b.batchIndex ?? 0));
+  /// 批量接收弹窗：一次确认整批（60 秒未接受自动超时）。
+  /// entries 已由 BatchDecider 按 batchIndex 排序。
+  void _showBatchDialog(String batchId, List<IncomingEntry> entries) {
+    if (entries.isEmpty || !mounted) return;
     final totalSize = entries.fold<int>(0, (s, e) => s + e.fileSize);
     var remaining = kDecisionTimeoutSecs;
     Timer? ticker;
@@ -679,10 +456,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _decideBatch(String batchId, bool accept) async {
-    // 先记下决定：迟到到达的同批条目会据此自动沿用，不再弹窗
-    _batchDecision[batchId] = accept;
-    // 后端 60s 未决策会自动拒绝，之后不会再有同批条目到达，记录可以回收
-    Timer(const Duration(seconds: 70), () => _batchDecision.remove(batchId));
+    // 先记下决定：迟到到达的同批条目会据此自动沿用，不再弹窗（共享状态机）
+    _batchDecider.recordDecision(batchId, accept);
     try {
       await httpPost('$_httpBase/api/incoming/batch-decide',
           body: jsonEncode({'batch_id': batchId, 'accept': accept}));
@@ -978,49 +753,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Widget _transferTile(TransferProgress p) {
     final pct = p.fileSize > 0 ? p.bytesTransferred / p.fileSize : 0.0;
-    final pctInt = (pct * 100).round();
-    // 角标文案（§3.5）：中断 ≠ 失败 ≠ 取消；自动重试期间角标改「重试中」
-    final retrying = p.status == TransferStatus.inProgress && p.retryNote != null;
-    final statusText = {
-      TransferStatus.pending: '等待',
-      TransferStatus.inProgress: retrying ? '重试中' : '传输中',
-      TransferStatus.completed: '已完成',
-      TransferStatus.failed: '传输失败',
-      TransferStatus.canceled: '已取消',
-      TransferStatus.interrupted: '已中断',
-    }[p.status]!;
-    final statusColor = {
-      TransferStatus.completed: Colors.green,
-      TransferStatus.failed: Colors.red,
-      TransferStatus.inProgress: retrying ? Colors.amber.shade800 : Colors.blue,
-      TransferStatus.canceled: Colors.orange,
-      TransferStatus.pending: Colors.grey,
-      TransferStatus.interrupted: Colors.amber.shade800,
-    }[p.status]!;
-
-    // 副文案（§3.5）
-    final dirLabel = p.incoming ? '接收' : '发送';
-    String subtitle;
-    switch (p.status) {
-      case TransferStatus.interrupted:
-        subtitle =
-            '$dirLabel · ${p.error ?? '传输中断'} · 已完成 $pctInt% · 未完成部分将重新发送';
-        break;
-      case TransferStatus.canceled:
-        subtitle = '$dirLabel · ${p.error ?? '已放弃本次传输'}';
-        break;
-      case TransferStatus.failed:
-        subtitle = '$dirLabel · ${p.error ?? '传输失败'}';
-        break;
-      case TransferStatus.inProgress:
-        subtitle = '$dirLabel · ${formatBytes(p.bytesTransferred)} / ${formatBytes(p.fileSize)}'
-            ' · ${formatSpeed(p.speedBps)}'
-            '${p.retryNote != null ? ' · ${p.retryNote}' : ''}';
-        break;
-      default:
-        subtitle = '$dirLabel · ${formatBytes(p.bytesTransferred)} / ${formatBytes(p.fileSize)}'
-            '${p.error != null ? ' · ${p.error}' : ''}';
-    }
+    // 角标与副文案来自共享层（§3.5 唯一源，工作流 C）；手机端带方向前缀
+    final statusText = statusBadgeLabel(p);
+    final statusColor = statusBadgeColor(p);
+    final subtitle = transferSubtitle(p, showDirection: true);
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
@@ -1524,15 +1260,7 @@ class PickedFileLite {
       );
 }
 
-String formatBytes(int bytes) {
-  if (bytes == 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-  final i = (bytes.bitLength - 1) ~/ 10;
-  final idx = i < units.length ? i : units.length - 1;
-  return '${(bytes / (1 << (10 * idx))).toStringAsFixed(2)} ${units[idx]}';
-}
-
-String formatSpeed(int bps) => '${formatBytes(bps)}/s';
+/// formatBytes / formatSpeed 由共享包 kitefile_shared 提供（工作流 C）。
 
 // ============ 简易 HTTP 客户端 ============
 

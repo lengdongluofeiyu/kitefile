@@ -11,6 +11,9 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.8
+  # 双端共享业务层（工作流 C）：模型 / §3.5 文案 / 攒批决策只写一份
+  kitefile_shared:
+    path: ../packages/kitefile_shared
   window_manager: ^0.4.3
   # 系统文件选择器（Windows 原生对话框，支持多选）
   file_picker: ^8.3.0
