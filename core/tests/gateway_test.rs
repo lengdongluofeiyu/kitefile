@@ -374,6 +374,158 @@ async fn test_offer_version_gate() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ============ 工作流 E：并发 / 竞态 ============
+
+/// 多文件同传（工作流 E）：两文件并行在途，各自接受后**同时**完成，
+/// 内容与源一致、互不串写。
+#[tokio::test]
+async fn test_concurrent_multi_file_transfers() {
+    require_sockets!("test_concurrent_multi_file_transfers");
+    let dir_a = temp_dir("multi-a");
+    let dir_b = temp_dir("multi-b");
+    let _a = start_stack(18060, 18160, &dir_a, 4).await;
+    let _b = start_stack(18061, 18161, &dir_b, 4).await;
+
+    // 两个不同内容的文件（512KB → 单流，聚焦并发而非多流）
+    let content1 = make_content(512 * 1024);
+    let content2: Vec<u8> = content1.iter().map(|b| b.wrapping_add(17)).collect();
+    let src1 = dir_a.join("one.bin");
+    let src2 = dir_a.join("two.bin");
+    std::fs::write(&src1, &content1).unwrap();
+    std::fs::write(&src2, &content2).unwrap();
+
+    let mut file_ids = Vec::new();
+    for src in [&src1, &src2] {
+        let send_body = json!({
+            "target_ip": "127.0.0.1",
+            "target_port": 18161,
+            "target_gateway_port": 18061,
+            "file_path": src.to_string_lossy(),
+        })
+        .to_string();
+        let (status, body) = http(18060, "POST", "/api/send", Some(&send_body)).await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let resp: Value = serde_json::from_slice(&body).unwrap();
+        file_ids.push(resp["file_id"].as_str().unwrap().to_string());
+    }
+
+    // 两个待决请求都出现（并行在途）
+    let v = wait_for_json(18061, "/api/incoming", 15, |v| {
+        v.as_array().map(|a| a.len() >= 2).unwrap_or(false)
+    })
+    .await;
+    let arr = v.as_array().unwrap();
+    for entry in arr {
+        let incoming_id = entry["incoming_id"].as_str().unwrap();
+        let (status, _) = http(
+            18061,
+            "POST",
+            &format!("/api/incoming/{incoming_id}/accept"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+
+    // 两个都到 Completed
+    let v = wait_for_json(18061, "/api/transfers", 30, |v| {
+        file_ids.iter().all(|fid| {
+            find_transfer(v, fid)
+                .map(|t| t["status"].as_str() == Some("Completed"))
+                .unwrap_or(false)
+        })
+    })
+    .await;
+    for fid in &file_ids {
+        assert!(find_transfer(&v, fid).is_some(), "{fid} 应有进度帧");
+    }
+
+    // 落盘内容逐一核对（防串写）
+    let got1 = std::fs::read(dir_b.join("one.bin")).unwrap();
+    let got2 = std::fs::read(dir_b.join("two.bin")).unwrap();
+    assert_eq!(got1, content1, "文件 1 内容必须与源一致");
+    assert_eq!(got2, content2, "文件 2 内容必须与源一致");
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// 取消与完成的竞态边界（工作流 E）：传输完成**之后**再取消，
+/// 不得改写终态、不得让状态卡回进行中；cancel 对已结束任务回 404。
+#[tokio::test]
+async fn test_cancel_after_completion_keeps_terminal_state() {
+    require_sockets!("test_cancel_after_completion_keeps_terminal_state");
+    let dir_a = temp_dir("race-a");
+    let dir_b = temp_dir("race-b");
+    let _a = start_stack(18070, 18170, &dir_a, 4).await;
+    let _b = start_stack(18071, 18171, &dir_b, 4).await;
+
+    let content = make_content(256 * 1024);
+    let src = dir_a.join("race.bin");
+    std::fs::write(&src, &content).unwrap();
+
+    let send_body = json!({
+        "target_ip": "127.0.0.1",
+        "target_port": 18171,
+        "target_gateway_port": 18071,
+        "file_path": src.to_string_lossy(),
+    })
+    .to_string();
+    let (status, body) = http(18070, "POST", "/api/send", Some(&send_body)).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let resp: Value = serde_json::from_slice(&body).unwrap();
+    let file_id = resp["file_id"].as_str().unwrap().to_string();
+
+    let v = wait_for_json(18071, "/api/incoming", 15, |v| {
+        v.as_array().map(|a| !a.is_empty()).unwrap_or(false)
+    })
+    .await;
+    let incoming_id = v[0]["incoming_id"].as_str().unwrap().to_string();
+    let (status, _) = http(
+        18071,
+        "POST",
+        &format!("/api/incoming/{incoming_id}/accept"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // 等两端都 Completed（任务彻底结束：会话/注册表已清理）
+    wait_for_json(18071, "/api/transfers", 30, |v| {
+        find_transfer(v, &file_id)
+            .map(|t| t["status"].as_str() == Some("Completed"))
+            .unwrap_or(false)
+    })
+    .await;
+    wait_for_json(18070, "/api/transfers", 30, |v| {
+        find_transfer(v, &file_id)
+            .map(|t| t["status"].as_str() == Some("Completed"))
+            .unwrap_or(false)
+    })
+    .await;
+
+    // 完成后取消：找不到活动任务 → 404；两端终态保持 Completed
+    let (status, _) = http(18070, "POST", &format!("/api/cancel/{file_id}"), None).await;
+    assert_eq!(status, 404, "已结束任务的取消应 404，而不是复活任务");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let a = http_json(18070, "GET", "/api/transfers", None).await;
+    let b = http_json(18071, "GET", "/api/transfers", None).await;
+    for (side, v) in [("A", &a), ("B", &b)] {
+        let t = find_transfer(v, &file_id).expect(side);
+        assert_eq!(
+            t["status"].as_str(),
+            Some("Completed"),
+            "{side} 侧终态不得被取消改写"
+        );
+    }
+
+    // 文件仍完好
+    assert_eq!(std::fs::read(dir_b.join("race.bin")).unwrap(), content);
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
 // ============ incoming offer：登记 / 列表 / 接受 / 拒绝 ============
 
 fn fake_offer(file_id: &str, file_size: u64, from_gateway_port: u16) -> String {

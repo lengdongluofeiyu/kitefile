@@ -572,9 +572,9 @@ class _HomePageState extends State<HomePage> with WindowListener {
         },
       );
     } catch (e) {
+      // 连接失败 ≠ 已建立后断开：daemon 存活由 whoami 轮询定真值，
+      // 这里只留日志并重连，避免与 whoami 打架导致徽标抖动。
       debugPrint('[kitefile] ws connect failed: $e');
-      if (mounted) setState(() => _daemonOnline = false);
-      // mounted 保护：页面已销毁就不再重连（否则定时器泄漏/幽灵连接）
       Future.delayed(const Duration(seconds: 5), () {
         if (mounted) _connectWs();
       });
