@@ -152,6 +152,10 @@ impl HttpGateway {
             .route("/api/send", post(send_file))
             .route("/api/transfers", get(list_transfers))
             .route("/api/cancel/:file_id", post(cancel_transfer))
+            // 续传（A3.2）：本机 UI 入口 / 对端 daemon 互相触发
+            .route("/api/transfers/:file_id/resume", post(resume_transfer))
+            .route("/api/peer-resume/:file_id", post(peer_resume))
+            .route("/api/peer-resumed/:file_id", post(peer_resumed))
             .route("/api/files", get(list_files))
             .route("/api/files/:name", get(download_file))
             .route("/api/incoming", post(incoming_offer).get(list_incoming))
@@ -235,10 +239,14 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
         (Method::POST, "/api/incoming-resp", Remote),
         (Method::POST, "/api/verify/:file_id", Remote),
         (Method::POST, "/api/cancel/:file_id", Remote),
+        // 对端触发的续传信号（A3.2）：接收方请求发送方继续 / 发送方通知接收方恢复
+        (Method::POST, "/api/peer-resume/:file_id", Remote),
+        (Method::POST, "/api/peer-resumed/:file_id", Remote),
         (Method::GET, "/api/whoami", Remote),
         // ---- 仅本机：会控制本机的操作 ----
         (Method::POST, "/api/send", LocalOnly),
         (Method::GET, "/api/transfers", LocalOnly),
+        (Method::POST, "/api/transfers/:file_id/resume", LocalOnly),
         (Method::GET, "/api/files", LocalOnly),
         (Method::GET, "/api/files/:name", LocalOnly),
         (Method::GET, "/api/incoming", LocalOnly),
@@ -393,6 +401,40 @@ async fn cancel_transfer(
         true => StatusCode::OK,
         false => StatusCode::NOT_FOUND,
     }
+}
+
+/// POST /api/transfers/:file_id/resume —— 本机 UI「继续传输」入口（A3.2）。
+/// 发送会话存在 → 只续未完成段；本机是接收方 → 通知发送方 peer-resume。
+async fn resume_transfer(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+) -> impl IntoResponse {
+    info!(%file_id, "resume requested");
+    match state.transfer.clone().resume_transfer(&file_id).await {
+        true => StatusCode::OK,
+        false => StatusCode::NOT_FOUND,
+    }
+}
+
+/// POST /api/peer-resume/:file_id —— 接收方请求发送方继续传输（Remote）。
+async fn peer_resume(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+) -> impl IntoResponse {
+    info!(%file_id, "peer-resume received");
+    match state.transfer.clone().resume_send(&file_id).await {
+        true => StatusCode::OK,
+        false => StatusCode::NOT_FOUND,
+    }
+}
+
+/// POST /api/peer-resumed/:file_id —— 发送方已续传，接收方清中断态回「传输中」（Remote）。
+async fn peer_resumed(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+) -> impl IntoResponse {
+    state.transfer.on_peer_resumed(&file_id).await;
+    StatusCode::OK
 }
 
 /// POST /api/verify/:file_id —— 发送方在全部 chunk ACK 后补发整文件 sha256。

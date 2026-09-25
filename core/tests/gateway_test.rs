@@ -301,6 +301,33 @@ async fn test_cancel_unknown_404() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A3.2 续传入口路由：未知 file_id → 404（没有可续的对象）。
+#[tokio::test]
+async fn test_resume_unknown_404() {
+    require_sockets!("test_resume_unknown_404");
+    let dir = temp_dir("resume404");
+    let _ = start_stack(18050, 18150, &dir, 2).await;
+
+    let (status, _) = http(
+        18050,
+        "POST",
+        "/api/transfers/nonexistent-id/resume",
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, 404);
+
+    // 对端续传入口（Remote 档，本机调用直接放行）：本机无发送会话 → 404
+    let (status, _) = http(18050, "POST", "/api/peer-resume/nonexistent-id", Some("{}")).await;
+    assert_eq!(status, 404);
+
+    // 对端已续传通知：幂等 200（接收方无该任务时静默忽略）
+    let (status, _) = http(18050, "POST", "/api/peer-resumed/nonexistent-id", Some("{}")).await;
+    assert_eq!(status, 200);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ============ incoming offer：登记 / 列表 / 接受 / 拒绝 ============
 
 fn fake_offer(file_id: &str, file_size: u64, from_gateway_port: u16) -> String {
@@ -853,12 +880,28 @@ fn test_classify_covers_all_routes() {
             "/api/cancel/:file_id",
             AccessPolicy::Remote,
         ),
+        // 对端续传信号（A3.2）
+        (
+            axum::http::Method::POST,
+            "/api/peer-resume/:file_id",
+            AccessPolicy::Remote,
+        ),
+        (
+            axum::http::Method::POST,
+            "/api/peer-resumed/:file_id",
+            AccessPolicy::Remote,
+        ),
         (axum::http::Method::GET, "/api/whoami", AccessPolicy::Remote),
         // 仅本机
         (axum::http::Method::POST, "/api/send", AccessPolicy::LocalOnly),
         (
             axum::http::Method::GET,
             "/api/transfers",
+            AccessPolicy::LocalOnly,
+        ),
+        (
+            axum::http::Method::POST,
+            "/api/transfers/:file_id/resume",
             AccessPolicy::LocalOnly,
         ),
         (axum::http::Method::GET, "/api/files", AccessPolicy::LocalOnly),

@@ -41,6 +41,7 @@ fn test_ws_event_progress_flatten() {
         error: None,
         incoming: false,
         file_path: None,
+        retry_note: None,
     };
     let ev = WsEvent::Progress { progress: p };
     let s = serde_json::to_string(&ev).unwrap();

@@ -73,6 +73,27 @@ where
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http response timeout"))?
 }
 
+/// 可注入的超时组（测试闸门 E：「超时可注入或缩短配置」）。
+///
+/// 默认值仍只来自本模块的常量；测试可在构造 `TransferEngine` 后、
+/// `Arc::new` 之前覆写字段以缩短超时，避免用大文件/真等待拖时间。
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    /// 连接建立上限（数据流 connect）
+    pub connect: Duration,
+    /// 空闲上限（数据流读/写）
+    pub idle: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            connect: CONNECT_TIMEOUT,
+            idle: IDLE_TIMEOUT,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
