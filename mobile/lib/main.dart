@@ -110,7 +110,9 @@ class WhoAmI {
       );
 }
 
-enum TransferStatus { pending, inProgress, completed, failed, canceled }
+/// 传输状态（与 Rust `TransferStatus` 一一对应，契约测试锁定）。
+/// `interrupted` = 已中断（可「继续传输」），**不等于** failed/canceled（§3.5）。
+enum TransferStatus { pending, inProgress, completed, failed, canceled, interrupted }
 
 TransferStatus _parseStatus(String s) {
   switch (s) {
@@ -124,6 +126,8 @@ TransferStatus _parseStatus(String s) {
       return TransferStatus.failed;
     case 'Canceled':
       return TransferStatus.canceled;
+    case 'Interrupted':
+      return TransferStatus.interrupted;
     default:
       return TransferStatus.pending;
   }
@@ -146,6 +150,9 @@ class TransferProgress {
 
   /// 接收完成后的最终保存路径（仅接收方 Completed 时有值）
   final String? filePath;
+
+  /// 自动重试提示（如「第 2/3 次重试流 3…」）；非空时角标显示「重试中」
+  final String? retryNote;
   const TransferProgress({
     required this.fileId,
     required this.fileName,
@@ -158,11 +165,13 @@ class TransferProgress {
     required this.error,
     this.incoming = false,
     this.filePath,
+    this.retryNote,
   });
 
+  /// 安全解析（工作流 B）：缺字段/错类型一律降级为安全默认，禁止硬转崩溃。
   factory TransferProgress.fromJson(Map<String, dynamic> j) => TransferProgress(
-        fileId: j['file_id'] as String,
-        fileName: j['file_name'] as String,
+        fileId: j['file_id'] as String? ?? '',
+        fileName: j['file_name'] as String? ?? '',
         fileSize: ((j['file_size'] as num?) ?? 0).toInt(),
         bytesTransferred: ((j['bytes_transferred'] as num?) ?? 0).toInt(),
         chunksDone: ((j['chunks_done'] as num?) ?? 0).toInt(),
@@ -172,6 +181,7 @@ class TransferProgress {
         error: j['error'] as String?,
         incoming: (j['incoming'] as bool?) ?? false,
         filePath: j['file_path'] as String?,
+        retryNote: j['retry_note'] as String?,
       );
 }
 
@@ -316,9 +326,11 @@ class _HomePageState extends State<HomePage> {
       _refreshReceiveDir();
       _refreshDevices();
       _refreshReceivedFiles();
+      // 周期刷新同时复核 whoami：daemon 不可达后 3s 内徽标掉线（A3.6）
       _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
         _refreshDevices();
         _refreshReceivedFiles();
+        _fetchWhoAmI();
       });
       _connectWs();
     }
@@ -391,6 +403,8 @@ class _HomePageState extends State<HomePage> {
         // 该端口没响应，试下一个
       }
     }
+    // 在线徽标唯一真值（A3.6）：所有候选都失败必须掉线，且不静默吞
+    debugPrint('[kitefile] whoami unreachable on all candidates (host=$_daemonHost)');
     if (mounted) setState(() => _daemonOnline = false);
   }
 
@@ -401,37 +415,57 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _devices = list.map(Device.fromJson).toList();
       });
-    } catch (_) {}
+    } catch (e) {
+      // 设备列表是本机 daemon 接口：失败留日志（徽标由 whoami 轮询定真值）
+      debugPrint('[kitefile] devices refresh failed: $e');
+    }
   }
 
   Future<void> _connectWs() async {
     try {
-      _ws = await WebSocket.connect(_wsBase);
-      _ws!.listen((data) {
-        if (data is! String) return;
-        try {
-          final j = jsonDecode(data) as Map<String, dynamic>;
-          // 按 event_type 分发：progress / incoming / incoming_resolved
-          switch (j['event_type'] as String? ?? 'progress') {
-            case 'incoming':
-              final entry = IncomingEntry.fromJson(j);
-              _onIncoming(entry);
-              break;
-            case 'incoming_resolved':
-              final id = j['incoming_id'] as String?;
-              if (id != null && mounted) {
-                setState(() => _incoming.remove(id));
-              }
-              break;
-            default:
-              final p = TransferProgress.fromJson(j);
-              if (mounted) setState(() => _progress[p.fileId] = p);
+      final ws = await WebSocket.connect(_wsBase);
+      _ws = ws;
+      ws.listen(
+        (data) {
+          if (data is! String) return;
+          try {
+            final j = jsonDecode(data) as Map<String, dynamic>;
+            // 按 event_type 分发：progress / incoming / incoming_resolved
+            switch (j['event_type'] as String? ?? 'progress') {
+              case 'incoming':
+                final entry = IncomingEntry.fromJson(j);
+                _onIncoming(entry);
+                break;
+              case 'incoming_resolved':
+                final id = j['incoming_id'] as String?;
+                if (id != null && mounted) {
+                  setState(() => _incoming.remove(id));
+                }
+                break;
+              default:
+                final p = TransferProgress.fromJson(j);
+                if (mounted) setState(() => _progress[p.fileId] = p);
+            }
+          } catch (e) {
+            debugPrint('[kitefile] ws message parse failed: $e');
           }
-        } catch (_) {
-          // 忽略无法解析的消息
-        }
-      });
-    } catch (_) {
+        },
+        onDone: () {
+          // WS 断开（进程退出/网络断）：立刻掉线真值 + 复核 whoami + 重连
+          debugPrint('[kitefile] ws closed');
+          if (mounted) setState(() => _daemonOnline = false);
+          _ws = null;
+          _fetchWhoAmI();
+          Future.delayed(const Duration(seconds: 5), _connectWs);
+        },
+        onError: (Object e) {
+          debugPrint('[kitefile] ws error: $e');
+          if (mounted) setState(() => _daemonOnline = false);
+        },
+      );
+    } catch (e) {
+      debugPrint('[kitefile] ws connect failed: $e');
+      if (mounted) setState(() => _daemonOnline = false);
       Future.delayed(const Duration(seconds: 5), _connectWs);
     }
   }
@@ -675,7 +709,20 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _cancel(String fileId) async {
-    await httpPost('$_httpBase/api/cancel/$fileId', body: '');
+    try {
+      await httpPost('$_httpBase/api/cancel/$fileId', body: '');
+    } catch (e) {
+      debugPrint('[kitefile] cancel failed: $e');
+    }
+  }
+
+  /// 「继续传输」：只重发未完成段（A3.2）。本机是发送方或接收方均由 daemon 路由。
+  Future<void> _resume(String fileId) async {
+    try {
+      await httpPost('$_httpBase/api/transfers/$fileId/resume', body: '{}');
+    } catch (e) {
+      debugPrint('[kitefile] resume failed: $e');
+    }
   }
 
   @override
@@ -832,20 +879,49 @@ class _HomePageState extends State<HomePage> {
 
   Widget _transferTile(TransferProgress p) {
     final pct = p.fileSize > 0 ? p.bytesTransferred / p.fileSize : 0.0;
+    final pctInt = (pct * 100).round();
+    // 角标文案（§3.5）：中断 ≠ 失败 ≠ 取消；自动重试期间角标改「重试中」
+    final retrying = p.status == TransferStatus.inProgress && p.retryNote != null;
     final statusText = {
       TransferStatus.pending: '等待',
-      TransferStatus.inProgress: '进行中',
+      TransferStatus.inProgress: retrying ? '重试中' : '传输中',
       TransferStatus.completed: '已完成',
-      TransferStatus.failed: '失败',
+      TransferStatus.failed: '传输失败',
       TransferStatus.canceled: '已取消',
+      TransferStatus.interrupted: '已中断',
     }[p.status]!;
     final statusColor = {
       TransferStatus.completed: Colors.green,
       TransferStatus.failed: Colors.red,
-      TransferStatus.inProgress: Colors.blue,
+      TransferStatus.inProgress: retrying ? Colors.amber.shade800 : Colors.blue,
       TransferStatus.canceled: Colors.orange,
       TransferStatus.pending: Colors.grey,
+      TransferStatus.interrupted: Colors.amber.shade800,
     }[p.status]!;
+
+    // 副文案（§3.5）
+    final dirLabel = p.incoming ? '接收' : '发送';
+    String subtitle;
+    switch (p.status) {
+      case TransferStatus.interrupted:
+        subtitle =
+            '$dirLabel · ${p.error ?? '传输中断'} · 已完成 $pctInt% · 未完成部分将重新发送';
+        break;
+      case TransferStatus.canceled:
+        subtitle = '$dirLabel · ${p.error ?? '已放弃本次传输'}';
+        break;
+      case TransferStatus.failed:
+        subtitle = '$dirLabel · ${p.error ?? '传输失败'}';
+        break;
+      case TransferStatus.inProgress:
+        subtitle = '$dirLabel · ${formatBytes(p.bytesTransferred)} / ${formatBytes(p.fileSize)}'
+            ' · ${formatSpeed(p.speedBps)}'
+            '${p.retryNote != null ? ' · ${p.retryNote}' : ''}';
+        break;
+      default:
+        subtitle = '$dirLabel · ${formatBytes(p.bytesTransferred)} / ${formatBytes(p.fileSize)}'
+            '${p.error != null ? ' · ${p.error}' : ''}';
+    }
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
@@ -877,11 +953,32 @@ class _HomePageState extends State<HomePage> {
           LinearProgressIndicator(value: pct),
           const SizedBox(height: 2),
           Text(
-            '${p.incoming ? '接收' : '发送'} · ${formatBytes(p.bytesTransferred)} / ${formatBytes(p.fileSize)}'
-            '${p.status == TransferStatus.inProgress ? ' · ${formatSpeed(p.speedBps)}' : ''}'
-            '${p.error != null ? ' · ${p.error}' : ''}',
+            subtitle,
             style: const TextStyle(fontSize: 11, color: Colors.grey),
           ),
+          // 已中断（§3.5）：继续传输 / 取消
+          if (p.status == TransferStatus.interrupted)
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                  ),
+                  child: const Text('继续传输'),
+                  onPressed: () => _resume(p.fileId),
+                ),
+                TextButton(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                  ),
+                  child: const Text('取消'),
+                  onPressed: () => _cancel(p.fileId),
+                ),
+              ],
+            ),
           if (p.incoming && p.status == TransferStatus.completed && p.filePath != null) ...[
             const SizedBox(height: 4),
             Align(

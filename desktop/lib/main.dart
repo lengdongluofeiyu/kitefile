@@ -362,7 +362,9 @@ class WhoAmI {
       );
 }
 
-enum TransferStatus { pending, inProgress, completed, failed, canceled }
+/// 传输状态（与 Rust `TransferStatus` 一一对应，契约测试锁定）。
+/// `interrupted` = 已中断（可「继续传输」），**不等于** failed/canceled（§3.5）。
+enum TransferStatus { pending, inProgress, completed, failed, canceled, interrupted }
 
 TransferStatus _parseStatus(String s) {
   switch (s) {
@@ -376,6 +378,8 @@ TransferStatus _parseStatus(String s) {
       return TransferStatus.failed;
     case 'Canceled':
       return TransferStatus.canceled;
+    case 'Interrupted':
+      return TransferStatus.interrupted;
     default:
       return TransferStatus.pending;
   }
@@ -395,6 +399,8 @@ class TransferProgress {
   final bool incoming;
   /// 接收完成后的最终保存路径（仅接收方 Completed 时有值）
   final String? filePath;
+  /// 自动重试提示（如「第 2/3 次重试流 3…」）；非空时角标显示「重试中」
+  final String? retryNote;
   const TransferProgress({
     required this.fileId,
     required this.fileName,
@@ -407,20 +413,23 @@ class TransferProgress {
     required this.error,
     this.incoming = false,
     this.filePath,
+    this.retryNote,
   });
 
+  /// 安全解析（工作流 B）：缺字段/错类型一律降级为安全默认，禁止硬转崩溃。
   factory TransferProgress.fromJson(Map<String, dynamic> j) => TransferProgress(
-        fileId: j['file_id'] as String,
-        fileName: j['file_name'] as String,
-        fileSize: (j['file_size'] as num).toInt(),
-        bytesTransferred: (j['bytes_transferred'] as num).toInt(),
-        chunksDone: (j['chunks_done'] as num).toInt(),
-        chunksTotal: (j['chunks_total'] as num).toInt(),
-        speedBps: (j['speed_bps'] as num).toInt(),
-        status: _parseStatus(j['status'] as String),
+        fileId: j['file_id'] as String? ?? '',
+        fileName: j['file_name'] as String? ?? '',
+        fileSize: (j['file_size'] as num?)?.toInt() ?? 0,
+        bytesTransferred: (j['bytes_transferred'] as num?)?.toInt() ?? 0,
+        chunksDone: (j['chunks_done'] as num?)?.toInt() ?? 0,
+        chunksTotal: (j['chunks_total'] as num?)?.toInt() ?? 0,
+        speedBps: (j['speed_bps'] as num?)?.toInt() ?? 0,
+        status: _parseStatus(j['status'] as String? ?? 'Pending'),
         error: j['error'] as String?,
-        incoming: j['incoming'] as bool? ?? false,
+        incoming: (j['incoming'] as bool?) ?? false,
         filePath: j['file_path'] as String?,
+        retryNote: j['retry_note'] as String?,
       );
 }
 
@@ -506,6 +515,8 @@ class _HomePageState extends State<HomePage> with WindowListener {
   final Map<String, bool> _batchDecision = {};
   /// 已经为该 fileId 弹过完成提示，避免重复弹窗
   final Set<String> _notifiedComplete = {};
+  /// 已通知过「传输中断」的 file_id（一条传输只弹一次）
+  final Set<String> _notifiedInterrupted = {};
   WebSocket? _ws;
   Timer? _refreshTimer;
   bool _daemonOnline = false;
@@ -623,6 +634,24 @@ class _HomePageState extends State<HomePage> with WindowListener {
     }
   }
 
+  /// 传输中断且窗口不可见时通知（§3.5）：点击拉起主窗口去「继续传输」
+  Future<void> _notifyInterruptedIfNeeded(TransferProgress p) async {
+    try {
+      final visible = await windowManager.isVisible();
+      final minimized = await windowManager.isMinimized();
+      if (visible && !minimized) return;
+      final pct = p.fileSize > 0 ? (p.bytesTransferred / p.fileSize * 100).round() : 0;
+      final n = LocalNotification(
+        title: '传输中断',
+        body: '「${p.fileName}」可继续，已完成 $pct%\n点击 KiteFile 继续传输',
+      );
+      n.onClick = bringAppToForeground;
+      n.show();
+    } catch (e) {
+      debugPrint('[Notify] interrupted failed: $e');
+    }
+  }
+
   Future<void> _initDaemon() async {
     // 等待 daemonManager 拉起的 daemon 就绪（最多再轮询 10s）
     _startupPollTimer = Timer.periodic(const Duration(seconds: 1), (t) async {
@@ -634,7 +663,11 @@ class _HomePageState extends State<HomePage> with WindowListener {
       if (_daemonOnline) {
         t.cancel();
         _refreshDevices();
-        _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) => _refreshDevices());
+        // 周期刷新同时复核 whoami：daemon 被杀后 3s 内徽标掉线（A3.6）
+        _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+          _refreshDevices();
+          _fetchWhoAmI();
+        });
         _connectWs();
       }
     });
@@ -643,7 +676,10 @@ class _HomePageState extends State<HomePage> with WindowListener {
     if (_daemonOnline) {
       _startupPollTimer?.cancel();
       _refreshDevices();
-      _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) => _refreshDevices());
+      _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+        _refreshDevices();
+        _fetchWhoAmI();
+      });
       _connectWs();
     }
   }
@@ -656,7 +692,9 @@ class _HomePageState extends State<HomePage> with WindowListener {
         _me = me;
         _daemonOnline = true;
       });
-    } catch (_) {
+    } catch (e) {
+      // 在线徽标唯一真值（A3.6）：轮询失败必须掉线，禁止吞掉后仍显示已连接
+      debugPrint('[kitefile] whoami poll failed: $e');
       setState(() => _daemonOnline = false);
     }
   }
@@ -668,19 +706,42 @@ class _HomePageState extends State<HomePage> with WindowListener {
       setState(() {
         _devices = list.map(Device.fromJson).toList();
       });
-    } catch (_) {}
+    } catch (e) {
+      // 设备列表是本机 daemon 接口：失败留日志（徽标由 whoami 轮询定真值）
+      debugPrint('[kitefile] devices refresh failed: $e');
+    }
   }
 
   Future<void> _connectWs() async {
     try {
-      _ws = await WebSocket.connect(kDaemonWs);
-      _ws!.listen((data) {
-        if (data is String) {
-          _handleWsMessage(jsonDecode(data) as Map<String, dynamic>);
-        }
-      });
-    } catch (_) {
-      // retry later
+      final ws = await WebSocket.connect(kDaemonWs);
+      _ws = ws;
+      ws.listen(
+        (data) {
+          if (data is String) {
+            try {
+              _handleWsMessage(jsonDecode(data) as Map<String, dynamic>);
+            } catch (e) {
+              debugPrint('[kitefile] ws message parse failed: $e');
+            }
+          }
+        },
+        onDone: () {
+          // daemon 退出 / WS 断开：立刻掉线真值 + 复核 whoami + 重连
+          debugPrint('[kitefile] ws closed');
+          if (mounted) setState(() => _daemonOnline = false);
+          _ws = null;
+          _fetchWhoAmI();
+          Future.delayed(const Duration(seconds: 5), _connectWs);
+        },
+        onError: (Object e) {
+          debugPrint('[kitefile] ws error: $e');
+          if (mounted) setState(() => _daemonOnline = false);
+        },
+      );
+    } catch (e) {
+      debugPrint('[kitefile] ws connect failed: $e');
+      if (mounted) setState(() => _daemonOnline = false);
       Future.delayed(const Duration(seconds: 5), _connectWs);
     }
   }
@@ -699,6 +760,12 @@ class _HomePageState extends State<HomePage> with WindowListener {
           _notifiedComplete.add(p.fileId);
           _showReceivedDialog(p);
           _notifyReceivedIfNeeded(p);
+        }
+        // 传输中断（§3.5 系统通知）：窗口隐藏时提示可继续
+        if (p.status == TransferStatus.interrupted &&
+            !_notifiedInterrupted.contains(p.fileId)) {
+          _notifiedInterrupted.add(p.fileId);
+          _notifyInterruptedIfNeeded(p);
         }
         break;
       case 'incoming':
@@ -1212,7 +1279,9 @@ class _HomePageState extends State<HomePage> with WindowListener {
     // 404 = 传输已结束/不存在，静默忽略
     try {
       await httpPost('$kDaemonHttp/api/cancel/$fileId', body: '');
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('[kitefile] cancel failed: $e');
+    }
   }
 
   @override
@@ -1349,20 +1418,49 @@ class _HomePageState extends State<HomePage> with WindowListener {
 
   Widget _transferTile(TransferProgress p) {
     final pct = p.fileSize > 0 ? p.bytesTransferred / p.fileSize : 0.0;
+    final pctInt = (pct * 100).round();
+    // 角标文案（§3.5）：中断 ≠ 失败 ≠ 取消；自动重试期间角标改「重试中」
+    final retrying = p.status == TransferStatus.inProgress && p.retryNote != null;
     final statusText = {
       TransferStatus.pending: '等待',
-      TransferStatus.inProgress: '进行中',
+      TransferStatus.inProgress: retrying ? '重试中' : '传输中',
       TransferStatus.completed: '已完成',
-      TransferStatus.failed: '失败',
+      TransferStatus.failed: '传输失败',
       TransferStatus.canceled: '已取消',
+      TransferStatus.interrupted: '已中断',
     }[p.status]!;
     final statusColor = {
       TransferStatus.completed: Colors.green,
       TransferStatus.failed: Colors.red,
-      TransferStatus.inProgress: Colors.blue,
+      TransferStatus.inProgress: retrying ? Colors.amber.shade800 : Colors.blue,
       TransferStatus.canceled: Colors.orange,
       TransferStatus.pending: Colors.grey,
+      TransferStatus.interrupted: Colors.amber.shade800,
     }[p.status]!;
+
+    // 副文案（§3.5）
+    String subtitle;
+    switch (p.status) {
+      case TransferStatus.interrupted:
+        // 「流 3/8 失败（连接超时）· 已完成 48% · 未完成部分将重新发送」
+        subtitle =
+            '${p.error ?? '传输中断'} · 已完成 $pctInt% · 未完成部分将重新发送';
+        break;
+      case TransferStatus.canceled:
+        subtitle = p.error ?? '已放弃本次传输';
+        break;
+      case TransferStatus.failed:
+        subtitle = p.error ?? '传输失败';
+        break;
+      case TransferStatus.inProgress:
+        subtitle = '${formatBytes(p.bytesTransferred)} / ${formatBytes(p.fileSize)}'
+            ' · ${formatSpeed(p.speedBps)}'
+            '${p.retryNote != null ? ' · ${p.retryNote}' : ''}';
+        break;
+      default:
+        subtitle = '${formatBytes(p.bytesTransferred)} / ${formatBytes(p.fileSize)}'
+            '${p.error != null ? ' · ${p.error}' : ''}';
+    }
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
@@ -1392,11 +1490,32 @@ class _HomePageState extends State<HomePage> with WindowListener {
           LinearProgressIndicator(value: pct),
           const SizedBox(height: 4),
           Text(
-            '${formatBytes(p.bytesTransferred)} / ${formatBytes(p.fileSize)}'
-            '${p.status == TransferStatus.inProgress ? ' · ${formatSpeed(p.speedBps)}' : ''}'
-            '${p.error != null ? ' · ${p.error}' : ''}',
+            subtitle,
             style: const TextStyle(fontSize: 12, color: Colors.grey),
           ),
+          // 已中断（§3.5）：继续传输 / 取消
+          if (p.status == TransferStatus.interrupted)
+            Row(
+              children: [
+                TextButton.icon(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                  ),
+                  icon: const Icon(Icons.play_arrow, size: 14),
+                  label: const Text('继续传输'),
+                  onPressed: () => _resume(p.fileId),
+                ),
+                TextButton(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                  ),
+                  child: const Text('取消'),
+                  onPressed: () => _cancel(p.fileId),
+                ),
+              ],
+            ),
           // 接收完成的条目：显示保存路径 + 打开文件 / 所在文件夹
           if (p.status == TransferStatus.completed &&
               p.incoming &&
@@ -1432,6 +1551,16 @@ class _HomePageState extends State<HomePage> with WindowListener {
         ],
       ),
     );
+  }
+
+  /// 「继续传输」：只重发未完成段（A3.2）。本机是发送方或接收方均由 daemon 路由。
+  Future<void> _resume(String fileId) async {
+    try {
+      await httpPost('$kDaemonHttp/api/transfers/$fileId/resume', body: '{}');
+    } catch (e) {
+      // 不静默吞：至少留日志（A3.6 精神）
+      debugPrint('[kitefile] resume failed: $e');
+    }
   }
 
   Widget _kv(String k, String v) {
