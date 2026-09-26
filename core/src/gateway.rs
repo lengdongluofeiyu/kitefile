@@ -444,6 +444,10 @@ async fn peer_resumed(
 ///
 /// 接收方据此做最终校验并 finalize（sha256 传完再算，offer 不携带哈希，
 /// 大文件弹窗即时出现）。body: {"sha256": "<hex>" 或 null}
+///
+/// 响应（A3.2 状态机对齐）：`{"result": "finalized"|"pending"|"missing",
+/// "chunks_done": [bool…] | null}`——pending 时发送方必须按位图回退并显示
+/// 已中断，不得凭 200 报已完成（否则两边状态永久分叉）。
 #[derive(Debug, Deserialize)]
 struct VerifyRequest {
     sha256: Option<String>,
@@ -455,7 +459,11 @@ async fn verify_file(
     Json(req): Json<VerifyRequest>,
 ) -> impl IntoResponse {
     match state.transfer.apply_final_sha256(&file_id, req.sha256).await {
-        Ok(()) => StatusCode::OK.into_response(),
+        Ok(outcome) => Json(serde_json::json!({
+            "result": outcome.as_str(),
+            "chunks_done": outcome.chunks(),
+        }))
+        .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

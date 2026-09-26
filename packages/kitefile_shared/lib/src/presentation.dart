@@ -79,6 +79,13 @@ String transferSubtitle(TransferProgress p, {bool showDirection = false}) {
     case TransferStatus.failed:
       return '$dir${p.error ?? '传输失败'}';
     case TransferStatus.inProgress:
+      // 接收方字节已收满但仍在等发送方 verify 回执/保险丝窗口（A3.8）：
+      // 这期间状态确为 InProgress，但显示「传输中 · 0 B/s」会让人以为卡死，
+      // 明确标出「已收满，等待发送方校验」。
+      if (p.incoming && p.fileSize > 0 && p.bytesTransferred >= p.fileSize) {
+        return '$dir${formatBytes(p.fileSize)} / ${formatBytes(p.fileSize)}'
+            ' · 已收满，等待发送方校验';
+      }
       return '$dir${formatBytes(p.bytesTransferred)} / ${formatBytes(p.fileSize)}'
           ' · ${formatSpeed(p.speedBps)}'
           '${p.retryNote != null ? ' · ${p.retryNote}' : ''}';

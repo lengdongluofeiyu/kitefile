@@ -532,6 +532,71 @@ async fn test_cancel_after_completion_keeps_terminal_state() {
     let _ = std::fs::remove_dir_all(&dir_b);
 }
 
+/// 工作流 E/A3.2：verify 回执必须如实反映接收方任务状态——
+/// 未收齐 → pending（带权威位图）；收齐 → finalized；无此任务 → missing。
+/// 发送方靠它决定终态，只回 200 会造成两端状态永久分叉（真机踩过）。
+#[tokio::test]
+async fn test_verify_receipt_shapes() {
+    require_sockets!("test_verify_receipt_shapes");
+    let dir = temp_dir("verify-receipt");
+    let engine = start_stack(18052, 18152, &dir, 2).await;
+
+    // ① 未收齐 → pending + 位图
+    engine
+        .storage
+        .create_slot("vr-pending".into(), "a.bin".into(), 10, 2, None, true)
+        .await
+        .unwrap();
+    let v = http_json(
+        18052,
+        "POST",
+        "/api/verify/vr-pending",
+        Some(r#"{"sha256":"00"}"#),
+    )
+    .await;
+    assert_eq!(v["result"], json!("pending"));
+    assert_eq!(v["chunks_done"], json!([false, false]));
+
+    // ② 收齐 + 正确 sha → finalized（且真正落盘）
+    let content = b"1234567890";
+    engine
+        .storage
+        .create_slot("vr-done".into(), "b.bin".into(), 10, 2, None, true)
+        .await
+        .unwrap();
+    engine.storage.write_at("vr-done", 0, b"12345").await.unwrap();
+    engine.storage.write_at("vr-done", 5, b"67890").await.unwrap();
+    engine.storage.finish_stream("vr-done", 0).await.unwrap();
+    engine.storage.finish_stream("vr-done", 1).await.unwrap();
+    let sha = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(content);
+        format!("{:x}", h.finalize())
+    };
+    let v = http_json(
+        18052,
+        "POST",
+        "/api/verify/vr-done",
+        Some(&json!({ "sha256": sha }).to_string()),
+    )
+    .await;
+    assert_eq!(v["result"], json!("finalized"));
+    assert!(dir.join("b.bin").exists(), "finalized 必须真实落盘");
+
+    // ③ 无此任务 → missing（幂等：对不存在/已清理的任务如实上报）
+    let v = http_json(
+        18052,
+        "POST",
+        "/api/verify/vr-none",
+        Some(r#"{"sha256":null}"#),
+    )
+    .await;
+    assert_eq!(v["result"], json!("missing"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ============ incoming offer：登记 / 列表 / 接受 / 拒绝 ============
 
 fn fake_offer(file_id: &str, file_size: u64, from_gateway_port: u16) -> String {

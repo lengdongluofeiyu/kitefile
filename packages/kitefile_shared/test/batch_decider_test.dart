@@ -182,5 +182,39 @@ void main() {
       );
       expect(s, startsWith('发送 · '));
     });
+
+    test('接收方收满但仍在等 verify：标「已收满，等待发送方校验」', () {
+      // 真机不一致场景：字节 100% 但接收方还没 finalize——
+      // 不能显示「传输中 · 0 B/s」让人以为卡死
+      final waiting = TransferProgress(
+        fileId: 'f',
+        fileName: 'a.jpg',
+        fileSize: 100,
+        bytesTransferred: 100,
+        chunksDone: 0,
+        chunksTotal: 1,
+        speedBps: 0,
+        status: TransferStatus.inProgress,
+        error: null,
+        incoming: true,
+      );
+      expect(transferSubtitle(waiting), contains('已收满，等待发送方校验'));
+      expect(transferSubtitle(waiting), isNot(contains('0 B/s')));
+
+      // 发送方（非 incoming）同状态不误伤：仍显示正常速度行
+      final sender = TransferProgress(
+        fileId: 'f',
+        fileName: 'a.jpg',
+        fileSize: 100,
+        bytesTransferred: 100,
+        chunksDone: 0,
+        chunksTotal: 1,
+        speedBps: 1024,
+        status: TransferStatus.inProgress,
+        error: null,
+        incoming: false,
+      );
+      expect(transferSubtitle(sender), isNot(contains('已收满')));
+    });
   });
 }

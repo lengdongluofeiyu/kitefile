@@ -423,6 +423,38 @@ struct SendSession {
     running: bool,
 }
 
+/// `/api/verify` 处理回执（发送方据此决定终态，A3.2 状态机对齐）。
+///
+/// 只回 200 不够：段没收齐时接收方**不会** finalize，发送方若凭 200 报
+/// 已完成，两边状态就永久分叉（真机实测：手机「已完成」/ 桌面「已中断」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyOutcome {
+    /// 接收方已 finalize（校验通过落盘；或校验失败也已推 Failed 终态）
+    Finalized,
+    /// 槽位在但段未收齐；携带**接收方权威完成位图**供发送方回退会话位图
+    Pending { chunks_done: Vec<bool> },
+    /// 槽位不存在（已完成过 / 已被取消清理）
+    Missing,
+}
+
+impl VerifyOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VerifyOutcome::Finalized => "finalized",
+            VerifyOutcome::Pending { .. } => "pending",
+            VerifyOutcome::Missing => "missing",
+        }
+    }
+
+    /// 供 verify 响应回传的位图（仅 Pending 有值）
+    pub fn chunks(&self) -> Option<&[bool]> {
+        match self {
+            VerifyOutcome::Pending { chunks_done } => Some(chunks_done),
+            _ => None,
+        }
+    }
+}
+
 /// 传输引擎：负责发送与接收
 pub struct TransferEngine {
     pub transfer_port: u16,
@@ -1009,18 +1041,30 @@ impl TransferEngine {
     }
 
     /// 接收方收到发送方补发的最终 sha256（POST /api/verify/:file_id）。
+    ///
+    /// 返回结构化回执（A3.2 状态机对齐）：发送方**不能只看 HTTP 200** 就报
+    /// 已完成——段没收齐时接收方不会 finalize，两边状态会永久分叉。
     pub async fn apply_final_sha256(
         &self,
         file_id: &str,
         sha256: Option<String>,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<VerifyOutcome> {
         let Some(slot) = self.storage.set_final_sha256(file_id, sha256).await else {
-            return Ok(());
+            return Ok(VerifyOutcome::Missing);
         };
         if slot.is_complete() {
-            return self.finish_receive(file_id, &slot).await;
+            // finalize 失败（如 sha 不匹配）也已推 Failed 终态帧：
+            // 对发送方而言任务同样「已终态」，回 Finalized 而不是 500。
+            if let Err(e) = self.finish_receive(file_id, &slot).await {
+                warn!(%file_id, error = %e, "finalize after verify failed (terminal state already pushed)");
+            }
+            return Ok(VerifyOutcome::Finalized);
         }
-        Ok(())
+        // 段未收齐：携带**接收方权威完成位图**——TCP 写成功 ≠ 对端应用层收齐，
+        // 发送方据此回退会话位图，续传只发接收方缺的段。
+        Ok(VerifyOutcome::Pending {
+            chunks_done: slot.streams_done,
+        })
     }
 
     /// UI 决策后调用
@@ -1506,18 +1550,71 @@ impl TransferEngine {
                     return;
                 }
                 let body = serde_json::json!({ "sha256": sha256 }).to_string();
-                if let Err(e) = http_post_json(
+                let resp = post_verify(
                     &snap.target_ip,
                     snap.target_gateway_port,
-                    &format!("/api/verify/{}", file_id),
+                    &file_id,
                     &body,
                 )
-                .await
-                {
-                    // 数据已全部送达，补发校验值失败不否定传输本身：
-                    // 接收方 verify 保险丝会跳过校验完成落盘（A3.8）。
-                    warn!(file_id = %file_id, error = %e, "notify verify failed, receiver will fall back to fuse");
+                .await;
+                let verified = resp.as_deref().and_then(parse_verify_result);
+                if resp.is_some() && verified.is_none() {
+                    // 旧对端空 body / 未知 result：宽容当 finalized（不谎报失败）
+                    warn!(%file_id, "verify receipt unparsed, treat as finalized");
                 }
+                if resp.is_none() {
+                    warn!(
+                        %file_id,
+                        "verify no receipt, receiver fuse will finalize (fallback)"
+                    );
+                }
+
+                // **以接收方回执为准**（A3.2 状态机对齐）：段没收齐时接收方
+                // 不会 finalize，发送方凭 200 报 Completed 会让两边永久分叉。
+                if let Some(VerifyOutcome::Pending { chunks_done }) = verified {
+                    {
+                        // TCP 写成功 ≠ 对端应用层收齐：位图以接收方为权威回退
+                        let mut done = snap.streams_done.lock();
+                        if chunks_done.len() == done.len() {
+                            *done = chunks_done;
+                        } else {
+                            for b in done.iter_mut() {
+                                *b = false;
+                            }
+                        }
+                    }
+                    warn!(
+                        %file_id,
+                        "receiver has not received all chunks → Interrupted (aligned)"
+                    );
+                    let (chunks, bytes) =
+                        done_stats(&snap.streams_done, snap.file_size, snap.stream_count);
+                    push_progress(
+                        &snap.progress_tx,
+                        TransferProgress {
+                            file_id: file_id.clone(),
+                            file_name: snap.file_name.clone(),
+                            file_size: snap.file_size,
+                            bytes_transferred: bytes,
+                            chunks_done: chunks,
+                            chunks_total: snap.stream_count as u64,
+                            speed_bps: 0,
+                            status: TransferStatus::Interrupted,
+                            error: Some("接收方尚未收齐，数据未确认送达".into()),
+                            incoming: false,
+                            file_path: None,
+                            retry_note: None,
+                        },
+                    )
+                    .await;
+                    // 保留会话（同 SendOutcome::Interrupted 分支：先推帧后落 running）
+                    let mut sessions = self.send_sessions.lock().await;
+                    if let Some(s) = sessions.get_mut(&file_id) {
+                        s.running = false;
+                    }
+                    return;
+                }
+
                 self.cleanup_send_final(&file_id).await;
                 push_progress(
                     &snap.progress_tx,
@@ -2279,6 +2376,68 @@ fn parse_slot_flag(body: &str) -> Option<bool> {
         .ok()?
         .get("slot")?
         .as_bool()
+}
+
+/// 补发校验值并读取接收方回执（A3.2：发送方终态以回执为准）。
+///
+/// - transport 错误（refused/reset/超时）有限重试 3 次（0.3s / 1s 退避）；
+/// - 对端 HTTP 拒绝（InvalidData）不重试（A3.4：终态判决）；
+/// - 全部失败返回 None——调用方按「接收方保险丝兜底」宽容 Completed（不谎报失败）。
+async fn post_verify(
+    host: &str,
+    port: u16,
+    file_id: &str,
+    body: &str,
+) -> Option<String> {
+    const ATTEMPTS: u32 = 3;
+    const BACKOFF_MS: [u64; 2] = [300, 1000];
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(
+                BACKOFF_MS[(attempt - 1) as usize],
+            ))
+            .await;
+        }
+        match http_post_json(host, port, &format!("/api/verify/{}", file_id), body).await {
+            Ok(r) => return Some(r),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                warn!(attempt, error = %e, "verify rejected by peer, no retry");
+                return None;
+            }
+            Err(e) => {
+                warn!(attempt, error = %e, "verify post failed, will retry");
+            }
+        }
+    }
+    None
+}
+
+/// 解析 verify 回执 `{"result": …, "chunks_done": […]}`。
+///
+/// - `pending` 但位图缺失/损坏 → `Pending { chunks_done: 空 }`（长度不符时
+///   调用方按「全未完成」回退——保守正确，宁可整段重发也不谎报）；
+/// - 坏 JSON / 旧对端空 body → None（宽容：当 finalized 处理，维持不谎报失败）。
+fn parse_verify_result(body: &str) -> Option<VerifyOutcome> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    match v.get("result")?.as_str()? {
+        "finalized" => Some(VerifyOutcome::Finalized),
+        "missing" => Some(VerifyOutcome::Missing),
+        "pending" => {
+            let chunks = v
+                .get("chunks_done")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|b| b.as_bool().unwrap_or(false))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Some(VerifyOutcome::Pending {
+                chunks_done: chunks,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn file_id_prefix_u64(file_id: &str) -> u64 {
@@ -3271,5 +3430,145 @@ mod tests {
             1,
             "对端明确拒绝只允许打一次，不得退避重试"
         );
+    }
+
+    // ============ verify 回执：两端状态机对齐（真机「手机已完成/桌面已中断」） ============
+
+    /// apply_final_sha256 三态：无槽 Missing / 未收齐 Pending（权威位图）/ 收齐 Finalized。
+    #[tokio::test]
+    async fn apply_verify_three_outcomes() {
+        let dir = tmp_dir("verify-outcome");
+        let engine = TransferEngine::new(0, 2, dir.clone());
+
+        // Missing：槽位不存在
+        let o = engine.apply_final_sha256("nope", Some("00".into())).await.unwrap();
+        assert_eq!(o, VerifyOutcome::Missing);
+
+        // Pending：未收齐 → 带接收方位图
+        engine
+            .storage
+            .create_slot("vf-p".into(), "a.bin".into(), 10, 2, None, true)
+            .await
+            .unwrap();
+        let o = engine.apply_final_sha256("vf-p", Some("00".into())).await.unwrap();
+        assert_eq!(o, VerifyOutcome::Pending { chunks_done: vec![false, false] });
+
+        // Finalized：收齐 + sha 匹配 → 真实落盘
+        engine
+            .storage
+            .create_slot("vf-d".into(), "b.bin".into(), 10, 2, None, true)
+            .await
+            .unwrap();
+        engine.storage.write_at("vf-d", 0, b"12345").await.unwrap();
+        engine.storage.write_at("vf-d", 5, b"67890").await.unwrap();
+        engine.storage.finish_stream("vf-d", 0).await.unwrap();
+        engine.storage.finish_stream("vf-d", 1).await.unwrap();
+        let sha = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"1234567890");
+            format!("{:x}", h.finalize())
+        };
+        let o = engine.apply_final_sha256("vf-d", Some(sha)).await.unwrap();
+        assert_eq!(o, VerifyOutcome::Finalized);
+        assert!(dir.join("b.bin").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// verify 回执解析：三态 + 坏 JSON/未知 result → None（宽容）+ pending 无位图 → 空位图。
+    #[test]
+    fn parse_verify_result_variants() {
+        assert_eq!(
+            parse_verify_result(r#"{"result":"finalized","chunks_done":null}"#),
+            Some(VerifyOutcome::Finalized)
+        );
+        assert_eq!(
+            parse_verify_result(r#"{"result":"missing","chunks_done":null}"#),
+            Some(VerifyOutcome::Missing)
+        );
+        assert_eq!(
+            parse_verify_result(r#"{"result":"pending","chunks_done":[true,false]}"#),
+            Some(VerifyOutcome::Pending { chunks_done: vec![true, false] })
+        );
+        // pending 但位图缺失 → 空位图（调用方按全未完成回退，保守正确）
+        assert_eq!(
+            parse_verify_result(r#"{"result":"pending"}"#),
+            Some(VerifyOutcome::Pending { chunks_done: vec![] })
+        );
+        // 坏 JSON / 旧对端空 body / 未知 result → None（宽容当 finalized）
+        assert_eq!(parse_verify_result(""), None);
+        assert_eq!(parse_verify_result("not json"), None);
+        assert_eq!(parse_verify_result(r#"{"result":"weird"}"#), None);
+    }
+
+    /// verify 对端明确 HTTP 拒绝不重试（hits==1）。
+    #[tokio::test]
+    async fn post_verify_reject_short_circuits() {
+        let (port, hits) = spawn_fixed_http("500 Internal Server Error", "boom").await;
+        let out = post_verify("127.0.0.1", port, "fid", "{}").await;
+        assert!(out.is_none());
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "HTTP 判决不重试");
+    }
+
+    /// 真机场景回归：发送方 do_send 全部成功（TCP 写完），但接收方回执
+    /// pending + 权威位图 → 发送方必须回退位图并显示**已中断**（保留会话可续），
+    /// 不得 Completed——否则两端状态永久分叉（手机已完成 / 桌面已中断）。
+    #[tokio::test]
+    async fn verify_pending_aligns_sender_to_interrupted() {
+        let dir = tmp_dir("verify-align");
+        let (gw_port, _hits) = spawn_fixed_http(
+            "200 OK",
+            r#"{"result":"pending","chunks_done":[true,false]}"#,
+        )
+        .await;
+        let src = dir.join("src.bin");
+        std::fs::write(&src, b"0123456789").unwrap();
+        let engine = Arc::new(TransferEngine::new(0, 4, dir.clone()));
+        // 位图全 true：do_send 各段直接 skip → Completed → hash → verify
+        let (mut rx, _cancel) = insert_session(
+            &engine,
+            "fid-align",
+            "src.bin",
+            src,
+            10,
+            2,
+            "127.0.0.1",
+            free_port(),
+            gw_port,
+            vec![true, true],
+        )
+        .await;
+
+        engine.clone().run_transfer("fid-align".into(), false).await;
+
+        let mut frames = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            frames.push(p);
+        }
+        let statuses: Vec<_> = frames.iter().map(|f| f.status).collect();
+        assert!(
+            !statuses.contains(&TransferStatus::Completed),
+            "pending 回执下不得出现 Completed（statuses={statuses:?}）"
+        );
+        let last = frames.last().expect("应有终态帧");
+        assert_eq!(last.status, TransferStatus::Interrupted);
+        assert!(
+            last.error.as_deref().unwrap_or("").contains("接收方尚未收齐"),
+            "got {:?}",
+            last.error
+        );
+
+        // 会话保留且位图按接收方权威回退 → 续传只发缺的段1
+        let sessions = engine.send_sessions.lock().await;
+        let s = sessions.get("fid-align").expect("pending 必须保留会话");
+        assert!(!s.running, "中断后 running 必须落回");
+        assert_eq!(
+            *s.streams_done.lock(),
+            vec![true, false],
+            "位图必须以接收方回执为准回退"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
