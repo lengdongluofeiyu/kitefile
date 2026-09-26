@@ -1,4 +1,4 @@
-# KiteFile 一键构建脚本
+﻿# KiteFile 一键构建脚本
 #
 # 用法：
 #   .\scripts\build-all.ps1                    # 全量构建
@@ -115,7 +115,16 @@ if (-not $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER -and $env:ANDROID_HOME) 
     }
 }
 
-$env:PATH = "$env:CARGO_HOME\bin;$(if ($env:JAVA_HOME) { \"$env:JAVA_HOME\bin;\" });$(if ($env:ANDROID_HOME) { \"$env:ANDROID_HOME\cmdline-tools\latest\bin;$env:ANDROID_HOME\platform-tools;\" });$env:PATH"
+# PATH 组装：JAVA_HOME / ANDROID_HOME 存在才追加。
+# 注意：PowerShell 子表达式里不能用 C 风格 \"...\" 转义（会把整段当命令名，
+# JAVA_HOME 一设置就 CommandNotFound）；改用数组拼接，语义一目了然。
+$pathParts = @("$env:CARGO_HOME\bin")
+if ($env:JAVA_HOME) { $pathParts += "$env:JAVA_HOME\bin" }
+if ($env:ANDROID_HOME) {
+    $pathParts += "$env:ANDROID_HOME\cmdline-tools\latest\bin"
+    $pathParts += "$env:ANDROID_HOME\platform-tools"
+}
+$env:PATH = ($pathParts -join ';') + ";$env:PATH"
 
 # 临时目录不存在就建一个
 if (-not (Test-Path $env:TEMP)) {
@@ -135,7 +144,9 @@ function Write-Err([string]$msg)  { Write-Host "    [ERR] $msg" -ForegroundColor
 # 桌面端下次启动时会自动重新拉起 daemon，无需担心。
 function Stop-FtcoreProcesses {
     $stopped = $false
-    foreach ($name in 'kitefile-cli', 'kitefile_desktop') {
+    # 含改名前的旧进程名（ftcore-*）：旧版残留会锁住 dist\windows\*.dll，
+    # 只认新名字会让 Copy-Item 反复失败（2026-09-26 实测）。
+    foreach ($name in 'kitefile-cli', 'kitefile_desktop', 'ftcore-cli', 'ftcore_desktop') {
         $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
         if ($procs) {
             $procs | Stop-Process -Force
