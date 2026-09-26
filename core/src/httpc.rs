@@ -62,6 +62,8 @@ pub async fn http_post_json_with(
 
     // 非 2xx 视为错误（工作流 B）：对端明确拒绝（协议版本不符、404 等）
     // 必须让调用方看见，而不是把错误页当成功响应吞掉。
+    // kind 用 InvalidData 以区别 transport 错误（refused/reset/timeout 不产生它）：
+    // 调用方靠 kind 区分「对端明确判决」与「链路不通」（如 resume 的 404 vs 离线文案）。
     let status = response_str
         .lines()
         .next()
@@ -70,7 +72,7 @@ pub async fn http_post_json_with(
         .unwrap_or(0);
     if !(200..300).contains(&status) {
         return Err(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::InvalidData,
             format!("http status {}", status),
         ));
     }
@@ -135,5 +137,33 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(body, "ok");
+    }
+
+    /// 非 2xx → `InvalidData`（与 transport 错误可区分）。
+    /// resume 文案（404=任务已结束 vs 离线）与 offer 重试短路都依赖这个 kind。
+    #[tokio::test]
+    async fn non_2xx_maps_to_invalid_data() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let resp =
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\nConnection: close\r\n\r\nnope";
+            let _ = sock.write_all(resp).await;
+        });
+        let err = http_post_json_with(
+            "127.0.0.1",
+            port,
+            "/api/x",
+            "{}",
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("404"), "错误应带状态码：{err}");
     }
 }

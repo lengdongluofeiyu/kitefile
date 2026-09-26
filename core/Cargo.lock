@@ -451,6 +451,7 @@ dependencies = [
  "base64",
  "futures-util",
  "if-addrs",
+ "libc",
  "mdns-sd",
  "parking_lot",
  "serde",

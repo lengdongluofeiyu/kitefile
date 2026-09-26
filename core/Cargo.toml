@@ -57,6 +57,9 @@ uuid = { version = "1", features = ["v4"] }
 parking_lot = "0.12"
 if-addrs = "0.13"
 tokio-util = { version = "0.7", features = ["io"] }
+# libc：/proc/self/fd 的 dup 打开（Android SAF 零拷贝，见 transfer::open_source_file）。
+# 本来就在传递依赖树里，提为直接依赖不引入新下载。
+libc = "0.2"
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"

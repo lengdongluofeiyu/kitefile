@@ -321,9 +321,15 @@ async fn test_resume_unknown_404() {
     let (status, _) = http(18050, "POST", "/api/peer-resume/nonexistent-id", Some("{}")).await;
     assert_eq!(status, 404);
 
-    // 对端已续传通知：幂等 200（接收方无该任务时静默忽略）
-    let (status, _) = http(18050, "POST", "/api/peer-resumed/nonexistent-id", Some("{}")).await;
-    assert_eq!(status, 200);
+    // 对端已续传通知：200 且上报本机槽位状态（slot=false = 无此任务）
+    let v = http_json(
+        18050,
+        "POST",
+        "/api/peer-resumed/nonexistent-id",
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(v["slot"], json!(false), "无槽位必须如实上报 false");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

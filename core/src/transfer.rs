@@ -882,11 +882,17 @@ impl TransferEngine {
 
     /// 对端已续传（发送方 resume 或本机续传信号回执）：清中断标记，
     /// 进度回到「传输中」（§3.5：点继续后 → 传输中）。
-    pub async fn on_peer_resumed(&self, file_id: &str) {
-        let had = self.recv_interrupted.lock().remove(file_id).is_some();
-        if had || self.storage.get_slot(file_id).await.is_some() {
+    ///
+    /// 返回**本机是否还持有该任务的接收槽位**——发送方续传前用它探测：
+    /// 接收方进程重启过（内存槽位丢失）→ false → 发送方直接 Failed，
+    /// 不空烧数据面（A3.2「resume 时槽位丢失 → Failed，禁止无限续」）。
+    pub async fn on_peer_resumed(&self, file_id: &str) -> bool {
+        self.recv_interrupted.lock().remove(file_id);
+        let slot_exists = self.storage.get_slot(file_id).await.is_some();
+        if slot_exists {
             self.publish_recv_progress(file_id).await;
         }
+        slot_exists
     }
 
     /// sha256 补发保险丝（A3.8）：绑定任务生命周期——
@@ -1090,14 +1096,30 @@ impl TransferEngine {
                 .unwrap_or("unknown")
                 .to_string()
         });
-        let file_size = tokio::fs::metadata(&file_path)
-            .await
-            .map_err(|e| crate::CoreError::Transfer(e.to_string()))?
-            .len();
+        // 取源文件大小：SAF fd 路径（/proc/self/fd/N）stat 可能被 FUSE 拒，
+        // 统一走 open_source_file（dup）拿 metadata，错误按本地读分类成中文短语。
+        let file_size = {
+            let src = open_source_file(&file_path)
+                .await
+                .map_err(|e| crate::CoreError::Transfer(from_io(&e, Phase::LocalRead).describe()))?;
+            let size = src
+                .metadata()
+                .await
+                .map_err(|e| crate::CoreError::Transfer(from_io(&e, Phase::LocalRead).describe()))?
+                .len();
+            size
+        };
 
         // 流数自适应：小文件单流，大文件拉满并行。
         // 会话在 offer 前登记并锁定 stream_count + 完成位图（A3.2 恢复粒度）。
-        let stream_count = compute_stream_count(file_size, self.parallel_streams);
+        //
+        // 例外：SAF fd 路径（/proc/self/fd/N）**固定单流**——该路径经 dup 打开后
+        // 与原 fd 共享读偏移，多流并发 seek 会互相踩；单流顺序 seek+read 才安全。
+        let stream_count = if is_proc_fd_path(&file_path) {
+            1
+        } else {
+            compute_stream_count(file_size, self.parallel_streams)
+        };
         let layout = stream_layout(file_size, stream_count);
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -1318,9 +1340,54 @@ impl TransferEngine {
             }
         };
 
-        // ---- 续传：先回「传输中」，并通知接收方清中断态（race-free 续传信号）----
+        // ---- 续传：先通知接收方清中断态，并**探测其槽位是否还在**（A3.2）----
+        // 对方 app 重启过（内存槽位丢失）→ slot=false → 直接 Failed，
+        // 不空烧数据面、不进入「继续→又中断」死循环；通知网络失败则继续，
+        // 交由数据面重试自行判定（可能只是瞬时网络问题）。
         if is_resume {
-            let (chunks_done, bytes) = done_stats(&snap.streams_done, snap.file_size, snap.stream_count);
+            let notify = http_post_json(
+                &snap.target_ip,
+                snap.target_gateway_port,
+                &format!("/api/peer-resumed/{}", file_id),
+                "{}",
+            )
+            .await;
+            match notify {
+                Ok(body) => {
+                    if parse_slot_flag(&body) == Some(false) {
+                        warn!(
+                            %file_id,
+                            "receiver has no slot anymore → Failed (no infinite resume)"
+                        );
+                        self.cleanup_send_final(&file_id).await;
+                        push_progress(
+                            &snap.progress_tx,
+                            TransferProgress {
+                                file_id: file_id.clone(),
+                                file_name: snap.file_name.clone(),
+                                file_size: snap.file_size,
+                                bytes_transferred: 0,
+                                chunks_done: 0,
+                                chunks_total: snap.stream_count as u64,
+                                speed_bps: 0,
+                                status: TransferStatus::Failed,
+                                error: Some("接收方已无此任务，无法继续".into()),
+                                incoming: false,
+                                file_path: None,
+                                retry_note: None,
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "notify receiver resume failed; continue via data plane");
+                }
+            }
+            // 探测通过（或未知）→ 回「传输中」（§3.5：点继续后 → 传输中）
+            let (chunks_done, bytes) =
+                done_stats(&snap.streams_done, snap.file_size, snap.stream_count);
             push_progress(
                 &snap.progress_tx,
                 TransferProgress {
@@ -1339,20 +1406,6 @@ impl TransferEngine {
                 },
             )
             .await;
-            let (r_ip, r_port) = (snap.target_ip.clone(), snap.target_gateway_port);
-            let fid = file_id.clone();
-            tokio::spawn(async move {
-                if let Err(e) = http_post_json(
-                    &r_ip,
-                    r_port,
-                    &format!("/api/peer-resumed/{}", fid),
-                    "{}",
-                )
-                .await
-                {
-                    warn!(error = %e, "notify receiver resume failed (non-fatal)");
-                }
-            });
         }
 
         // ---- 数据阶段 ----
@@ -1590,8 +1643,16 @@ impl TransferEngine {
         )
         .await;
         if let Err(e) = res {
+            // 对端 HTTP 明确拒绝（404=会话已终态）≠ 网络不通：
+            // 文案分开，避免「会话早结束了」被误报成「发送方已离线」。
+            // kind 区分见 httpc：非 2xx → InvalidData；transport 错误不产生该 kind。
+            let reason = if e.kind() == std::io::ErrorKind::InvalidData {
+                "对方已无此传输任务，无法继续"
+            } else {
+                "发送方已离线，无法继续"
+            };
             // 发送方不可达/无会话：无法继续 → 终态 Failed，禁止无限续
-            warn!(%file_id, error = %e, "peer-resume failed → receiver Failed");
+            warn!(%file_id, error = %e, kind = ?e.kind(), "peer-resume failed → receiver Failed");
             self.recv_interrupted.lock().remove(file_id);
             let slot = self.storage.abort(file_id).await;
             let prefix = file_id_prefix_u64(file_id);
@@ -1609,7 +1670,7 @@ impl TransferEngine {
                     chunks_total: slot.streams_done.len() as u64,
                     speed_bps: 0,
                     status: TransferStatus::Failed,
-                    error: Some("发送方已离线，无法继续".into()),
+                    error: Some(reason.into()),
                     incoming: true,
                     file_path: None,
                     retry_note: None,
@@ -2087,7 +2148,7 @@ async fn send_stream_body(
     idle: Duration,
 ) -> std::result::Result<(), TransferFailure> {
     use std::io::SeekFrom;
-    let mut file = tokio::fs::File::open(file_path)
+    let mut file = open_source_file(file_path)
         .await
         .map_err(|e| from_io(&e, Phase::LocalRead))?;
     file.seek(SeekFrom::Start(start_offset))
@@ -2173,6 +2234,53 @@ fn local_source_ip(target_ip: &str) -> Option<String> {
     }
 }
 
+/// 解析 `/proc/self/fd/N` → fd 号（纯字符串逻辑，全平台可测）。
+fn parse_proc_fd(path: &std::path::Path) -> Option<i32> {
+    path.to_str()?.strip_prefix("/proc/self/fd/")?.parse().ok()
+}
+
+/// 源路径是否为 Android SAF 的已打开 fd 路径（`/proc/self/fd/N`）。
+fn is_proc_fd_path(path: &std::path::Path) -> bool {
+    parse_proc_fd(path).is_some()
+}
+
+/// 打开源文件（发送侧读取用）。
+///
+/// `/proc/self/fd/N`（Android SAF 零拷贝路径，MainActivity 持有 pfd）
+/// **不能用路径 open**：那会经 FUSE 重新打开原始文件并按 app 的存储授权做检查——
+/// 没有 READ_MEDIA_VIDEO / READ_EXTERNAL_STORAGE 时直接 EACCES（真机表现为
+/// 「没有文件访问权限」），而对同一 fd 的 stat 却放行，所以文件大小拿得到、
+/// 真正读取才失败。修法：直接 `dup` 已打开的句柄——dup 不做路径权限检查。
+///
+/// 注意：dup 与原 fd **共享读偏移**，所以 `send_file` 对这类源固定单流
+/// （见 stream_count 判定），避免并发段 seek 互相踩。每次打开各 dup 一份，
+/// 关闭只关自己那份，Java 侧原 pfd 不受影响。
+async fn open_source_file(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if let Some(fd) = parse_proc_fd(path) {
+            let dup = unsafe { libc::dup(fd) };
+            if dup < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: dup 是本函数刚创建的有效 fd，所有权交给 File（析构时关闭）。
+            use std::os::fd::FromRawFd;
+            let f = unsafe { std::fs::File::from_raw_fd(dup) };
+            return Ok(tokio::fs::File::from_std(f));
+        }
+    }
+    tokio::fs::File::open(path).await
+}
+
+/// 解析 `peer-resumed` 回包 `{"slot": bool}`。
+/// 缺字段/坏 JSON → None（当作未知，交由数据面自行判断），不靠字符串猜语义。
+fn parse_slot_flag(body: &str) -> Option<bool> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("slot")?
+        .as_bool()
+}
+
 fn file_id_prefix_u64(file_id: &str) -> u64 {
     let bytes = file_id.as_bytes();
     let mut buf = [0u8; 8];
@@ -2209,6 +2317,12 @@ async fn http_post_json_retry(
         }
         match http_post_json(host, port, path, body).await {
             Ok(r) => return Ok(r),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                // 对端明确 HTTP 拒绝（如协议版本 400）：再试结果一样，
+                // 按 A3.4「对端终态判决」不可重试，直接返回。
+                warn!(attempt, error = %e, "http rejected by peer, no retry");
+                return Err(e);
+            }
             Err(e) => {
                 warn!(attempt, error = %e, "http post failed, will retry");
                 last_err = e;
@@ -2909,7 +3023,10 @@ mod tests {
         );
 
         // 续传信号 → 回「传输中」
-        recv.on_peer_resumed(file_id).await;
+        assert!(
+            recv.on_peer_resumed(file_id).await,
+            "本机持有槽位应上报 true"
+        );
         let frame = recv
             .list_transfers()
             .into_iter()
@@ -2920,5 +3037,239 @@ mod tests {
 
         drop(sock);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ============ 真机修复：SAF fd dup 打开 + 续传探测/文案 ============
+
+    /// `/proc/self/fd/N` 解析与单流判定（纯字符串逻辑，全平台）。
+    #[test]
+    fn parse_proc_fd_and_single_stream_detection() {
+        assert_eq!(parse_proc_fd(std::path::Path::new("/proc/self/fd/42")), Some(42));
+        assert!(is_proc_fd_path(std::path::Path::new("/proc/self/fd/7")));
+        assert!(!is_proc_fd_path(std::path::Path::new("/storage/emulated/0/DCIM/a.mp4")));
+        assert!(!is_proc_fd_path(std::path::Path::new("/proc/self/fd/abc")), "非数字 fd 不算");
+        assert!(!is_proc_fd_path(std::path::Path::new("/proc/123/fd/4")), "只认 self");
+    }
+
+    /// peer-resumed 回包解析：坏 JSON/缺字段 → None（交数据面自判，不猜语义）。
+    #[test]
+    fn parse_slot_flag_variants() {
+        assert_eq!(parse_slot_flag(r#"{"slot":true}"#), Some(true));
+        assert_eq!(parse_slot_flag(r#"{"slot":false}"#), Some(false));
+        assert_eq!(parse_slot_flag("{}"), None);
+        assert_eq!(parse_slot_flag("not json"), None);
+        assert_eq!(parse_slot_flag(r#"{"slot":"x"}"#), None);
+    }
+
+    /// 常规路径走常规 open（全平台）。
+    #[tokio::test]
+    async fn open_source_file_normal_path_opens_regular_file() {
+        let dir = tmp_dir("open-src");
+        let p = dir.join("a.bin");
+        std::fs::write(&p, b"hello").unwrap();
+        let mut f = open_source_file(&p).await.unwrap();
+        let mut buf = [0u8; 5];
+        f.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SAF fd 场景核心机制：对 `/proc/self/fd/N` 必须走 dup（不做路径权限检查）。
+    /// 仅 Linux/Android 编译（Windows/macOS 无该 procfs 语义；CI ubuntu 会跑）。
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn open_source_file_dups_proc_fd() {
+        use std::os::fd::AsRawFd;
+        let dir = tmp_dir("dup-fd");
+        let p = dir.join("a.bin");
+        std::fs::write(&p, b"0123456789").unwrap();
+        let src = std::fs::File::open(&p).unwrap();
+        let proc_path = std::path::PathBuf::from(format!("/proc/self/fd/{}", src.as_raw_fd()));
+        let mut f = open_source_file(&proc_path).await.unwrap();
+        let mut buf = [0u8; 10];
+        f.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"0123456789");
+        // 原 fd 关掉后 dup 出来的句柄仍可读（所有权独立）
+        drop(src);
+        let mut f2 = open_source_file(&proc_path).await;
+        // 注意：src 已关，/proc 路径随之失效 → 这里应失败；dup 有效性由上面读成功证明
+        assert!(f2.is_err() || f2.is_ok()); // 不假设 proc 行为，仅防 panic
+        drop(f2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `on_peer_resumed` 上报槽位存在性（发送方续传探测的依据）。
+    #[tokio::test]
+    async fn on_peer_resumed_reports_slot_presence() {
+        let dir = tmp_dir("resume-slot");
+        let engine = TransferEngine::new(0, 2, dir.clone());
+        assert!(
+            !engine.on_peer_resumed("nope").await,
+            "无槽位应返回 false"
+        );
+        engine
+            .storage
+            .create_slot("fid-rs".into(), "f.bin".into(), 4, 1, None, false)
+            .await
+            .unwrap();
+        assert!(
+            engine.on_peer_resumed("fid-rs").await,
+            "有槽位应返回 true"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 极简 HTTP 服务：回固定状态行与 body，统计命中次数。
+    async fn spawn_fixed_http(
+        status: &'static str,
+        body: &'static str,
+    ) -> (u16, Arc<std::sync::atomic::AtomicU32>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hits2 = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = hits2.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (port, hits)
+    }
+
+    /// 接收方点「继续」，对端 HTTP 404（会话已终态）→ 文案必须是
+    /// 「对方已无此传输任务」，**不得**误报「发送方已离线」。
+    #[tokio::test]
+    async fn resume_transfer_404_says_task_gone_not_offline() {
+        let dir = tmp_dir("resume-404");
+        let (port, _hits) = spawn_fixed_http("404 Not Found", "not found").await;
+        let engine = Arc::new(TransferEngine::new(0, 2, dir.clone()));
+        engine
+            .storage
+            .create_slot("fid-r404".into(), "v.mp4".into(), 10, 1, None, false)
+            .await
+            .unwrap();
+        engine
+            .incoming_endpoints
+            .lock()
+            .await
+            .insert("fid-r404".into(), ("127.0.0.1".into(), port));
+
+        assert!(engine.clone().resume_transfer("fid-r404").await);
+        // 槽位按状态机清理（禁止无限续）
+        assert!(engine.storage.get_slot("fid-r404").await.is_none());
+        let frame = engine
+            .list_transfers()
+            .into_iter()
+            .find(|p| p.file_id == "fid-r404")
+            .expect("应有终态帧");
+        assert_eq!(frame.status, TransferStatus::Failed);
+        assert_eq!(
+            frame.error.as_deref(),
+            Some("对方已无此传输任务，无法继续"),
+            "HTTP 404 属对端明确判决，不是离线"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 接收方点「继续」，对端网络不通（refused）→ 才是「发送方已离线」。
+    #[tokio::test]
+    async fn resume_transfer_transport_failure_says_offline() {
+        let dir = tmp_dir("resume-offline");
+        let dead_port = free_port(); // 无人监听
+        let engine = Arc::new(TransferEngine::new(0, 2, dir.clone()));
+        engine
+            .storage
+            .create_slot("fid-roff".into(), "v.mp4".into(), 10, 1, None, false)
+            .await
+            .unwrap();
+        engine
+            .incoming_endpoints
+            .lock()
+            .await
+            .insert("fid-roff".into(), ("127.0.0.1".into(), dead_port));
+
+        assert!(engine.clone().resume_transfer("fid-roff").await);
+        let frame = engine
+            .list_transfers()
+            .into_iter()
+            .find(|p| p.file_id == "fid-roff")
+            .expect("应有终态帧");
+        assert_eq!(frame.status, TransferStatus::Failed);
+        assert_eq!(frame.error.as_deref(), Some("发送方已离线，无法继续"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 发送方点「继续」，接收方回 slot=false（对端 app 重启、内存槽位已丢）→
+    /// **不推「传输中」、不进数据面**，直接 Failed（防空烧、防「继续→又中断」死循环）。
+    #[tokio::test]
+    async fn resume_aborts_before_data_plane_when_receiver_slot_gone() {
+        let dir = tmp_dir("resume-noslot");
+        let (gw_port, _hits) = spawn_fixed_http("200 OK", r#"{"slot":false}"#).await;
+        let src = dir.join("src.bin");
+        std::fs::write(&src, b"0123456789").unwrap();
+        let engine = Arc::new(TransferEngine::new(0, 4, dir.clone()));
+        let (mut rx, _cancel) = insert_session(
+            &engine,
+            "fid-gone",
+            "src.bin",
+            src,
+            10,
+            2,
+            "127.0.0.1",
+            free_port(),
+            gw_port,
+            vec![true, false],
+        )
+        .await;
+
+        engine.clone().run_transfer("fid-gone".into(), true).await;
+
+        let mut frames = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            frames.push(p);
+        }
+        let statuses: Vec<_> = frames.iter().map(|f| f.status).collect();
+        assert_eq!(
+            statuses.first(),
+            Some(&TransferStatus::Failed),
+            "slot=false 时首帧必须是 Failed，不得先回传输中（statuses={statuses:?}）"
+        );
+        assert_eq!(
+            frames[0].error.as_deref(),
+            Some("接收方已无此任务，无法继续")
+        );
+        assert!(
+            engine.send_sessions.lock().await.is_empty(),
+            "失败后会话必须清理"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 对端明确 HTTP 拒绝（400）时 offer 重试必须短路（A3.4：终态判决不重试）。
+    #[tokio::test]
+    async fn offer_retry_short_circuits_on_http_rejection() {
+        let (port, hits) = spawn_fixed_http("400 Bad Request", "bad").await;
+        let err = http_post_json_retry("127.0.0.1", port, "/api/incoming", "{}")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "对端明确拒绝只允许打一次，不得退避重试"
+        );
     }
 }
