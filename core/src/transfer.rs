@@ -35,7 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as TokioMutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// 传输状态
 ///
@@ -481,6 +481,16 @@ pub struct TransferEngine {
     /// 接收方中断标记：file_id → 失败原因短语（A3.2）。
     /// 置位期间进度保持「已中断」，槽位与 .part 保留；续传信号到达时清除。
     recv_interrupted: Arc<Mutex<HashMap<String, String>>>,
+    /// 接收连接代际：file_id → 最近一条连接的序号（A3.2 竞态防护）。
+    ///
+    /// 真机竞态：网络断开时挂起的连接 A 进入 30s 空闲计时；网络恢复后
+    /// 发送方开新连接 B 重发、数据流畅——**A 的超时随后才迟到触发**，
+    /// 若不加拦截会把 B 的「传输中」打回「已中断」（传输在进行却显示中断，
+    /// 且中断不是断网当时显示的）。失败信号必须携带本连接序号，
+    /// 序号已被更新的连接接管 → 丢弃。
+    recv_active_conn: Arc<Mutex<HashMap<String, u64>>>,
+    /// 接收连接序号发号器
+    recv_conn_seq: AtomicU64,
     /// 进度广播 bus（gateway 注入；None 时 send_file 仍能用，只是不广播）
     progress_bus: TokioMutex<Option<Arc<broadcast::Sender<TransferProgress>>>>,
     /// 全量进度快照：file_id → 最近一条进度（GET /api/transfers 用）
@@ -524,6 +534,8 @@ impl TransferEngine {
             storage: Arc::new(StorageManager::new(receive_dir)),
             prefix_to_file_id: TokioMutex::new(HashMap::new()),
             recv_interrupted: Arc::new(Mutex::new(HashMap::new())),
+            recv_active_conn: Arc::new(Mutex::new(HashMap::new())),
+            recv_conn_seq: AtomicU64::new(1),
             progress_bus: TokioMutex::new(None),
             progress_cache: Arc::new(Mutex::new(ProgressCache::new(PROGRESS_CACHE_CAP))),
             recv_speed_state: TokioMutex::new(HashMap::new()),
@@ -758,10 +770,17 @@ impl TransferEngine {
             )));
         };
 
+        // ---- 登记本连接代际（失败信号凭它判新鲜，见 recv_active_conn）----
+        let conn_id = self.recv_conn_seq.fetch_add(1, Ordering::Relaxed);
+        self.recv_active_conn
+            .lock()
+            .insert(file_id.clone(), conn_id);
+
         // ---- 段体：错误归属到 file_id，驱动接收方状态机 ----
         let result = self.recv_segment(&file_id, &header, &mut stream, idle).await;
         if let Err(f) = &result {
-            self.on_recv_stream_failure(&file_id, header.stream_id, f).await;
+            self.on_recv_stream_failure(&file_id, conn_id, header.stream_id, f)
+                .await;
         }
         result
     }
@@ -886,7 +905,35 @@ impl TransferEngine {
     /// 接收段失败后的状态机推进（A3.2）：
     /// - 可重试 → `Interrupted`：保留槽位与 .part，进度保持「已中断」；
     /// - 不可重试 → `Failed`：按现策略清理槽位，推终态。
-    async fn on_recv_stream_failure(&self, file_id: &str, stream_id: u32, f: &TransferFailure) {
+    ///
+    /// **陈旧信号丢弃**（真机竞态）：`conn_id` 是发起本次接收的连接序号。
+    /// 若期间已有更新的连接接管（`recv_active_conn` 已前移），说明本失败
+    /// 属于一条已被替代的旧连接——它的迟到超时**不得**把新连接的
+    /// 「传输中」打回「已中断」（网络断开→恢复重发时必现，用户实测两次）。
+    async fn on_recv_stream_failure(
+        &self,
+        file_id: &str,
+        conn_id: u64,
+        stream_id: u32,
+        f: &TransferFailure,
+    ) {
+        // 槽位已终结（已完成/已取消）：无处标中断
+        if self.storage.get_slot(file_id).await.is_none() {
+            return;
+        }
+        // 陈旧连接的失败：新连接已接管数据面 → 丢弃
+        {
+            let active = self.recv_active_conn.lock().get(file_id).copied();
+            if active != Some(conn_id) {
+                debug!(
+                    %file_id,
+                    conn_id,
+                    active = ?active,
+                    "stale receive-failure signal discarded (superseded by newer connection)"
+                );
+                return;
+            }
+        }
         // UI 副文案（§3.5）：「流 3/8 失败（连接超时）」
         let compose = |total: u64| {
             format!(
@@ -3882,6 +3929,77 @@ mod tests {
         );
 
         drop(sock2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 竞态回归（真机两次实测）：网络断开挂起的旧连接 A 的 30s 空闲超时
+    /// **迟到触发**时，新连接 B 已在正常收数据——A 的失败信号必须被
+    /// 丢弃，不得把 B 的「传输中」打回「已中断」；当前活跃连接的失败
+    /// 则必须正常置位。
+    #[tokio::test]
+    async fn stale_connection_failure_signal_is_discarded() {
+        let dir = tmp_dir("stale-sig");
+        let engine = TransferEngine::new(0, 2, dir.clone());
+        engine
+            .storage
+            .create_slot("fid-stale".into(), "a.bin".into(), 10, 1, None, false)
+            .await
+            .unwrap();
+
+        // 连接 A 建立（登记代际），随后连接 B 建立接管（代际前移）
+        let conn_a = engine.recv_conn_seq.fetch_add(1, Ordering::Relaxed);
+        engine
+            .recv_active_conn
+            .lock()
+            .insert("fid-stale".into(), conn_a);
+        let conn_b = engine.recv_conn_seq.fetch_add(1, Ordering::Relaxed);
+        engine
+            .recv_active_conn
+            .lock()
+            .insert("fid-stale".into(), conn_b);
+
+        let f = TransferFailure::new(FailureKind::IdleTimeout, Phase::Recv, "stale idle");
+
+        // A 的迟到失败：已被 B 接管 → 丢弃
+        engine
+            .on_recv_stream_failure("fid-stale", conn_a, 0, &f)
+            .await;
+        assert!(
+            !engine.recv_interrupted.lock().contains_key("fid-stale"),
+            "陈旧连接的失败信号必须丢弃，不得覆盖新连接的恢复状态"
+        );
+
+        // B（当前活跃）的失败：正常置位
+        engine
+            .on_recv_stream_failure("fid-stale", conn_b, 0, &f)
+            .await;
+        assert!(
+            engine.recv_interrupted.lock().contains_key("fid-stale"),
+            "活跃连接的失败必须置位中断"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 槽位已终结（finalize/取消后）的失败信号：无处标中断，直接忽略。
+    #[tokio::test]
+    async fn failure_signal_without_slot_is_ignored() {
+        let dir = tmp_dir("sig-no-slot");
+        let engine = TransferEngine::new(0, 2, dir.clone());
+        let conn = engine.recv_conn_seq.fetch_add(1, Ordering::Relaxed);
+        engine
+            .recv_active_conn
+            .lock()
+            .insert("fid-gone".into(), conn);
+
+        let f = TransferFailure::new(FailureKind::IdleTimeout, Phase::Recv, "x");
+        engine
+            .on_recv_stream_failure("fid-gone", conn, 0, &f)
+            .await;
+        assert!(
+            !engine.recv_interrupted.lock().contains_key("fid-gone"),
+            "没有槽位不得产生中断标记（防 finalize 后的僵尸信号）"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
