@@ -811,6 +811,7 @@ impl TransferEngine {
             let mut last_push = Instant::now()
                 .checked_sub(PROGRESS_PUSH_INTERVAL)
                 .unwrap_or_else(Instant::now);
+            let mut resumed = false;
             while remaining > 0 {
                 let want = std::cmp::min(remaining as usize, buf.len());
                 let n = read_full(stream, &mut buf[..want], Phase::Recv, idle).await?;
@@ -830,6 +831,17 @@ impl TransferEngine {
                     .map_err(|e| from_io(&e, Phase::DiskWrite))?;
                 remaining -= n as u64;
                 self.storage.add_bytes(file_id, n as u64).await;
+
+                // 数据面活性恢复：**收到第一批字节**就清中断标记回「传输中」。
+                // 不能等 finish_stream——大段重发（真机 2.63GB 单段）要分钟级，
+                // 期间每个进度帧都会按未清标记推「已中断」，而数据明明在流入
+                //（真机踩过：发送方 17MB/s 重发中、接收方却显示已中断）。
+                if !resumed {
+                    resumed = true;
+                    if self.recv_interrupted.lock().remove(file_id).is_some() {
+                        self.publish_recv_progress(file_id).await;
+                    }
+                }
 
                 if last_push.elapsed() >= PROGRESS_PUSH_INTERVAL {
                     last_push = Instant::now();
@@ -3786,10 +3798,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// R1 回归（真机：数据在涨、状态却卡「已中断」）：
-    /// 中断标记必须**随数据恢复**清除——任一段 finish_stream 成功即回
-    /// 「传输中」，不等整任务收齐。2 段任务：段1中断后，段0重发成功落盘
-    /// （任务尚未 complete），最新帧必须是 InProgress 而不是 Interrupted。
+    /// R1 回归（真机：发送方 17MB/s 重发中、接收方却显示已中断）：
+    /// 中断标记必须随**首个读块返回**清除——不等 finish_stream、不等整段完成。
+    /// 构造「首块已收、整段未 finish」的窗口：段0 重连只发满一个
+    /// STREAM_IO_BUF 块（256KB），余下字节不发（idle 2s 内），
+    /// 此刻任务两段都未完成、段0 也未 finish，最新帧必须已是「传输中」。
+    /// （read_full 要读满 want 才返回，故用 >256KB 的段制造分块。）
     #[tokio::test]
     async fn interrupted_cleared_on_segment_finish_before_complete() {
         let dir = tmp_dir("recv-recover");
@@ -3797,14 +3811,15 @@ mod tests {
         let mut cfg_recv = TransferEngine::new(port, 4, dir.clone());
         cfg_recv.timeouts = crate::timeouts::Timeouts {
             connect: Duration::from_secs(2),
-            idle: Duration::from_millis(300),
+            idle: Duration::from_secs(2),
         };
         let recv = Arc::new(cfg_recv);
         recv.clone().spawn_receiver().await.unwrap();
 
         let file_id = "recv-recover-fid";
+        // 600_000 字节 / 2 段 = 每段 300_000（> 256KB 块 → 读循环分块返回）
         recv.storage
-            .create_slot(file_id.into(), "two.bin".into(), 10, 2, None, false)
+            .create_slot(file_id.into(), "two.bin".into(), 600_000, 2, None, false)
             .await
             .unwrap();
         recv.prefix_to_file_id
@@ -3816,15 +3831,15 @@ mod tests {
             file_id_prefix: file_id_prefix_u64(file_id),
             stream_id,
             _reserved: 0,
-            start_offset: if stream_id == 0 { 0 } else { 5 },
-            data_len: 5,
+            start_offset: if stream_id == 0 { 0 } else { 300_000 },
+            data_len: 300_000,
         };
 
-        // 第一次：段1 发 2 字节后静默 → idle 超时 → Interrupted（标记置位）
+        // 第一次：段1 发 10 字节后静默 → idle(2s) 超时 → Interrupted（标记置位）
         let mut sock1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         sock1.write_all(&header(1).to_bytes()).await.unwrap();
-        sock1.write_all(&[0xAB; 2]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        sock1.write_all(&[0xAB; 10]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2600)).await;
         let frame = recv
             .list_transfers()
             .into_iter()
@@ -3834,11 +3849,13 @@ mod tests {
         assert!(recv.recv_interrupted.lock().contains_key(file_id));
         drop(sock1);
 
-        // 第二次：段0 重发成功收满（任务仍缺段1，未 complete）→
-        // R1：finish_stream 即清标记，最新帧回「传输中」
+        // 第二次：段0 重连只发**一个读块**（256KB < 整段 300_000）
+        // → 首块返回即须清标记推「传输中」；余下 37_856 字节不发，
+        // 此刻段0 未 finish、任务未 complete——若清除只在 finish/complete，
+        // 断言会失败（这正是真机分钟级卡「已中断」的窗口）。
         let mut sock2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         sock2.write_all(&header(0).to_bytes()).await.unwrap();
-        sock2.write_all(b"12345").await.unwrap();
+        sock2.write_all(&vec![0xCDu8; STREAM_IO_BUF]).await.unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut latest = TransferStatus::Interrupted;
@@ -3857,11 +3874,11 @@ mod tests {
         assert_eq!(
             latest,
             TransferStatus::InProgress,
-            "段成功落盘后必须回「传输中」，不得卡「已中断」"
+            "首块数据到达即须回「传输中」，不得等整段 finish"
         );
         assert!(
             !recv.recv_interrupted.lock().contains_key(file_id),
-            "中断标记必须随数据恢复清除"
+            "中断标记必须随首批数据清除"
         );
 
         drop(sock2);
