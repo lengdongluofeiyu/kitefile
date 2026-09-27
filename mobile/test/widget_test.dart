@@ -10,6 +10,11 @@ import 'package:kitefile_mobile/main.dart';
 
 void main() {
   testWidgets('HomePage 构建冒烟测试', (WidgetTester tester) async {
+    // 扫描列表收缩为「仅默认端口」：隔离开发机上可能常驻的真实 daemon，
+    // 否则设备/传输列表会被真数据污染（断言 0 的项会挂）
+    daemonScanPorts = [];
+    addTearDown(() => daemonScanPorts = kGatewayPortCandidates);
+
     await tester.pumpWidget(const KiteFileApp());
 
     // 标题与三个分区标题存在

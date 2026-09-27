@@ -19,6 +19,10 @@ void main() {
   testWidgets('daemon 被杀后徽标从已连接切换为未运行（A验收5）', (tester) async {
     // 恢复真实网络：本用例自带本地 server，不吃 flutter test 的 400 拦截
     HttpOverrides.global = null;
+    // 扫描列表收缩为「仅当前端口」：隔离本机可能常驻的真实 daemon
+    //（否则 server 死后 whoami 会命中真 daemon，离线断言被污染）
+    daemonScanPorts = [];
+    addTearDown(() => daemonScanPorts = kGatewayPortCandidates);
 
     var hits = 0;
     // server 与首次探测都在真实区完成（见文件头注释）

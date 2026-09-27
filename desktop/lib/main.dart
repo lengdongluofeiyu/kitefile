@@ -26,9 +26,12 @@ export 'package:kitefile_shared/kitefile_shared.dart';
 /// - iOS（预留）：使用同 UI 但隐藏窗口控制
 /// - Android（移动端走 mobile 项目）：纯 UI
 
-/// daemon 实际监听的端口，由 `DaemonManager` 探测后写入。
+/// daemon 实际监听的端口，由 `DaemonManager` / whoami 探测后写入。
 /// 未探测到时先用首选，保证 UI 不会因端口未定而崩。
 int daemonPort = 7878;
+
+/// whoami 扫描端口列表（默认 = 共享候选；测试可注入以隔离本机真实 daemon）。
+List<int> daemonScanPorts = kGatewayPortCandidates;
 
 String get kDaemonHttp => 'http://127.0.0.1:$daemonPort';
 String get kDaemonWs => 'ws://127.0.0.1:$daemonPort/ws/progress';
@@ -332,6 +335,8 @@ class _HomePageState extends State<HomePage> with WindowListener {
   /// 已通知过「传输中断」的 file_id（一条传输只弹一次）
   final Set<String> _notifiedInterrupted = {};
   WebSocket? _ws;
+  /// WS 连接进行中标志：防止 whoami 成功触发与失败重试链并发叠加
+  bool _wsConnecting = false;
   Timer? _refreshTimer;
   bool _daemonOnline = false;
   Timer? _startupPollTimer;
@@ -483,7 +488,14 @@ class _HomePageState extends State<HomePage> with WindowListener {
   }
 
   Future<void> _initDaemon() async {
-    // 等待 daemonManager 拉起的 daemon 就绪（最多再轮询 10s）
+    // 周期轮询**无条件**创建：daemon 可能晚于 UI 就绪（杀软扫描 release exe
+    // 首跑、慢盘），也可能因端口退避到备选——启动窗口错过绝不能永久离线
+    //（真机踩过：守护进程起来了、徽标永远停在未连接）。
+    _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      _refreshDevices();
+      _fetchWhoAmI();
+    });
+    // 启动期 1s 快速探测只为尽早 ready；超时后由上面的周期轮询继续兜底。
     _startupPollTimer = Timer.periodic(const Duration(seconds: 1), (t) async {
       if (t.tick > 10) {
         t.cancel();
@@ -492,41 +504,42 @@ class _HomePageState extends State<HomePage> with WindowListener {
       await _fetchWhoAmI();
       if (_daemonOnline) {
         t.cancel();
-        _refreshDevices();
-        // 周期刷新同时复核 whoami：daemon 被杀后 3s 内徽标掉线（A3.6）
-        _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-          _refreshDevices();
-          _fetchWhoAmI();
-        });
-        _connectWs();
       }
     });
-    // 同时立即试一次（万一 daemon 已经 ready）
+    // 立即试一次（万一 daemon 已经 ready）
     await _fetchWhoAmI();
     if (_daemonOnline) {
       _startupPollTimer?.cancel();
-      _refreshDevices();
-      _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-        _refreshDevices();
-        _fetchWhoAmI();
-      });
-      _connectWs();
     }
+    _refreshDevices();
   }
 
   Future<void> _fetchWhoAmI() async {
-    try {
-      final r = await httpGet('$kDaemonHttp/api/whoami');
-      final me = WhoAmI.fromJson(jsonDecode(r) as Map<String, dynamic>);
-      setState(() {
-        _me = me;
-        _daemonOnline = true;
-      });
-    } catch (e) {
-      // 在线徽标唯一真值（A3.6）：轮询失败必须掉线，禁止吞掉后仍显示已连接
-      debugPrint('[kitefile] whoami poll failed: $e');
-      setState(() => _daemonOnline = false);
+    // 扫描序列：当前已知端口优先，随后全部候选（whoamiScanPorts）。
+    // daemon 若因端口保留退避到 17878 等备选，只认默认端口会永远发现不了。
+    for (final p in whoamiScanPorts(daemonPort, daemonScanPorts)) {
+      try {
+        final r = await httpGet('http://127.0.0.1:$p/api/whoami')
+            .timeout(const Duration(seconds: 1));
+        final me = WhoAmI.fromJson(jsonDecode(r) as Map<String, dynamic>);
+        if (!mounted) return;
+        setState(() {
+          daemonPort = p;
+          _me = me;
+          _daemonOnline = true;
+        });
+        // 首次连上（或 WS 掉线后尚未重连）→ 触发 WS；防抖避免重试链叠加
+        if (_ws == null && !_wsConnecting) {
+          _connectWs();
+        }
+        return;
+      } catch (e) {
+        // 该端口没响应/非 daemon 服务，试下一个（不静默：debug 可见）
+        debugPrint('[kitefile] whoami @$p failed: $e');
+      }
     }
+    // 在线徽标唯一真值（A3.6）：全部候选都失败必须掉线
+    if (mounted) setState(() => _daemonOnline = false);
   }
 
   Future<void> _refreshDevices() async {
@@ -543,9 +556,13 @@ class _HomePageState extends State<HomePage> with WindowListener {
   }
 
   Future<void> _connectWs() async {
+    // 防抖：whoami 成功触发与失败重试链不得并发叠加（同一时刻至多一条链）
+    if (_ws != null || _wsConnecting) return;
+    _wsConnecting = true;
     try {
       final ws = await WebSocket.connect(kDaemonWs);
       _ws = ws;
+      _wsConnecting = false;
       ws.listen(
         (data) {
           if (data is String) {
@@ -575,6 +592,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
       // 连接失败 ≠ 已建立后断开：daemon 存活由 whoami 轮询定真值，
       // 这里只留日志并重连，避免与 whoami 打架导致徽标抖动。
       debugPrint('[kitefile] ws connect failed: $e');
+      _wsConnecting = false;
       Future.delayed(const Duration(seconds: 5), () {
         if (mounted) _connectWs();
       });

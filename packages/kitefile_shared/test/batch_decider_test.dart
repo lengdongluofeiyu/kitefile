@@ -135,6 +135,18 @@ void main() {
     });
   });
 
+  group('whoami 扫描端口序列（守护进程退避发现）', () {
+    test('当前端口放首位、随后全部候选、无重复', () {
+      expect(whoamiScanPorts(7878), [7878, 17878, 27878]);
+      // daemon 退避到 17878 被发现后，下一轮优先打已知端口
+      expect(whoamiScanPorts(17878), [17878, 7878, 27878]);
+      // 注入的非候选端口（如测试用临时 server）也在序列里
+      expect(whoamiScanPorts(54321), [54321, 7878, 17878, 27878]);
+      // 与候选重复时去重，不出现两次 7878
+      expect(whoamiScanPorts(7878).toSet().length, whoamiScanPorts(7878).length);
+    });
+  });
+
   group('§3.5 状态文案（唯一源）', () {
     TransferProgress p(TransferStatus s, {String? error, String? retryNote}) =>
         TransferProgress(

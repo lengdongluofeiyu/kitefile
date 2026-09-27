@@ -41,6 +41,9 @@ Future<String?> openFileNative(String path) async {
 /// - 远程模式：设置弹窗切换到对端 IP，可当“遥控器”控制远端 daemon（开发调试用）。
 /// - iOS：daemon 嵌入预留（接口一致）。
 
+/// whoami 扫描端口列表（默认 = 共享候选；测试可注入以隔离本机真实 daemon）。
+List<int> daemonScanPorts = kGatewayPortCandidates;
+
 void main() {
   runApp(const KiteFileApp());
 }
@@ -96,6 +99,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 攒批—决策—迟到沿用状态机（工作流 C：共享实现，双端仅此一份）
   late final BatchDecider _batchDecider;
   WebSocket? _ws;
+  /// WS 连接进行中标志：防止 whoami 成功触发与失败重试链并发叠加
+  bool _wsConnecting = false;
   Timer? _refreshTimer;
   bool _daemonOnline = false;
   /// 前台保活服务当前是否已启动（A3.7；由进行中的传输驱动）
@@ -179,18 +184,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // 内嵌 daemon 的 gateway 端口绑定是异步的：FFI init 返回 ≠ 已可连接。
     // 轮询等待就绪（与桌面端行为一致）。
     await _waitDaemonReady(timeout: const Duration(seconds: 10));
+    // 等待期间页面可能已销毁：此时再创建周期轮询会没人回收（pending Timer）
+    if (!mounted) return;
+    // 周期轮询**无条件**创建：启动窗口错过（慢盘/首跑）绝不能永久离线，
+    // 之后的周期 whoami 会继续发现晚启动的 daemon（与桌面端一致）。
+    _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      _refreshDevices();
+      _refreshReceivedFiles();
+      _fetchWhoAmI();
+    });
     if (_daemonOnline) {
       _refreshReceiveDir();
       _refreshDevices();
       _refreshReceivedFiles();
       _refreshTransfers();
-      // 周期刷新同时复核 whoami：daemon 不可达后 3s 内徽标掉线（A3.6）
-      _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-        _refreshDevices();
-        _refreshReceivedFiles();
-        _fetchWhoAmI();
-      });
-      _connectWs();
+      // WS 首连由 _fetchWhoAmI 成功分支触发（带防抖），这里无需重复调用
     }
   }
 
@@ -279,9 +287,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _fetchWhoAmI() async {
-    // 逐个试候选端口：默认端口可能被系统保留，daemon 会退避到备选。
-    // 命中后记住实际端口，后续所有请求（含 WS）都跟着走。
-    for (final p in kGatewayPortCandidates) {
+    // 扫描序列：当前已知端口优先，随后全部候选（whoamiScanPorts）。
+    // daemon 可能因端口保留退避到备选，只认默认端口会「看起来没启动」。
+    for (final p in whoamiScanPorts(_daemonPort, daemonScanPorts)) {
       try {
         final r = await httpGet('http://$_daemonHost:$p/api/whoami')
             .timeout(const Duration(milliseconds: 800));
@@ -292,6 +300,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           _me = me;
           _daemonOnline = true;
         });
+        // 首次连上（或 WS 掉线后尚未重连）→ 触发 WS；防抖避免重试链叠加
+        if (_ws == null && !_wsConnecting) {
+          _connectWs();
+        }
         return;
       } catch (_) {
         // 该端口没响应，试下一个
@@ -316,9 +328,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _connectWs() async {
+    // 防抖：whoami 成功触发与失败重试链不得并发叠加（同一时刻至多一条链）
+    if (_ws != null || _wsConnecting) return;
+    _wsConnecting = true;
     try {
       final ws = await WebSocket.connect(_wsBase);
       _ws = ws;
+      _wsConnecting = false;
       ws.listen(
         (data) {
           if (data is! String) return;
@@ -368,6 +384,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       // 连接失败 ≠ 已建立后断开：daemon 存活由 whoami 轮询定真值，
       // 这里只留日志并重连，避免与 whoami 打架导致徽标抖动。
       debugPrint('[kitefile] ws connect failed: $e');
+      _wsConnecting = false;
       // mounted 保护：页面已销毁就不再重连（否则定时器泄漏/幽灵连接）
       Future.delayed(const Duration(seconds: 5), () {
         if (mounted) _connectWs();
