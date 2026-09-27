@@ -462,6 +462,11 @@ pub struct TransferEngine {
     pub receive_dir: PathBuf,
     /// 数据面超时（可注入，见 `timeouts::Timeouts`；**须在 `Arc::new` 之前设置**）
     pub timeouts: crate::timeouts::Timeouts,
+    /// verify 协商轮询退避表：每轮 POST 前的等待，len = 最大轮数（可注入测试短表）。
+    ///
+    /// 为什么必须轮询：TCP 写完成 ≠ 对端应用层收齐，do_send 一结束就发 verify
+    /// 几乎必然 pending；且网络抖动刚恢复时回执可能发不出去。默认总窗口约 9.5s。
+    verify_backoff: Vec<Duration>,
     inflight: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     /// 发送方 daemon：等待接收方回包的 file_id → oneshot
     outgoing_offers: Arc<TokioMutex<HashMap<String, oneshot::Sender<HttpIncomingResponse>>>>,
@@ -504,6 +509,14 @@ impl TransferEngine {
             parallel_streams,
             receive_dir: receive_dir.clone(),
             timeouts: crate::timeouts::Timeouts::default(),
+            verify_backoff: vec![
+                Duration::from_millis(500),
+                Duration::from_millis(1000),
+                Duration::from_millis(1000),
+                Duration::from_millis(2000),
+                Duration::from_millis(2000),
+                Duration::from_millis(3000),
+            ],
             inflight: Arc::new(Mutex::new(HashMap::new())),
             outgoing_offers: Arc::new(TokioMutex::new(HashMap::new())),
             send_sessions: Arc::new(TokioMutex::new(HashMap::new())),
@@ -835,12 +848,14 @@ impl TransferEngine {
             .finish_stream(file_id, header.stream_id)
             .await
             .ok_or_else(|| TransferFailure::protocol("slot vanished during stream"))?;
+        // 任一段成功落盘 = 数据面已恢复（发送方段级重试成功后重发）：
+        // 立即清中断标记回「传输中」。只在整任务收齐才清的话，会出现
+        // 「字节一直在涨、状态却卡在已中断」的谎报（真机踩过）。
+        self.recv_interrupted.lock().remove(file_id);
         self.publish_recv_progress(file_id).await;
 
         // 全部流收齐后的收尾
         if slot.is_complete() {
-            // 完成即清中断标记（进度随后由 finish_receive 推终态）
-            self.recv_interrupted.lock().remove(file_id);
             if slot.await_sha256 && slot.sha256.is_none() {
                 // 发送方声明会补发 sha256：先不 finalize，等 POST /api/verify。
                 // 保险丝：120 秒未收到则跳过校验直接完成（A3.8 生命周期绑定见 apply 路径）。
@@ -1354,6 +1369,58 @@ impl TransferEngine {
         })
     }
 
+    /// 终态 Canceled：清理会话并推帧（run_transfer 各取消检查点复用）。
+    async fn finish_canceled(&self, file_id: &str, snap: &SessionSnap) {
+        self.cleanup_send_final(file_id).await;
+        let (chunks, bytes) = done_stats(&snap.streams_done, snap.file_size, snap.stream_count);
+        push_progress(
+            &snap.progress_tx,
+            TransferProgress {
+                file_id: file_id.to_string(),
+                file_name: snap.file_name.clone(),
+                file_size: snap.file_size,
+                bytes_transferred: bytes,
+                chunks_done: chunks,
+                chunks_total: snap.stream_count as u64,
+                speed_bps: 0,
+                status: TransferStatus::Canceled,
+                error: Some("canceled".into()),
+                incoming: false,
+                file_path: None,
+                retry_note: None,
+            },
+        )
+        .await;
+    }
+
+    /// 推 Interrupted 帧并落 running（会话与注册项保留，供「继续传输」）。
+    /// 先推帧后落 running：反过来会让并发 resume 的 InProgress 帧被覆盖回已中断。
+    async fn interrupt_send_session(&self, file_id: &str, snap: &SessionSnap, error: &str) {
+        let (chunks, bytes) = done_stats(&snap.streams_done, snap.file_size, snap.stream_count);
+        push_progress(
+            &snap.progress_tx,
+            TransferProgress {
+                file_id: file_id.to_string(),
+                file_name: snap.file_name.clone(),
+                file_size: snap.file_size,
+                bytes_transferred: bytes,
+                chunks_done: chunks,
+                chunks_total: snap.stream_count as u64,
+                speed_bps: 0,
+                status: TransferStatus::Interrupted,
+                error: Some(error.to_string()),
+                incoming: false,
+                file_path: None,
+                retry_note: None,
+            },
+        )
+        .await;
+        let mut sessions = self.send_sessions.lock().await;
+        if let Some(s) = sessions.get_mut(file_id) {
+            s.running = false;
+        }
+    }
+
     /// 执行（或续传）一次发送的数据阶段——A3.2 状态机推进器。
     ///
     /// 首次（Accept 后，`is_resume=false`）与用户「继续传输」共用。
@@ -1361,7 +1428,7 @@ impl TransferEngine {
     /// 避免与 `cancel()` 竞态双写；`Interrupted` 保留会话（先推帧后落 running）。
     async fn run_transfer(self: Arc<Self>, file_id: String, is_resume: bool) {
         // ---- 快照会话并互斥置 running ----
-        let snap = {
+        let mut snap = {
             let mut sessions = self.send_sessions.lock().await;
             let Some(s) = sessions.get_mut(&file_id) else {
                 return; // 已被取消/收走
@@ -1471,27 +1538,7 @@ impl TransferEngine {
 
         // ---- 状态机推进（取消优先级最高）----
         if *snap.cancel_rx.borrow() || matches!(outcome, SendOutcome::Canceled) {
-            self.cleanup_send_final(&file_id).await;
-            let (chunks_done, bytes) =
-                done_stats(&snap.streams_done, snap.file_size, snap.stream_count);
-            push_progress(
-                &snap.progress_tx,
-                TransferProgress {
-                    file_id: file_id.clone(),
-                    file_name: snap.file_name.clone(),
-                    file_size: snap.file_size,
-                    bytes_transferred: bytes,
-                    chunks_done,
-                    chunks_total: snap.stream_count as u64,
-                    speed_bps: 0,
-                    status: TransferStatus::Canceled,
-                    error: Some("canceled".into()),
-                    incoming: false,
-                    file_path: None,
-                    retry_note: None,
-                },
-            )
-            .await;
+            self.finish_canceled(&file_id, &snap).await;
             return;
         }
 
@@ -1528,91 +1575,69 @@ impl TransferEngine {
                 };
                 if *snap.cancel_rx.borrow() {
                     // 哈希期间用户取消 → Canceled（不谎报 Completed）
-                    self.cleanup_send_final(&file_id).await;
-                    push_progress(
-                        &snap.progress_tx,
-                        TransferProgress {
-                            file_id: file_id.clone(),
-                            file_name: snap.file_name.clone(),
-                            file_size: snap.file_size,
-                            bytes_transferred: 0,
-                            chunks_done: 0,
-                            chunks_total: snap.stream_count as u64,
-                            speed_bps: 0,
-                            status: TransferStatus::Canceled,
-                            error: Some("canceled".into()),
-                            incoming: false,
-                            file_path: None,
-                            retry_note: None,
-                        },
-                    )
-                    .await;
+                    self.finish_canceled(&file_id, &snap).await;
                     return;
                 }
+
+                // ---- verify 协商（轮询，见 negotiate_verify）----
+                // TCP 写完成 ≠ 对端应用层收齐：do_send 一结束就发 verify 几乎
+                // 必然 pending；网络抖动刚恢复时回执也可能发不出去。
+                // 拿不到回执 → Interrupted（会话保留、位图不动），
+                // 点继续重新协商——**不谎报 Completed**（真机痛点）。
                 let body = serde_json::json!({ "sha256": sha256 }).to_string();
-                let resp = post_verify(
+                let negotiation = negotiate_verify(
                     &snap.target_ip,
                     snap.target_gateway_port,
                     &file_id,
                     &body,
+                    &mut snap.cancel_rx,
+                    &self.verify_backoff,
                 )
                 .await;
-                let verified = resp.as_deref().and_then(parse_verify_result);
-                if resp.is_some() && verified.is_none() {
-                    // 旧对端空 body / 未知 result：宽容当 finalized（不谎报失败）
-                    warn!(%file_id, "verify receipt unparsed, treat as finalized");
+                if *snap.cancel_rx.borrow() {
+                    self.finish_canceled(&file_id, &snap).await;
+                    return;
                 }
-                if resp.is_none() {
-                    warn!(
-                        %file_id,
-                        "verify no receipt, receiver fuse will finalize (fallback)"
-                    );
-                }
-
-                // **以接收方回执为准**（A3.2 状态机对齐）：段没收齐时接收方
-                // 不会 finalize，发送方凭 200 报 Completed 会让两边永久分叉。
-                if let Some(VerifyOutcome::Pending { chunks_done }) = verified {
-                    {
-                        // TCP 写成功 ≠ 对端应用层收齐：位图以接收方为权威回退
-                        let mut done = snap.streams_done.lock();
-                        if chunks_done.len() == done.len() {
-                            *done = chunks_done;
-                        } else {
-                            for b in done.iter_mut() {
-                                *b = false;
+                match negotiation {
+                    VerifyNegotiation::Finalized => {
+                        // 对端已终态 → 落到下面的 Completed
+                    }
+                    VerifyNegotiation::PendingBitmap(chunks_done) => {
+                        {
+                            // 对端确实没收齐：位图以接收方为权威回退
+                            let mut done = snap.streams_done.lock();
+                            if chunks_done.len() == done.len() {
+                                *done = chunks_done;
+                            } else {
+                                for b in done.iter_mut() {
+                                    *b = false;
+                                }
                             }
                         }
+                        warn!(
+                            %file_id,
+                            "receiver still pending after negotiation → Interrupted (bitmap rolled back)"
+                        );
+                        self.interrupt_send_session(
+                            &file_id,
+                            &snap,
+                            "接收方尚未收齐，数据未确认送达",
+                        )
+                        .await;
+                        return;
                     }
-                    warn!(
-                        %file_id,
-                        "receiver has not received all chunks → Interrupted (aligned)"
-                    );
-                    let (chunks, bytes) =
-                        done_stats(&snap.streams_done, snap.file_size, snap.stream_count);
-                    push_progress(
-                        &snap.progress_tx,
-                        TransferProgress {
-                            file_id: file_id.clone(),
-                            file_name: snap.file_name.clone(),
-                            file_size: snap.file_size,
-                            bytes_transferred: bytes,
-                            chunks_done: chunks,
-                            chunks_total: snap.stream_count as u64,
-                            speed_bps: 0,
-                            status: TransferStatus::Interrupted,
-                            error: Some("接收方尚未收齐，数据未确认送达".into()),
-                            incoming: false,
-                            file_path: None,
-                            retry_note: None,
-                        },
-                    )
-                    .await;
-                    // 保留会话（同 SendOutcome::Interrupted 分支：先推帧后落 running）
-                    let mut sessions = self.send_sessions.lock().await;
-                    if let Some(s) = sessions.get_mut(&file_id) {
-                        s.running = false;
+                    VerifyNegotiation::NotReceived => {
+                        // 全程没拿到回执（网络不通）：没有信息就不动位图，
+                        // 会话保留、点继续重新协商（自愈闭环）
+                        warn!(%file_id, "verify receipt not received → Interrupted (keep bitmap)");
+                        self.interrupt_send_session(
+                            &file_id,
+                            &snap,
+                            "校验回执未达，可继续传输",
+                        )
+                        .await;
+                        return;
                     }
-                    return;
                 }
 
                 self.cleanup_send_final(&file_id).await;
@@ -1658,11 +1683,7 @@ impl TransferEngine {
                 .await;
             }
             SendOutcome::Interrupted { stream_id, failure } => {
-                // 保留会话与注册项（继续传输 / 取消都还要用）。
-                // 先推中断帧、后落 running：反过来会让并发 resume 的
-                // InProgress 帧被本帧覆盖回「已中断」。
-                let (chunks_done, bytes) =
-                    done_stats(&snap.streams_done, snap.file_size, snap.stream_count);
+                // 保留会话与注册项（继续传输 / 取消都还要用）
                 warn!(
                     %file_id,
                     stream_id,
@@ -1670,33 +1691,13 @@ impl TransferEngine {
                     detail = %failure.detail,
                     "send stream exhausted retries → Interrupted (segments kept)"
                 );
-                push_progress(
-                    &snap.progress_tx,
-                    TransferProgress {
-                        file_id: file_id.clone(),
-                        file_name: snap.file_name.clone(),
-                        file_size: snap.file_size,
-                        bytes_transferred: bytes,
-                        chunks_done,
-                        chunks_total: snap.stream_count as u64,
-                        speed_bps: 0,
-                        status: TransferStatus::Interrupted,
-                        error: Some(format!(
-                            "流 {}/{} 失败（{}）",
-                            stream_id + 1,
-                            snap.stream_count,
-                            failure.describe()
-                        )),
-                        incoming: false,
-                        file_path: None,
-                        retry_note: None,
-                    },
-                )
-                .await;
-                let mut sessions = self.send_sessions.lock().await;
-                if let Some(s) = sessions.get_mut(&file_id) {
-                    s.running = false;
-                }
+                let reason = format!(
+                    "流 {}/{} 失败（{}）",
+                    stream_id + 1,
+                    snap.stream_count,
+                    failure.describe()
+                );
+                self.interrupt_send_session(&file_id, &snap, &reason).await;
             }
             SendOutcome::Canceled => unreachable!("canceled handled above"),
         }
@@ -2378,38 +2379,97 @@ fn parse_slot_flag(body: &str) -> Option<bool> {
         .as_bool()
 }
 
-/// 补发校验值并读取接收方回执（A3.2：发送方终态以回执为准）。
+/// 单次补发校验值的结果。
+enum VerifyPost {
+    /// 2xx，携带回执 body
+    Receipt(String),
+    /// 对端 HTTP 明确拒绝（4xx/5xx 响应）
+    Rejected,
+    /// transport 失败（refused/reset/超时）——网络抖动期常见，轮询方继续
+    Transport,
+}
+
+/// 单次 POST /api/verify（不重试；轮询节奏由 [`negotiate_verify`] 统一管）。
+async fn post_verify_once(host: &str, port: u16, file_id: &str, body: &str) -> VerifyPost {
+    match http_post_json(host, port, &format!("/api/verify/{}", file_id), body).await {
+        Ok(r) => VerifyPost::Receipt(r),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            warn!(error = %e, "verify rejected by peer");
+            VerifyPost::Rejected
+        }
+        Err(e) => {
+            warn!(error = %e, "verify post transport error");
+            VerifyPost::Transport
+        }
+    }
+}
+
+/// verify 协商：轮询直到拿到终态回执或预算耗尽。
 ///
-/// - transport 错误（refused/reset/超时）有限重试 3 次（0.3s / 1s 退避）；
-/// - 对端 HTTP 拒绝（InvalidData）不重试（A3.4：终态判决）；
-/// - 全部失败返回 None——调用方按「接收方保险丝兜底」宽容 Completed（不谎报失败）。
-async fn post_verify(
+/// - `finalized`/`missing`/旧对端空回执 → [`VerifyNegotiation::Finalized`]；
+/// - 对端反复 `pending`（**TCP 写完成 ≠ 对端应用层收齐**，早发必然如此）
+///   → 轮询等它收尾，耗尽仍 pending → [`VerifyNegotiation::PendingBitmap`]，
+///   发送方按权威位图回退（此时对端确实缺数据）；
+/// - 全程 transport 失败（网络抖动恢复期）→ [`VerifyNegotiation::NotReceived`]，
+///   发送方 **Interrupted 保留会话、位图不动**（不谎报 Completed，点继续自愈）。
+///
+/// `backoff[i]` = 第 i+1 轮 POST 前的等待（len = 轮数上限）。
+async fn negotiate_verify(
     host: &str,
     port: u16,
     file_id: &str,
     body: &str,
-) -> Option<String> {
-    const ATTEMPTS: u32 = 3;
-    const BACKOFF_MS: [u64; 2] = [300, 1000];
-    for attempt in 0..ATTEMPTS {
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(
-                BACKOFF_MS[(attempt - 1) as usize],
-            ))
-            .await;
-        }
-        match http_post_json(host, port, &format!("/api/verify/{}", file_id), body).await {
-            Ok(r) => return Some(r),
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                warn!(attempt, error = %e, "verify rejected by peer, no retry");
-                return None;
+    cancel_rx: &mut watch::Receiver<bool>,
+    backoff: &[Duration],
+) -> VerifyNegotiation {
+    let mut saw_pending: Option<Vec<bool>> = None;
+    for (i, wait) in backoff.iter().enumerate() {
+        if i > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(*wait) => {}
+                _ = cancel_rx.changed() => break,
             }
-            Err(e) => {
-                warn!(attempt, error = %e, "verify post failed, will retry");
+            if *cancel_rx.borrow() {
+                break;
+            }
+        }
+        match post_verify_once(host, port, file_id, body).await {
+            VerifyPost::Receipt(receipt) => match parse_verify_result(&receipt) {
+                Some(VerifyOutcome::Finalized) | Some(VerifyOutcome::Missing) => {
+                    return VerifyNegotiation::Finalized;
+                }
+                Some(VerifyOutcome::Pending { chunks_done }) => {
+                    saw_pending = Some(chunks_done);
+                    // 对端还没收完：等它收尾，下一轮再问
+                }
+                None => {
+                    // 旧对端空 body / 未知 result：宽容当已 finalize
+                    return VerifyNegotiation::Finalized;
+                }
+            },
+            VerifyPost::Rejected => {
+                // 对端明确报错：未完成校验，按「未收到回执」处理（可继续）
+                return VerifyNegotiation::NotReceived;
+            }
+            VerifyPost::Transport => {
+                // 网络抖动：等下一轮（覆盖恢复期）
             }
         }
     }
-    None
+    match saw_pending {
+        Some(chunks_done) => VerifyNegotiation::PendingBitmap(chunks_done),
+        None => VerifyNegotiation::NotReceived,
+    }
+}
+
+/// verify 协商结果（驱动发送方终态，A3.2 状态机对齐）。
+enum VerifyNegotiation {
+    /// 接收方任务已终态（或旧对端宽容）→ 发送方 Completed
+    Finalized,
+    /// 全程无回执（网络不通）→ 发送方 Interrupted，会话保留、位图不动
+    NotReceived,
+    /// 对端明确 pending 直到耗尽 → 发送方按位图回退后 Interrupted
+    PendingBitmap(Vec<bool>),
 }
 
 /// 解析 verify 回执 `{"result": …, "chunks_done": […]}`。
@@ -2989,6 +3049,11 @@ mod tests {
 
         // 发送会话：位图 [true, false] → 只应发送段1
         let sender = Arc::new(TransferEngine::new(0, 4, src_dir.clone()));
+        // verify 回执服务：回 finalized（否则发送方进入轮询协商、
+        // 拿不到回执会 Interrupted——那正是对齐修复后的预期行为）
+        let (gw_port, _hits) =
+            spawn_scripted_http(vec![("200 OK", r#"{"result":"finalized","chunks_done":null}"#)])
+                .await;
         let (mut rx, _cancel) = insert_session(
             &sender,
             file_id,
@@ -2998,7 +3063,7 @@ mod tests {
             2,
             "127.0.0.1",
             port,
-            free_port(), // 无 gateway：verify 通知失败仅告警，不影响状态
+            gw_port,
             vec![true, false],
         )
         .await;
@@ -3061,6 +3126,11 @@ mod tests {
         let mut note_tx = Some(note_tx);
 
         let sender = Arc::new(TransferEngine::new(0, 4, src_dir.clone()));
+        // verify 回执服务：回 finalized——否则协商拿不到回执 → Interrupted
+        //（会话保留、进度通道不关），下面等 channel 关闭的 collector 会永久挂起
+        let (gw_port, _hits) =
+            spawn_scripted_http(vec![("200 OK", r#"{"result":"finalized","chunks_done":null}"#)])
+                .await;
         let (mut rx, _cancel) = insert_session(
             &sender,
             file_id,
@@ -3070,7 +3140,7 @@ mod tests {
             1,
             "127.0.0.1",
             port,
-            free_port(),
+            gw_port,
             vec![false],
         )
         .await;
@@ -3114,7 +3184,15 @@ mod tests {
             "重试成功后应 Completed，frames={:?}",
             frames.last().map(|p| (p.status, p.error.clone()))
         );
-        let got = std::fs::read(recv_dir.join("ok.bin")).unwrap();
+        // 发送方 Completed（verify 回执）可先于接收方应用层 finalize：
+        // 轮询等落盘，不做瞬时断言
+        let final_path = recv_dir.join("ok.bin");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !final_path.exists() {
+            assert!(Instant::now() < deadline, "接收方未 finalize 落盘");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let got = std::fs::read(&final_path).unwrap();
         assert_eq!(got, b"hello-retry");
 
         let _ = std::fs::remove_dir_all(&recv_dir);
@@ -3283,6 +3361,13 @@ mod tests {
         status: &'static str,
         body: &'static str,
     ) -> (u16, Arc<std::sync::atomic::AtomicU32>) {
+        spawn_scripted_http(vec![(status, body)]).await
+    }
+
+    /// 极简 HTTP 服务：按命中序号返回 `responses[i]`（超出取最后一项）。
+    async fn spawn_scripted_http(
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> (u16, Arc<std::sync::atomic::AtomicU32>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -3293,10 +3378,15 @@ mod tests {
                     break;
                 };
                 let hits = hits2.clone();
+                let responses = responses.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let _ = sock.read(&mut buf).await;
-                    hits.fetch_add(1, Ordering::SeqCst);
+                    let idx = hits.fetch_add(1, Ordering::SeqCst) as usize;
+                    let (status, body) = responses
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(responses.last().copied().unwrap());
                     let resp = format!(
                         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -3506,8 +3596,8 @@ mod tests {
     #[tokio::test]
     async fn post_verify_reject_short_circuits() {
         let (port, hits) = spawn_fixed_http("500 Internal Server Error", "boom").await;
-        let out = post_verify("127.0.0.1", port, "fid", "{}").await;
-        assert!(out.is_none());
+        let out = post_verify_once("127.0.0.1", port, "fid", "{}").await;
+        assert!(matches!(out, VerifyPost::Rejected));
         assert_eq!(hits.load(Ordering::SeqCst), 1, "HTTP 判决不重试");
     }
 
@@ -3524,7 +3614,10 @@ mod tests {
         .await;
         let src = dir.join("src.bin");
         std::fs::write(&src, b"0123456789").unwrap();
-        let engine = Arc::new(TransferEngine::new(0, 4, dir.clone()));
+        let mut engine = TransferEngine::new(0, 4, dir.clone());
+        // 协商退避注入短表（2 轮即耗尽），不真等默认 9.5s 窗口
+        engine.verify_backoff = vec![Duration::from_millis(10), Duration::from_millis(10)];
+        let engine = Arc::new(engine);
         // 位图全 true：do_send 各段直接 skip → Completed → hash → verify
         let (mut rx, _cancel) = insert_session(
             &engine,
@@ -3569,6 +3662,209 @@ mod tests {
             "位图必须以接收方回执为准回退"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 网络抖动导致全程拿不到 verify 回执（transport 全失败）：
+    /// 发送方必须 Interrupted 保留会话、**位图一格不动**（无信息不回退），
+    /// 点继续重新协商自愈——不得谎报 Completed（真机痛点）。
+    #[tokio::test]
+    async fn verify_not_received_keeps_bitmap_and_interrupts() {
+        let dir = tmp_dir("verify-noreceipt");
+        let src = dir.join("src.bin");
+        std::fs::write(&src, b"0123456789").unwrap();
+        let mut engine = TransferEngine::new(0, 4, dir.clone());
+        engine.verify_backoff = vec![Duration::from_millis(10), Duration::from_millis(10)];
+        let engine = Arc::new(engine);
+        let dead_port = free_port(); // 无人监听 → transport 全程失败
+        let (mut rx, _cancel) = insert_session(
+            &engine,
+            "fid-noreceipt",
+            "src.bin",
+            src,
+            10,
+            2,
+            "127.0.0.1",
+            free_port(),
+            dead_port,
+            vec![true, true],
+        )
+        .await;
+
+        engine
+            .clone()
+            .run_transfer("fid-noreceipt".into(), false)
+            .await;
+
+        let mut frames = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            frames.push(p);
+        }
+        assert!(
+            !frames
+                .iter()
+                .any(|f| f.status == TransferStatus::Completed),
+            "无回执不得 Completed"
+        );
+        let last = frames.last().expect("应有终态帧");
+        assert_eq!(last.status, TransferStatus::Interrupted);
+        assert!(
+            last.error.as_deref().unwrap_or("").contains("校验回执未达"),
+            "got {:?}",
+            last.error
+        );
+        let sessions = engine.send_sessions.lock().await;
+        let s = sessions.get("fid-noreceipt").expect("必须保留会话");
+        assert_eq!(
+            *s.streams_done.lock(),
+            vec![true, true],
+            "无回执时位图一格不得回退（没有信息）"
+        );
+        assert!(!s.running);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// verify 轮询自愈：前几轮 pending（对端还在收尾），随后 finalized → Completed。
+    /// 这正是「TCP 写完成 ≠ 对端收齐」的正常竞态，不能一轮 pending 就中断重发。
+    #[tokio::test]
+    async fn verify_polling_recovers_from_early_pending() {
+        let dir = tmp_dir("verify-poll");
+        let src = dir.join("src.bin");
+        std::fs::write(&src, b"0123456789").unwrap();
+        let mut engine = TransferEngine::new(0, 4, dir.clone());
+        engine.verify_backoff = vec![
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ];
+        let engine = Arc::new(engine);
+        // 第 1、2 轮 pending，第 3 轮 finalized（模拟对端收尾完成后才 finalize）
+        let (gw_port, _hits) = spawn_scripted_http(vec![
+            (
+                "200 OK",
+                r#"{"result":"pending","chunks_done":[true,false]}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"result":"pending","chunks_done":[true,true]}"#,
+            ),
+            ("200 OK", r#"{"result":"finalized","chunks_done":null}"#),
+        ])
+        .await;
+        let (mut rx, _cancel) = insert_session(
+            &engine,
+            "fid-poll",
+            "src.bin",
+            src,
+            10,
+            2,
+            "127.0.0.1",
+            free_port(),
+            gw_port,
+            vec![true, true],
+        )
+        .await;
+
+        engine.clone().run_transfer("fid-poll".into(), false).await;
+
+        let mut frames = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            frames.push(p);
+        }
+        assert_eq!(
+            frames.last().map(|f| f.status),
+            Some(TransferStatus::Completed),
+            "轮询等到 finalized 必须 Completed（statuses={:?}）",
+            frames.iter().map(|f| f.status).collect::<Vec<_>>()
+        );
+        assert!(
+            engine.send_sessions.lock().await.is_empty(),
+            "Completed 后会话必须清理"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R1 回归（真机：数据在涨、状态却卡「已中断」）：
+    /// 中断标记必须**随数据恢复**清除——任一段 finish_stream 成功即回
+    /// 「传输中」，不等整任务收齐。2 段任务：段1中断后，段0重发成功落盘
+    /// （任务尚未 complete），最新帧必须是 InProgress 而不是 Interrupted。
+    #[tokio::test]
+    async fn interrupted_cleared_on_segment_finish_before_complete() {
+        let dir = tmp_dir("recv-recover");
+        let port = free_port();
+        let mut cfg_recv = TransferEngine::new(port, 4, dir.clone());
+        cfg_recv.timeouts = crate::timeouts::Timeouts {
+            connect: Duration::from_secs(2),
+            idle: Duration::from_millis(300),
+        };
+        let recv = Arc::new(cfg_recv);
+        recv.clone().spawn_receiver().await.unwrap();
+
+        let file_id = "recv-recover-fid";
+        recv.storage
+            .create_slot(file_id.into(), "two.bin".into(), 10, 2, None, false)
+            .await
+            .unwrap();
+        recv.prefix_to_file_id
+            .lock()
+            .await
+            .insert(file_id_prefix_u64(file_id), file_id.to_string());
+
+        let header = |stream_id: u32| StreamHeader {
+            file_id_prefix: file_id_prefix_u64(file_id),
+            stream_id,
+            _reserved: 0,
+            start_offset: if stream_id == 0 { 0 } else { 5 },
+            data_len: 5,
+        };
+
+        // 第一次：段1 发 2 字节后静默 → idle 超时 → Interrupted（标记置位）
+        let mut sock1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        sock1.write_all(&header(1).to_bytes()).await.unwrap();
+        sock1.write_all(&[0xAB; 2]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let frame = recv
+            .list_transfers()
+            .into_iter()
+            .find(|p| p.file_id == file_id)
+            .expect("应有中断帧");
+        assert_eq!(frame.status, TransferStatus::Interrupted);
+        assert!(recv.recv_interrupted.lock().contains_key(file_id));
+        drop(sock1);
+
+        // 第二次：段0 重发成功收满（任务仍缺段1，未 complete）→
+        // R1：finish_stream 即清标记，最新帧回「传输中」
+        let mut sock2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        sock2.write_all(&header(0).to_bytes()).await.unwrap();
+        sock2.write_all(b"12345").await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut latest = TransferStatus::Interrupted;
+        while Instant::now() < deadline {
+            latest = recv
+                .list_transfers()
+                .into_iter()
+                .find(|p| p.file_id == file_id)
+                .map(|p| p.status)
+                .unwrap_or(latest);
+            if latest == TransferStatus::InProgress {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            latest,
+            TransferStatus::InProgress,
+            "段成功落盘后必须回「传输中」，不得卡「已中断」"
+        );
+        assert!(
+            !recv.recv_interrupted.lock().contains_key(file_id),
+            "中断标记必须随数据恢复清除"
+        );
+
+        drop(sock2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
