@@ -38,7 +38,8 @@ Future<String?> openFileNative(String path) async {
 /// 架构：
 /// - Android：App 启动时通过 FFI（libkitefile.so）在本进程内拉起 Rust daemon，
 ///   Dart UI 统一走 HTTP/WS 调用 127.0.0.1:7878 —— 手机是平等的传输节点。
-/// - 远程模式：设置弹窗切换到对端 IP，可当“遥控器”控制远端 daemon（开发调试用）。
+/// - 前端**只连接本机守护进程**（阶段 5 移除遥控模式：跨机控制需要 mTLS
+///   客户端证书，Dart HTTP 栈不支持；daemon 侧 `--remote-admin` 仍保留）。
 /// - iOS：daemon 嵌入预留（接口一致）。
 
 /// whoami 扫描端口列表（默认 = 共享候选；测试可注入以隔离本机真实 daemon）。
@@ -78,12 +79,12 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
-  // 默认指向本机；用户可改成对端 IP
-  String _daemonHost = '127.0.0.1';
+  // 固定指向本机（阶段 5 取消遥控模式：前端只连本机守护进程，
+  // 跨机通信一律由 daemon↔daemon 走 mTLS，不经 Dart UI）
+  final String _daemonHost = '127.0.0.1';
   /// daemon 实际监听的网关端口。默认端口可能被系统保留（Android 上少见，
   /// 但与桌面端共用同一套退避逻辑），探测到实际端口后更新。
   int _daemonPort = kGatewayPortCandidates.first;
-  final TextEditingController _hostController = TextEditingController(text: '127.0.0.1');
 
   String get _httpBase => 'http://$_daemonHost:$_daemonPort';
   String get _wsBase => 'ws://$_daemonHost:$_daemonPort/ws/progress';
@@ -178,7 +179,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _ws?.close();
     _refreshTimer?.cancel();
-    _hostController.dispose();
     super.dispose();
   }
 
@@ -269,23 +269,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     } catch (e) {
       debugPrint('[kitefile] keep-alive toggle($active) failed: $e');
     }
-  }
-
-  Future<void> _reconnect(String host) async {
-    setState(() {
-      _daemonHost = host;
-      _me = null;
-      _devices = [];
-      _receivedFiles = [];
-      _receiveDir = null;
-      _progress.clear();
-      _incoming.clear();
-      _daemonOnline = false;
-    });
-    await _ws?.close();
-    _ws = null;
-    _refreshTimer?.cancel();
-    await _initDaemon();
   }
 
   Future<void> _fetchWhoAmI() async {
@@ -880,8 +863,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             Row(
               children: [
                 Text('本机 / 守护进程', style: Theme.of(context).textTheme.titleMedium),
-                const Spacer(),
-                Text(_daemonHost, style: const TextStyle(color: Colors.grey, fontSize: 12)),
               ],
             ),
             const SizedBox(height: 6),
@@ -889,9 +870,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               Text(
                 _daemonOnline
                     ? '加载中...'
-                    : _daemonHost == '127.0.0.1'
-                        ? '内嵌守护进程未就绪。请重开应用；若持续失败请反馈日志。'
-                        : '未连接守护进程。检查对端 IP，或点右上角修改。',
+                    : '内嵌守护进程未就绪。请重开应用；若持续失败请反馈日志。',
                 style: const TextStyle(color: Colors.grey, fontSize: 13),
               )
             else
@@ -1111,8 +1090,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             else
               Column(
                 children: _receivedFiles.map((name) {
-                  // 本机 daemon 且已知接收目录时，可直接打开文件
-                  final canOpen = _daemonHost == '127.0.0.1' && _receiveDir != null;
+                  // 已知接收目录时可直接打开文件（本机 daemon 固定 127.0.0.1）
+                  final canOpen = _receiveDir != null;
                   return ListTile(
                     contentPadding: EdgeInsets.zero,
                     dense: true,
@@ -1121,7 +1100,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(fontSize: 13)),
                     subtitle: Text(
-                      _receiveDir ?? (_daemonHost == '127.0.0.1' ? '接收目录' : '对端接收目录'),
+                      _receiveDir ?? '接收目录',
                       style: const TextStyle(fontSize: 11),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
@@ -1337,37 +1316,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 Text(
                   '重启后名称保留；对端设备列表会立即显示新名字。',
                   style: const TextStyle(fontSize: 12, color: Colors.grey),
-                ),
-                const Divider(),
-                const Text('守护进程地址', style: TextStyle(fontWeight: FontWeight.bold)),
-                const SizedBox(height: 6),
-                Text(
-                  _daemonHost == '127.0.0.1' ? '本机（127.0.0.1）' : _daemonHost,
-                  style: const TextStyle(fontSize: 13, color: Colors.grey),
-                ),
-                const SizedBox(height: 8),
-                TextField(
-                  controller: _hostController,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    border: OutlineInputBorder(),
-                    labelText: '切换到其他 IP（当遥控器）',
-                    hintText: '127.0.0.1',
-                    isDense: true,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: TextButton(
-                    onPressed: () {
-                      final h = _hostController.text.trim();
-                      if (h.isEmpty) return;
-                      Navigator.pop(ctx);
-                      _reconnect(h);
-                    },
-                    child: const Text('连接'),
-                  ),
                 ),
                 const Divider(),
                 const Text('接收文件保存位置', style: TextStyle(fontWeight: FontWeight.bold)),
