@@ -41,6 +41,9 @@ class Device {
   final int transferPort;
   final int gatewayPort;
   final String platform;
+  /// 对端是否处于配对模式（mDNS TXT `pair=1`；旧版对端不发 → false）。
+  /// 展示规则（设计 §5.4）：已配对 ∨（未配对 ∧ pair）。
+  final bool pair;
   const Device({
     required this.id,
     required this.name,
@@ -48,6 +51,7 @@ class Device {
     required this.transferPort,
     required this.gatewayPort,
     required this.platform,
+    this.pair = false,
   });
 
   factory Device.fromJson(Map<String, dynamic> j) => Device(
@@ -57,6 +61,7 @@ class Device {
         transferPort: jsonInt(j['transfer_port'], 7879),
         gatewayPort: jsonInt(j['gateway_port'], 7878),
         platform: jsonStr(j['platform']),
+        pair: j['pair'] == true,
       );
 }
 

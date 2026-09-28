@@ -326,6 +326,8 @@ enum _CloseAction { tray, fullExit }
 class _HomePageState extends State<HomePage> with WindowListener {
   WhoAmI? _me;
   List<Device> _devices = [];
+  /// 已配对设备（GET /api/peers；设备列表展示规则与发送入口依赖它）
+  List<Map<String, dynamic>> _peers = [];
   final Map<String, TransferProgress> _progress = {};
   final Map<String, IncomingEntry> _pendingIncoming = {};
   /// 攒批—决策—迟到沿用状态机（工作流 C：共享实现，双端仅此一份）
@@ -553,6 +555,14 @@ class _HomePageState extends State<HomePage> with WindowListener {
       // 设备列表是本机 daemon 接口：失败留日志（徽标由 whoami 轮询定真值）
       debugPrint('[kitefile] devices refresh failed: $e');
     }
+    // 配对表单独拉：失败不拖垮设备列表
+    try {
+      final r = await httpGet('$kDaemonHttp/api/peers');
+      final list = (jsonDecode(r) as List).cast<Map<String, dynamic>>();
+      if (mounted) setState(() => _peers = list);
+    } catch (e) {
+      debugPrint('[kitefile] peers refresh failed: $e');
+    }
   }
 
   Future<void> _connectWs() async {
@@ -630,9 +640,201 @@ class _HomePageState extends State<HomePage> with WindowListener {
         final id = j['incoming_id'] as String;
         setState(() => _pendingIncoming.remove(id));
         break;
+      case 'pair_request':
+        // 对端发来配对请求（P3 WS 事件）→ 确认码弹窗
+        _showPairRequestDialog(j);
+        break;
       default:
         break;
     }
+  }
+
+  /// 对端配对请求弹窗：两屏比对确认码，确认 → POST /api/pair/decide
+  Future<void> _showPairRequestDialog(Map<String, dynamic> j) async {
+    final session = j['session'] as String? ?? '';
+    final name = j['name'] as String? ?? '未知设备';
+    final ip = j['ip'] as String? ?? '';
+    final platform = j['platform'] as String? ?? '';
+    final code = j['code'] as String? ?? '';
+    if (session.isEmpty || !mounted) return;
+
+    Future<void> decide(bool accept) async {
+      try {
+        await httpPost(
+          '$kDaemonHttp/api/pair/decide',
+          body: jsonEncode({'session': session, 'accept': accept}),
+        );
+        await _refreshDevices();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(accept ? '已与 $name 配对' : '已拒绝 $name 的配对请求'),
+            ),
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text('配对失败: $e')));
+        }
+      }
+    }
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.link_rounded, size: 24),
+            SizedBox(width: 8),
+            Text('配对请求'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('$name 请求与本机配对'),
+            const SizedBox(height: 4),
+            Text('$platform · $ip',
+                style: const TextStyle(fontSize: 12, color: Colors.grey)),
+            const SizedBox(height: 16),
+            const Text('确认码（请与对方屏幕核对）',
+                style: TextStyle(fontSize: 12, color: Colors.grey)),
+            const SizedBox(height: 8),
+            Center(
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                decoration: BoxDecoration(
+                  color: Theme.of(ctx).colorScheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  code,
+                  style: const TextStyle(
+                      fontSize: 36,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 6),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              '两台设备显示的数字必须一致；不一致请取消，可能有人在中间拦截。',
+              style: TextStyle(fontSize: 12, color: Colors.orange),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              decide(false);
+            },
+            child: const Text('拒绝'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              decide(true);
+            },
+            child: const Text('确认配对'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 发起配对（设备列表「配对」按钮）：hello 握手在 daemon 侧完成，
+  /// 本机展示确认码等对方确认；后台轮询配对表，成功即收。
+  Future<void> _startPairing(Device d) async {
+    String session;
+    String code;
+    try {
+      final r = await httpPost(
+        '$kDaemonHttp/api/pair/start',
+        body: jsonEncode({
+          'device_id': d.id,
+          'name': d.name,
+          'platform': d.platform,
+          'ip': d.ip,
+          'gateway_port': d.gatewayPort,
+        }),
+      );
+      final j = jsonDecode(r) as Map<String, dynamic>;
+      session = j['pairing_session'] as String? ?? '';
+      code = j['code'] as String? ?? '';
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('发起配对失败: $e')));
+      }
+      return;
+    }
+    if (!mounted || session.isEmpty) return;
+
+    var done = false;
+    Timer.periodic(const Duration(seconds: 1), (t) async {
+      if (done) {
+        t.cancel();
+        return;
+      }
+      try {
+        final r = await httpGet('$kDaemonHttp/api/peers');
+        final list = (jsonDecode(r) as List).cast<Map<String, dynamic>>();
+        if (list.any((p) => p['device_id'] == d.id)) {
+          t.cancel();
+          done = true;
+          await _refreshDevices();
+          if (mounted) {
+            ScaffoldMessenger.of(context)
+                .showSnackBar(SnackBar(content: Text('已与 ${d.name} 配对')));
+            if (context.mounted) Navigator.of(context, rootNavigator: true).pop();
+          }
+        }
+      } catch (_) {/* 轮询失败静默，下一轮再试 */}
+    });
+
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) => AlertDialog(
+        title: Text('等待 ${d.name} 确认'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('请与对方屏幕核对确认码：',
+                style: TextStyle(fontSize: 12, color: Colors.grey)),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+              decoration: BoxDecoration(
+                color: Theme.of(ctx).colorScheme.primaryContainer,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                code,
+                style: const TextStyle(
+                    fontSize: 36, fontWeight: FontWeight.bold, letterSpacing: 6),
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text('对方确认后自动完成；60 秒未确认将过期。',
+                style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+    done = true; // 关闭弹窗即停止轮询（配对可能仍在对端进行，设备列表刷新兜底）
   }
 
   /// 收到一个 incoming 请求：去重后交给共享攒批状态机（工作流 C）。
@@ -924,7 +1126,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
     );
   }
 
-  /// 设置弹窗：查看/修改设备名 + 接收目录
+  /// 设置弹窗：配对 + 设备名 + 接收目录
   Future<void> _showSettingsDialog() async {
     String? currentDir;
     String? currentName;
@@ -934,20 +1136,135 @@ class _HomePageState extends State<HomePage> with WindowListener {
       currentDir = j['receive_dir'] as String?;
       currentName = j['device_name'] as String?;
     } catch (_) {}
+    // 配对状态（开关倒计时 + 已配对列表）
+    var pairOn = false;
+    var pairTtl = 0;
+    var peers = <Map<String, dynamic>>[];
+    try {
+      final r = await httpGet('$kDaemonHttp/api/pair/mode');
+      final j = jsonDecode(r) as Map<String, dynamic>;
+      pairOn = j['enabled'] == true;
+      pairTtl = (j['seconds_left'] as num?)?.toInt() ?? 0;
+    } catch (_) {}
+    try {
+      final r = await httpGet('$kDaemonHttp/api/peers');
+      peers = (jsonDecode(r) as List).cast<Map<String, dynamic>>();
+    } catch (_) {}
     if (!mounted) return;
 
     final nameController = TextEditingController(text: currentName ?? '');
+    Timer? pairTicker;
 
     await showDialog<void>(
       context: context,
       builder: (dialogCtx) => StatefulBuilder(
-        builder: (ctx, setDialogState) => AlertDialog(
+        builder: (ctx, setDialogState) {
+          // 配对模式本地倒计时（服务端 TTL 为准，这里只做展示节拍）
+          pairTicker ??= Timer.periodic(const Duration(seconds: 1), (t) {
+            if (!pairOn) {
+              t.cancel();
+              return;
+            }
+            pairTtl -= 1;
+            if (pairTtl <= 0) {
+              pairOn = false;
+              pairTtl = 0;
+              t.cancel();
+            }
+            if (ctx.mounted) setDialogState(() {});
+          });
+          return AlertDialog(
           title: const Text('设置'),
           content: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                const Text('配对', style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Switch(
+                      value: pairOn,
+                      onChanged: (v) async {
+                        try {
+                          await httpPost(
+                            '$kDaemonHttp/api/pair/mode',
+                            body: jsonEncode({'enabled': v}),
+                          );
+                          setDialogState(() {
+                            pairOn = v;
+                            if (v) pairTtl = 120;
+                          });
+                        } catch (e) {
+                          if (ctx.mounted) {
+                            ScaffoldMessenger.of(ctx).showSnackBar(
+                              SnackBar(content: Text('切换配对模式失败: $e')),
+                            );
+                          }
+                        }
+                      },
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      pairOn ? '配对模式开启（剩余 ${pairTtl}s）' : '配对模式关闭',
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: pairOn
+                            ? Theme.of(ctx).colorScheme.primary
+                            : Colors.grey,
+                      ),
+                    ),
+                  ],
+                ),
+                const Text(
+                  '开启后 120 秒内，双方设备才能互相发现并配对；配对过的设备不受影响，始终可见。',
+                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+                if (peers.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  for (final p in peers)
+                    ListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      leading: Icon(
+                        p['online'] == true
+                            ? Icons.circle
+                            : Icons.circle_outlined,
+                        size: 14,
+                        color: p['online'] == true ? Colors.green : Colors.grey,
+                      ),
+                      title: Text(p['name_hint'] as String? ?? '未知设备'),
+                      subtitle: Text(
+                        '${p['platform'] ?? ''} · 已配对',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.delete_outline, size: 20),
+                        tooltip: '解除配对',
+                        onPressed: () async {
+                          try {
+                            await httpDelete(
+                                '$kDaemonHttp/api/peers/${p['device_id']}');
+                            final r =
+                                await httpGet('$kDaemonHttp/api/peers');
+                            setDialogState(() {
+                              peers = (jsonDecode(r) as List)
+                                  .cast<Map<String, dynamic>>();
+                            });
+                            await _refreshDevices();
+                          } catch (e) {
+                            if (ctx.mounted) {
+                              ScaffoldMessenger.of(ctx).showSnackBar(
+                                SnackBar(content: Text('解除配对失败: $e')),
+                              );
+                            }
+                          }
+                        },
+                      ),
+                    ),
+                ],
+                const Divider(height: 24),
                 const Text('设备名称', style: TextStyle(fontWeight: FontWeight.bold)),
                 const SizedBox(height: 6),
                 Row(
@@ -1056,7 +1373,8 @@ class _HomePageState extends State<HomePage> with WindowListener {
               child: const Text('关闭'),
             ),
           ],
-        ),
+        );
+        },
       ),
     );
     nameController.dispose();
@@ -1177,25 +1495,46 @@ class _HomePageState extends State<HomePage> with WindowListener {
   }
 
   Widget _devicesSection() {
+    // 展示规则（设计 §5.4）：已配对 ∨（未配对 ∧ 对方处于配对模式）
+    final visible = _devices
+        .where((d) =>
+            d.pair || _peers.any((p) => p['device_id'] == d.id))
+        .toList();
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('设备列表 (${_devices.length})', style: Theme.of(context).textTheme.titleMedium),
+            Text('设备列表 (${visible.length})',
+                style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
-            if (_devices.isEmpty)
+            if (visible.isEmpty)
               const Padding(
                 padding: EdgeInsets.symmetric(vertical: 8),
-                child: Text('未发现设备，请确认对端已启动并处于同一局域网。'),
+                child: Text(
+                    '未发现可用设备。已配对设备始终显示；新设备需双方都进入配对模式（设置 → 配对）才能被发现。'),
               )
             else
               Column(
-                children: _devices.map((d) {
+                children: visible.map((d) {
+                  final paired = _peers.any((p) => p['device_id'] == d.id);
+                  if (!paired) {
+                    // 未配对（且对方在配对模式）：只有配对入口，无发送入口
+                    return ListTile(
+                      title: Text(d.name),
+                      subtitle:
+                          Text('${d.platform} · ${d.ip} · 可配对'),
+                      trailing: FilledButton.tonal(
+                        onPressed: () => _startPairing(d),
+                        child: const Text('配对'),
+                      ),
+                    );
+                  }
                   return ListTile(
                     title: Text(d.name),
-                    subtitle: Text('${d.platform} · ${d.ip}:${d.transferPort}'),
+                    subtitle: Text(
+                        '${d.platform} · ${d.ip}:${d.transferPort} · 已配对'),
                     trailing: const Icon(Icons.send),
                     onTap: () => _showSendDialog(d),
                   );
@@ -1504,6 +1843,22 @@ Future<String> httpPost(String url, {required String body}) async {
     final r = await client.postUrl(uri);
     r.headers.contentType = ContentType.json;
     r.add(Uint8List.fromList(utf8.encode(body)));
+    final resp = await r.close();
+    final respBody = await resp.transform(utf8.decoder).join();
+    if (resp.statusCode >= 400) {
+      throw Exception('HTTP ${resp.statusCode}: $respBody');
+    }
+    return respBody;
+  } finally {
+    client.close(force: true);
+  }
+}
+
+Future<String> httpDelete(String url) async {
+  final uri = Uri.parse(url);
+  final client = HttpClient();
+  try {
+    final r = await client.deleteUrl(uri);
     final resp = await r.close();
     final respBody = await resp.transform(utf8.decoder).join();
     if (resp.statusCode >= 400) {
