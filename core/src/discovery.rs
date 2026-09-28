@@ -70,6 +70,10 @@ pub struct Device {
     pub gateway_port: u16,
     pub transfer_port: u16,
     pub platform: String,
+    /// 对端是否处于配对模式（TXT `pair=1`）。旧版客户端不发该键 → false。
+    /// P2：UI 显示「可配对」；P3：未配对设备只在此为 true 时展示/可发起配对。
+    #[serde(default)]
+    pub pair: bool,
 }
 
 /// 发现服务：注册本机并发现局域网内其他设备
@@ -84,6 +88,8 @@ pub struct DiscoveryService {
     identity_path: Option<PathBuf>,
     gateway_port: u16,
     transfer_port: u16,
+    /// 配对模式状态（P2）：驱动 mDNS `pair` TXT 与 P3 的配对接口门
+    pairing: Arc<crate::pairing::PairingState>,
 }
 
 impl DiscoveryService {
@@ -101,7 +107,7 @@ impl DiscoveryService {
     ) -> Result<Self> {
         let daemon = ServiceDaemon::new().map_err(|e| crate::CoreError::Discovery(e.to_string()))?;
 
-        let info = build_service_info(&self_id, &self_name, gateway_port, transfer_port)?;
+        let info = build_service_info(&self_id, &self_name, gateway_port, transfer_port, false)?;
         daemon
             .register(info)
             .map_err(|e| crate::CoreError::Discovery(e.to_string()))?;
@@ -116,6 +122,7 @@ impl DiscoveryService {
             identity_path,
             gateway_port,
             transfer_port,
+            pairing: Arc::new(crate::pairing::PairingState::new()),
         })
     }
 
@@ -136,6 +143,7 @@ impl DiscoveryService {
             identity_path,
             gateway_port: 7878,
             transfer_port: 7879,
+            pairing: Arc::new(crate::pairing::PairingState::new()),
         }
     }
 
@@ -166,15 +174,70 @@ impl DiscoveryService {
         }
         *self.self_name.write() = new_name.to_string();
 
-        // 重新注册 mDNS（广播新名字）
-        if let Some(daemon) = &self.daemon {
-            let info = build_service_info(&self.self_id, new_name, self.gateway_port, self.transfer_port)?;
-            daemon
-                .register(info)
-                .map_err(|e| crate::CoreError::Discovery(e.to_string()))?;
-            info!(name = %new_name, "device renamed, mDNS re-announced");
-        }
+        // 重新注册 mDNS（广播新名字；pair 标志按当前状态带上）
+        self.reregister_service()?;
+        info!(name = %new_name, "device renamed, mDNS re-announced");
         Ok(())
+    }
+
+    /// 按当前状态（名字 / 端口 / pair 标志）重新注册 mDNS 服务。
+    /// mdns-sd 对同一实例重复 register 即更新 TXT（service_daemon.rs:286）。
+    fn reregister_service(&self) -> Result<()> {
+        let Some(daemon) = &self.daemon else {
+            return Ok(()); // 离线模式无 mDNS 可更
+        };
+        let name = self.self_name.read().clone();
+        let pair = self.pairing.is_active();
+        let info = build_service_info(&self.self_id, &name, self.gateway_port, self.transfer_port, pair)?;
+        daemon
+            .register(info)
+            .map_err(|e| crate::CoreError::Discovery(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 进入 / 退出配对模式（P2）。返回 (是否开启, 剩余秒数)。
+    ///
+    /// - 开启：mDNS TXT 置 `pair=1`（对端设备表标「可配对」），并 spawn
+    ///   一个 120s 过期任务——到点自动退出并把 TXT 改回 `pair=0`。
+    ///   重复开启刷新倒计时（代数前进，旧任务作废）。
+    /// - 关闭：立即生效，同样推进代数作废旧任务。
+    /// - 重启后默认关闭（状态只在内存，符合设计 §5）。
+    ///
+    /// 只从 async 上下文调用（gateway handler）；无运行时时不 spawn 过期任务，
+    /// 惰性判断（`is_active`）仍会正确按到期时间收敛。
+    pub fn set_pairing_mode(self: Arc<Self>, on: bool) -> Result<(bool, u32)> {
+        let gen = if on {
+            self.pairing.activate()
+        } else {
+            self.pairing.deactivate()
+        };
+        // 先落状态再广播：即使 register 失败，is_active 语义也正确（UI 可见）
+        if let Err(e) = self.reregister_service() {
+            warn!(error = %e, "pairing mode mDNS re-register failed");
+        }
+
+        if on {
+            let this = Arc::clone(&self);
+            let spawned = tokio::runtime::Handle::try_current().map(|h| {
+                h.spawn(async move {
+                    tokio::time::sleep(crate::pairing::PAIRING_TTL).await;
+                    if this.pairing.expire_if_current(gen) {
+                        let _ = this.reregister_service();
+                        info!("pairing mode expired, pair flag cleared");
+                    }
+                })
+            });
+            if spawned.is_err() {
+                warn!("no runtime for pairing TTL task; lazy expiry only");
+            }
+        }
+        info!(on, "pairing mode set");
+        Ok((self.pairing.is_active(), self.pairing.seconds_left()))
+    }
+
+    /// 当前配对模式状态 (是否开启, 剩余秒数)
+    pub fn pairing_status(&self) -> (bool, u32) {
+        (self.pairing.is_active(), self.pairing.seconds_left())
     }
 
     /// 后台轮询发现事件，更新设备表
@@ -217,6 +280,11 @@ impl DiscoveryService {
                                 .find(|p| p.key() == "transfer_port")
                                 .and_then(|p| p.val_str().parse().ok())
                                 .unwrap_or(7879u16);
+                            let pair = props
+                                .iter()
+                                .find(|p| p.key() == "pair")
+                                .map(|p| p.val_str() == "1")
+                                .unwrap_or(false);
                             let addrs: Vec<IpAddr> =
                                 info.get_addresses().iter().copied().collect();
                             let ip = pick_peer_address(&addrs);
@@ -228,6 +296,7 @@ impl DiscoveryService {
                                 gateway_port,
                                 transfer_port,
                                 platform,
+                                pair,
                             };
                             info!(?device, "resolved device");
                             self.devices.write().insert(id, device);
@@ -339,6 +408,7 @@ fn build_service_info(
     self_name: &str,
     gateway_port: u16,
     transfer_port: u16,
+    pair_active: bool,
 ) -> Result<ServiceInfo> {
     // 取本机所有 IPv4 地址，作为可被发现的地址
     let my_ips = my_ipv4_addrs();
@@ -354,6 +424,11 @@ fn build_service_info(
     properties.insert("platform".into(), crate::platform::platform_name().to_string());
     properties.insert("gateway_port".into(), gateway_port.to_string());
     properties.insert("transfer_port".into(), transfer_port.to_string());
+    // 配对模式标志（P2）：旧版客户端忽略未知键，向后兼容
+    properties.insert(
+        "pair".into(),
+        if pair_active { "1" } else { "0" }.to_string(),
+    );
 
     let hostname = format!("{}.local.", self_id);
     let host_ipv4: Vec<&str> = my_ips.iter().map(|s| s.as_str()).collect();
@@ -558,5 +633,60 @@ mod tests {
             v4("10.124.68.246"),
             v4("255.255.255.0")
         ));
+    }
+
+    // ---- 阶段 5 P2：配对模式 ----
+
+    /// TXT 必须携带 `pair` 键：对端据此标「可配对」；旧版客户端忽略未知键。
+    #[test]
+    fn service_info_carries_pair_flag() {
+        if my_ipv4_addrs().is_empty() {
+            eprintln!("SKIP service_info_carries_pair_flag: 无可用 IPv4");
+            return;
+        }
+        let on = build_service_info("id-a", "name-a", 7880, 7879, true).unwrap();
+        let pair = on
+            .get_properties()
+            .iter()
+            .find(|p| p.key() == "pair")
+            .map(|p| p.val_str().to_string());
+        assert_eq!(pair.as_deref(), Some("1"), "开启配对模式应广播 pair=1");
+
+        let off = build_service_info("id-a", "name-a", 7880, 7879, false).unwrap();
+        let pair = off
+            .get_properties()
+            .iter()
+            .find(|p| p.key() == "pair")
+            .map(|p| p.val_str().to_string());
+        assert_eq!(pair.as_deref(), Some("0"), "默认应广播 pair=0");
+    }
+
+    /// set_pairing_mode：开启 → 状态可见；手动关立即生效；
+    /// 再开启 → 120s 虚拟时间后过期任务自动关闭。
+    #[tokio::test(start_paused = true)]
+    async fn pairing_mode_toggles_and_auto_expires() {
+        let svc = Arc::new(DiscoveryService::new_offline(
+            "t".into(),
+            "t-id".into(),
+            None,
+        ));
+
+        let (on, left) = svc.clone().set_pairing_mode(true).unwrap();
+        assert!(on, "开启后状态应为 active");
+        assert!(left > 0 && left <= 120, "剩余秒数应在 (0,120]：{left}");
+        assert!(svc.pairing_status().0);
+
+        let (on2, _) = svc.clone().set_pairing_mode(false).unwrap();
+        assert!(!on2, "手动关闭必须立即生效");
+        assert!(!svc.pairing_status().0);
+
+        // 再开启 → TTL 过期任务接管
+        svc.clone().set_pairing_mode(true).unwrap();
+        tokio::time::sleep(crate::pairing::PAIRING_TTL + std::time::Duration::from_secs(1))
+            .await;
+        assert!(
+            !svc.pairing_status().0,
+            "120s 后必须自动退出配对模式（重启不复活的前提是内存态）"
+        );
     }
 }

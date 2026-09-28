@@ -108,6 +108,45 @@ pub struct WhoAmI {
     pub transfer_port: u16,
 }
 
+/// POST /api/pair/mode 请求体（阶段 5 P2）
+#[derive(Debug, Deserialize)]
+pub struct PairModeRequest {
+    pub enabled: bool,
+}
+
+/// 配对模式状态
+#[derive(Debug, Serialize)]
+pub struct PairModeStatus {
+    pub enabled: bool,
+    pub seconds_left: u32,
+    pub ttl_seconds: u32,
+}
+
+fn pair_mode_status(state: &AppState) -> PairModeStatus {
+    let (enabled, seconds_left) = state.discovery.pairing_status();
+    PairModeStatus {
+        enabled,
+        seconds_left,
+        ttl_seconds: crate::pairing::PAIRING_TTL.as_secs() as u32,
+    }
+}
+
+async fn get_pair_mode(State(state): State<AppState>) -> Json<PairModeStatus> {
+    Json(pair_mode_status(&state))
+}
+
+async fn set_pair_mode(
+    State(state): State<AppState>,
+    Json(req): Json<PairModeRequest>,
+) -> std::result::Result<Json<PairModeStatus>, (StatusCode, String)> {
+    state
+        .discovery
+        .clone()
+        .set_pairing_mode(req.enabled)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(pair_mode_status(&state)))
+}
+
 pub struct HttpGateway {
     state: AppState,
 }
@@ -226,6 +265,7 @@ fn build_app(state: AppState, advertised_gateway_port: u16) -> Router {
         .route("/api/incoming/batch-decide", post(batch_decide_incoming))
         .route("/api/incoming-resp", post(incoming_resp))
         .route("/api/verify/:file_id", post(verify_file))
+        .route("/api/pair/mode", get(get_pair_mode).post(set_pair_mode))
         .route("/api/config", get(get_config))
         .route("/api/config/receive-dir", post(set_receive_dir))
         .route("/api/config/device-name", post(set_device_name))
@@ -351,6 +391,8 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
         (Method::POST, "/api/peer-resumed/:file_id", Remote),
         (Method::GET, "/api/whoami", Remote),
         // ---- 仅本机：会控制本机的操作 ----
+        (Method::POST, "/api/pair/mode", LocalOnly),
+        (Method::GET, "/api/pair/mode", LocalOnly),
         (Method::POST, "/api/send", LocalOnly),
         (Method::GET, "/api/transfers", LocalOnly),
         (Method::POST, "/api/transfers/:file_id/resume", LocalOnly),

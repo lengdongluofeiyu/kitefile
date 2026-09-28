@@ -20,6 +20,7 @@ pub mod timeouts;
 pub mod fault;
 pub mod httpc;
 pub mod tls;
+pub mod pairing;
 
 pub use discovery::{Device, DeviceId, DiscoveryService};
 pub use transfer::{TransferEngine, TransferHandle, TransferProgress, TransferStatus};

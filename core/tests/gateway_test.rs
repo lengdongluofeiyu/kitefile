@@ -1401,6 +1401,43 @@ async fn test_remote_admin_opens_local_only_routes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 阶段 5 P2：配对模式开关（LocalOnly）+ 状态回读 + TTL 常量。
+#[tokio::test]
+async fn test_pair_mode_toggle() {
+    let dir = temp_dir("pair-mode");
+    let _ = start_stack(18049, 18149, &dir, 2).await;
+
+    let (status, _) = http(
+        18049,
+        "POST",
+        "/api/pair/mode",
+        Some(r#"{"enabled":true}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "本机 POST /api/pair/mode 应成功");
+    let v = http_json(18049, "GET", "/api/pair/mode", None).await;
+    assert_eq!(v["enabled"].as_bool(), Some(true));
+    assert!(
+        v["seconds_left"].as_u64().unwrap_or(0) > 0,
+        "开启后应有剩余秒数：{v}"
+    );
+    assert_eq!(v["ttl_seconds"].as_u64(), Some(120));
+
+    let (status, _) = http(
+        18049,
+        "POST",
+        "/api/pair/mode",
+        Some(r#"{"enabled":false}"#),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let v = http_json(18049, "GET", "/api/pair/mode", None).await;
+    assert_eq!(v["enabled"].as_bool(), Some(false));
+    assert_eq!(v["seconds_left"].as_u64(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// N2 回归：stream_count 必须由发送方带过去，接收方按它建槽。
 ///
 /// 这是唯一一条能在合入前抓住「静默数据损坏」的测试。
