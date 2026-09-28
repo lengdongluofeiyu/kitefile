@@ -271,13 +271,16 @@ C     = 前 4 字节大端 u32 % 1_000_000，左补零到 6 位   // 如 "048392
     "<device_id>": {
       "name_hint": "办公本-Win",
       "platform": "windows",
-      "cert_der": "<base64 证书 DER>",
       "fp_sha256": "ab12…",
       "paired_at": 1768000000
     }
   }
 }
 ```
+
+（实现注记：初稿的 `cert_der` 字段**未保留**——pin 校验、成员检查、
+握手比对用的都是整证书指纹，DER 本体没有任何消费方；只存 fp 少一份
+落盘敏感数据。若将来出现需要证书本体的场景再加。）
 
 - 索引键 **`device_id`**（Q5 原样：换 IP 不掉信任；IP 变化由 mDNS 重新解析）。
 - 鉴权时按连接收到的客户端证书整表比对 `fp_sha256`（常数条目线性扫即可，
@@ -440,14 +443,12 @@ request → access_guard（分级，现状） → auth_guard（证书 ∈ peers�
 
 ## 11. FFI 与 UI 改动清单
 
-### 11.1 FFI（core，沿用 ffi.rs 现有「JSON 进 JSON 出」风格）
+### 11.1 接口（实现调整：走 HTTP，不加 FFI）
 
-| 新增 | 说明 |
-|---|---|
-| `kitefile_pair_mode_json(set: bool)` | 进入/退出配对模式，返回 `{enabled, ttl_sec}` |
-| `kitefile_peers_json()` | 已配对列表（含在线状态，拼 discovery 设备表） |
-| `kitefile_peer_remove_json(id)` | 解除配对 |
-| 配对事件推送 | 走既有 WS：新增事件类型 `pair_request`（带 name/ip/platform/确认码）、`pair_result` |
+配对相关能力全部以 **LocalOnly HTTP 端点**暴露（`/api/pair/mode|start|decide|pending`、
+`/api/peers`），与既有 config 类接口同风格——Dart 两端本来就用 HTTP 调 daemon，
+**不需要新增 FFI 面**（初稿的 `kitefile_pair_mode_json` 等条目作废）。
+跨机事件经既有 WS 推送：新增 `WsEvent::PairRequest`（确认码弹窗数据）。
 
 ### 11.2 UI（desktop + mobile 同构）
 

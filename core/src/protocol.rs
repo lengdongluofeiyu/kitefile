@@ -223,6 +223,14 @@ pub enum WsEvent {
         incoming_id: String,
         accepted: bool,
     },
+    /// 新配对请求待确认（P3）：UI 弹确认码对话框（与 incoming 弹窗同构）
+    PairRequest {
+        session: String,
+        name: String,
+        ip: String,
+        platform: String,
+        code: String,
+    },
 }
 
 /// 接收方 daemon → 发送方 daemon 的 Offer 响应

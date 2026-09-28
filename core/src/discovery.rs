@@ -240,6 +240,11 @@ impl DiscoveryService {
         (self.pairing.is_active(), self.pairing.seconds_left())
     }
 
+    /// 配对协议状态（P3：pending 会话 / 限频 / 确认码所需）
+    pub fn pairing(&self) -> Arc<crate::pairing::PairingState> {
+        Arc::clone(&self.pairing)
+    }
+
     /// 后台轮询发现事件，更新设备表
     pub fn spawn_event_loop(self: Arc<Self>, rt: tokio::runtime::Handle) {
         let receiver = match self.daemon.as_ref().map(|d| d.browse(SERVICE_TYPE)) {

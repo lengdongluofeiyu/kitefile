@@ -92,7 +92,7 @@ pub async fn http_post_json_tls_with(
     connect_timeout: Duration,
     response_timeout: Duration,
 ) -> io::Result<String> {
-    let mut stream =
+    let (mut stream, _server_fp) =
         tls_connect(host, port, receive_dir, pinned_fp, connect_timeout).await?;
     let req = build_req(host, port, path, body);
     stream.write_all(req.as_bytes()).await?;
@@ -108,7 +108,7 @@ pub async fn http_get_tls(
     receive_dir: &Path,
     pinned_fp: Option<&str>,
 ) -> io::Result<String> {
-    let mut stream = tls_connect(
+    let (mut stream, _server_fp) = tls_connect(
         host,
         port,
         receive_dir,
@@ -124,14 +124,17 @@ pub async fn http_get_tls(
     read_response(stream, timeouts::HTTP_RESPONSE_TIMEOUT).await
 }
 
-/// 建立 TLS 连接（含握手超时）。
+/// 建立 TLS 连接（含握手超时）。返回 (流, 服务端证书指纹)。
+///
+/// 指纹来自**握手收到的服务端证书**（不是任何响应体声称）——
+/// 配对确认码必须基于亲眼所见，否则中间人可以两头喂同一个假码。
 async fn tls_connect(
     host: &str,
     port: u16,
     receive_dir: &Path,
     pinned_fp: Option<&str>,
     connect_timeout: Duration,
-) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+) -> io::Result<(tokio_rustls::client::TlsStream<TcpStream>, Option<String>)> {
     let identity = crate::tls::NodeIdentity::load_or_create(receive_dir)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("加载 TLS 身份失败: {e}")))?;
     let client_cfg = crate::tls::client_config(&identity, pinned_fp)
@@ -142,12 +145,37 @@ async fn tls_connect(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
     let server_name = server_name_for(host)?;
-    tokio::time::timeout(connect_timeout, connector.connect(server_name, tcp))
+    let stream = tokio::time::timeout(connect_timeout, connector.connect(server_name, tcp))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tls handshake timeout"))?
         // 握手失败按传输类错误（非 InvalidData——InvalidData 保留给
         // 「对端应用层明确判决」，调用方靠 kind 区分离线 vs 被拒）
-        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, format!("tls: {e}")))
+        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, format!("tls: {e}")))?;
+    let server_fp = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .map(|c| crate::tls::fingerprint(c.as_ref()));
+    Ok((stream, server_fp))
+}
+
+/// POST JSON over TLS，同时返回**握手所见**的服务端证书指纹。
+/// 配对流程（pair/start → hello）专用。
+pub async fn http_post_json_tls_peer_fp(
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &str,
+    receive_dir: &Path,
+) -> io::Result<(String, Option<String>)> {
+    let (mut stream, server_fp) =
+        tls_connect(host, port, receive_dir, None, timeouts::CONNECT_TIMEOUT).await?;
+    let req = build_req(host, port, path, body);
+    stream.write_all(req.as_bytes()).await?;
+    stream.flush().await?;
+    let resp = read_response(stream, timeouts::HTTP_RESPONSE_TIMEOUT).await?;
+    Ok((resp, server_fp))
 }
 
 fn server_name_for(host: &str) -> io::Result<rustls::pki_types::ServerName<'static>> {
@@ -191,9 +219,13 @@ where
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
     if !(200..300).contains(&status) {
+        // 摘一段响应体进错误：调用方（如配对流程）要能看见对端的拒绝原因，
+        // 不然只剩 "http status 403" 无法排查。仍保持 InvalidData kind
+        //（对端明确判决 vs 链路不通的区分），且字符串仍含状态码。
+        let snippet: String = response_str[body_start + 4..].chars().take(200).collect();
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("http status {}", status),
+            format!("http status {status}: {snippet}"),
         ));
     }
     Ok(response_str[body_start + 4..].to_string())

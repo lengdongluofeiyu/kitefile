@@ -91,10 +91,46 @@ async fn start_stack(
 ///
 /// 端口约定（阶段 5 P1 双监听）：
 /// - `gw_port` → 回环明文口（本机 UI / 测试的 `http_*` 助手打这里）
-/// - `gw_port+…` 不用；LAN TLS 口 = `tr_port + 1000`（与 (gw, tr) 固定错开，
+/// - LAN TLS 口 = `tr_port + 1000`（与 (gw, tr) 固定错开，
 ///   避免与其它用例的固定端口在并行下相撞）
 /// - 跨机流量（引擎互发 offer、远程策略用例）打 LAN TLS 口
 async fn start_stack_with(
+    gw_port: u16,
+    tr_port: u16,
+    recv_dir: &std::path::Path,
+    parallel: usize,
+    allow_remote_admin: bool,
+) -> Arc<TransferEngine> {
+    start_stack_impl(
+        shared_discovery(),
+        gw_port,
+        tr_port,
+        recv_dir,
+        parallel,
+        allow_remote_admin,
+    )
+    .await
+}
+
+/// 同 start_stack，但用**本用例独占的离线 discovery**——
+/// 配对模式 / pending 是进程级状态，共享 discovery 会让并行用例互相污染。
+async fn start_stack_isolated(
+    tag: &str,
+    gw_port: u16,
+    tr_port: u16,
+    recv_dir: &std::path::Path,
+    parallel: usize,
+) -> Arc<TransferEngine> {
+    let discovery = Arc::new(DiscoveryService::new_offline(
+        format!("iso-{tag}"),
+        format!("iso-{tag}-id"),
+        None,
+    ));
+    start_stack_impl(discovery, gw_port, tr_port, recv_dir, parallel, false).await
+}
+
+async fn start_stack_impl(
+    discovery: Arc<DiscoveryService>,
     gw_port: u16,
     tr_port: u16,
     recv_dir: &std::path::Path,
@@ -111,7 +147,6 @@ async fn start_stack_with(
         receive_dir: recv_dir.to_path_buf(),
         allow_remote_admin,
     };
-    let discovery = shared_discovery();
     let transfer = Arc::new(TransferEngine::new(
         tr_port,
         parallel,
@@ -1363,6 +1398,19 @@ async fn test_remote_access_blocked_by_policy() {
     let (status, _) = https_to(&ip, lan, "POST", "/api/incoming", Some("{}")).await;
     assert_ne!(status, 403, "POST /api/incoming 是对端发 offer 的入口，不能拒");
 
+    // P3 鉴权层：未配对设备打传输类接口必须 401（fail-closed）；
+    // 同时这也验证 middleware 顺序——LocalOnly 先得到 403（分级），不是 401
+    let (status, body) = https_to(&ip, lan, "POST", "/api/verify/xyz", Some("{}")).await;
+    assert_eq!(status, 401, "未配对设备调 verify 应 401，实际 {status}");
+    assert!(
+        String::from_utf8_lossy(&body).contains("未配对"),
+        "401 文案应给出可操作提示：{}",
+        String::from_utf8_lossy(&body)
+    );
+    // 免鉴权接口仍然可达（whoami 信息与 mDNS TXT 重合，见设计 §9.2）
+    let (status, _) = https_to(&ip, lan, "GET", "/api/whoami", None).await;
+    assert_eq!(status, 200, "whoami 免配对");
+
     // 本机访问不被误伤（回环地址一律放行）
     let (status, _) = http(18030, "GET", "/api/transfers", None).await;
     assert_eq!(status, 200, "本机访问不应受分级影响");
@@ -1374,7 +1422,11 @@ async fn test_remote_access_blocked_by_policy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `--remote-admin` 打开后，LocalOnly 那一档也对局域网放行。
+/// `--remote-admin` 打开后，LocalOnly 那一档对局域网放行；
+/// 但 P3 起鉴权与分级**正交**（Q1 裁决：分级放宽 ≠ 免鉴权）——
+/// 未配对设备过得了分级、仍被鉴权层拦下。
+/// 期望 **401 而非 403/200**：403 说明分级没开，200 说明鉴权没了，
+/// 401 恰好证明「分级放行 + 鉴权独立生效」两件事同时成立。
 #[tokio::test]
 async fn test_remote_admin_opens_local_only_routes() {
     require_sockets!("test_remote_admin_opens_local_only_routes");
@@ -1392,20 +1444,30 @@ async fn test_remote_admin_opens_local_only_routes() {
         return;
     }
 
-    let (status, _) = https_to(&ip, lan, "GET", "/api/transfers", None).await;
-    assert_eq!(status, 200, "开了 --remote-admin 后应放行");
+    let (status, body) = https_to(&ip, lan, "GET", "/api/transfers", None).await;
+    assert_eq!(
+        status, 401,
+        "分级已放行、鉴权层应 401（未配对）；403=分级没开、200=鉴权失守。body={}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("未配对"),
+        "401 文案应说明未配对：{}",
+        String::from_utf8_lossy(&body)
+    );
 
     let (status, _) = https_to(&ip, lan, "GET", "/api/files", None).await;
-    assert_eq!(status, 200);
+    assert_eq!(status, 401, "同上，files 也应 401 而非 403");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 阶段 5 P2：配对模式开关（LocalOnly）+ 状态回读 + TTL 常量。
+/// 用隔离 discovery：配对状态是进程级的，共享会与 P3 配对流程用例互踩。
 #[tokio::test]
 async fn test_pair_mode_toggle() {
     let dir = temp_dir("pair-mode");
-    let _ = start_stack(18049, 18149, &dir, 2).await;
+    let _ = start_stack_isolated("pairmode", 18049, 18149, &dir, 2).await;
 
     let (status, _) = http(
         18049,
@@ -1434,6 +1496,118 @@ async fn test_pair_mode_toggle() {
     let v = http_json(18049, "GET", "/api/pair/mode", None).await;
     assert_eq!(v["enabled"].as_bool(), Some(false));
     assert_eq!(v["seconds_left"].as_u64(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P3：完整配对流程——模式关时拒绝 → 开启 → 发起/确认码一致 → 确认 →
+/// 双方落库 → pending 清空 → 解除配对。
+///
+/// 两端都用隔离 discovery（配对状态进程级）；同进程内 in/out pending 分字段，
+/// 互不干扰。确认码断言是防中间人的核心：两端必须各自独立算出同一串。
+#[tokio::test]
+async fn test_pairing_flow_end_to_end() {
+    let dir_a = temp_dir("pflow-a");
+    let dir_b = temp_dir("pflow-b");
+    let _a = start_stack_isolated("pflow-a", 18082, 18182, &dir_a, 2).await;
+    let _b = start_stack_isolated("pflow-b", 18083, 18183, &dir_b, 2).await;
+
+    let start_body = r#"{"device_id":"peer-b","name":"B机","platform":"windows","ip":"127.0.0.1","gateway_port":19183}"#;
+
+    // 1) 模式关闭（默认）→ hello 403 → start 以 502 收口，错误带对端原因
+    let (st, body) = http(18082, "POST", "/api/pair/start", Some(start_body)).await;
+    assert_eq!(st, 502, "模式关闭时 start 应失败: {}", String::from_utf8_lossy(&body));
+    assert!(
+        String::from_utf8_lossy(&body).contains("未开启配对模式"),
+        "错误必须透传对端拒绝原因，实际：{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // 2) B 开启配对模式
+    let (st, _) = http(18083, "POST", "/api/pair/mode", Some(r#"{"enabled":true}"#)).await;
+    assert_eq!(st, 200);
+
+    // 3) A 发起 → 拿到 session + 本机确认码
+    let (st, body) = http(18082, "POST", "/api/pair/start", Some(start_body)).await;
+    assert_eq!(st, 200, "start 应成功: {}", String::from_utf8_lossy(&body));
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let session = v["pairing_session"].as_str().unwrap().to_string();
+    let code_a = v["code"].as_str().unwrap().to_string();
+    assert_eq!(code_a.len(), 6, "确认码应为 6 位: {code_a}");
+
+    // 4) B 侧 pending：session 一致 + **确认码一致**（独立计算必须相同）
+    let v = http_json(18083, "GET", "/api/pair/pending", None).await;
+    let p = v["pending"].as_object().expect("B 应有待确认请求");
+    assert_eq!(p["session"].as_str(), Some(session.as_str()));
+    assert_eq!(
+        p["code"].as_str(),
+        Some(code_a.as_str()),
+        "两端确认码必须一致——不一致说明中间有人换了证书"
+    );
+    assert_eq!(p["ip"].as_str(), Some("127.0.0.1"));
+    assert!(p["name"].as_str().is_some(), "应携带发起方展示名");
+
+    // 5) B 确认 → B 推 confirm 给 A → A 先落库 → B 落库
+    let decide_body = format!(r#"{{"session":"{session}","accept":true}}"#);
+    let (st, resp) = http(18083, "POST", "/api/pair/decide", Some(&decide_body)).await;
+    assert_eq!(st, 200, "decide: {}", String::from_utf8_lossy(&resp));
+    let rv: Value = serde_json::from_str(&String::from_utf8_lossy(&resp)).unwrap();
+    assert_eq!(rv["ok"], true);
+
+    // 6) 双方落库（A 存 B：device_id=peer-b；B 存 A：hello 自报的 device_id）
+    let a_peers = http_json(18082, "GET", "/api/peers", None).await;
+    assert!(
+        a_peers
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["device_id"] == "peer-b"),
+        "A 应持有 B: {a_peers}"
+    );
+    let b_peers = http_json(18083, "GET", "/api/peers", None).await;
+    assert!(
+        b_peers.as_array().unwrap().len() == 1,
+        "B 应持有 A: {b_peers}"
+    );
+
+    // 7) pending 已清
+    let v = http_json(18083, "GET", "/api/pair/pending", None).await;
+    assert!(v["pending"].is_null(), "确认后 pending 应清空: {v}");
+
+    // 8) 解除配对：首删 200、再删 404
+    let (st, _) = http(18082, "DELETE", "/api/peers/peer-b", None).await;
+    assert_eq!(st, 200);
+    let (st, _) = http(18082, "DELETE", "/api/peers/peer-b", None).await;
+    assert_eq!(st, 404);
+    let b_id = b_peers[0]["device_id"].as_str().unwrap().to_string();
+    let (st, _) = http(18083, "DELETE", &format!("/api/peers/{b_id}"), None).await;
+    assert_eq!(st, 200, "B 侧解除应成功");
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// P3 拒绝路径：配对模式开着但会话不匹配的 confirm → 403（会话化闭合 Q4）
+#[tokio::test]
+async fn test_pair_confirm_rejects_unknown_session() {
+    let dir = temp_dir("pflow-cf");
+    let _s = start_stack_isolated("pflow-cf", 18084, 18184, &dir, 2).await;
+
+    // 直接打 Remote confirm（绕过本机 start）：没有 pending → 403
+    let (st, body) = https_to(
+        "127.0.0.1",
+        19184,
+        "POST",
+        "/api/pair/confirm",
+        Some(r#"{"pairing_session":"nope"}"#),
+    )
+    .await;
+    assert_eq!(st, 403, "无会话 confirm 必须 403，实际 {st}: {}", String::from_utf8_lossy(&body));
+    assert!(
+        String::from_utf8_lossy(&body).contains("配对会话"),
+        "文案应说明是会话问题：{}",
+        String::from_utf8_lossy(&body)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

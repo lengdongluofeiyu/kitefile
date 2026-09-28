@@ -70,6 +70,22 @@ pub struct AppState {
     pub config: Arc<EngineConfig>,
     pub progress_bus: Arc<tokio::sync::broadcast::Sender<TransferProgress>>,
     pub ws_event_bus: Arc<tokio::sync::broadcast::Sender<WsEvent>>,
+    /// 已配对设备表（P3 鉴权 / 配对去重）
+    pub peers: Arc<crate::pairing::PeersStore>,
+    /// 本机 TLS 身份；`run()` 启动时预填，handler 兜底惰性加载
+    pub identity: std::sync::OnceLock<Arc<crate::tls::NodeIdentity>>,
+}
+
+impl AppState {
+    /// 本机身份（指纹用于确认码 / 自证）
+    fn identity(&self) -> Arc<crate::tls::NodeIdentity> {
+        self.identity
+            .get_or_init(|| {
+                crate::tls::NodeIdentity::load_or_create(&self.config.receive_dir)
+                    .expect("TLS identity 加载失败")
+            })
+            .clone()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +163,355 @@ async fn set_pair_mode(
     Ok(Json(pair_mode_status(&state)))
 }
 
+// ---------------------------------------------------------------------------
+// 配对协议（P3，设计 §6）
+//
+// 方向：A（发起方）→ B（接收方）
+//   1. A: POST /api/pair/start（本机 UI 入口）→ TLS POST B /api/pair/hello
+//   2. B: 配对模式门 + 限频 + 单 pending → WS 推 PairRequest（确认码弹窗）
+//   3. B: POST /api/pair/decide {accept} → TLS POST A /api/pair/confirm
+//   4. A: 校验 session + B 的客户端证书 → 落库 peers[B] → 200
+//   5. B: 收到 200 → 落库 peers[A]（两阶段写，200 丢失可重发起自愈）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct PairHelloRequest {
+    pub device_id: String,
+    pub name: String,
+    pub platform: String,
+    /// 发起方（A）的 LAN TLS 端口：B 确认后把 confirm 推回这里
+    pub gateway_port: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PairHelloResponse {
+    pub pairing_session: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PairStartRequest {
+    /// 对端（B）的 device_id：peers 表索引键（5d 手动添加时 UI 自行传入）
+    pub device_id: String,
+    /// 对端展示名（落库 name_hint）
+    pub name: String,
+    pub platform: String,
+    pub ip: String,
+    /// 对端 LAN TLS 端口（设备表 gateway_port）
+    pub gateway_port: u16,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PairStartResponse {
+    pub pairing_session: String,
+    /// 本机侧确认码（对方屏上应显示同一串）
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PairDecideRequest {
+    pub session: String,
+    pub accept: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PairDecideResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PairPendingResponse {
+    pub pending: Option<PairPendingView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PairPendingView {
+    pub session: String,
+    pub name: String,
+    pub ip: String,
+    pub platform: String,
+    pub code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PeerView {
+    pub device_id: String,
+    pub name_hint: String,
+    pub platform: String,
+    pub fp_sha256: String,
+    pub paired_at: u64,
+    /// 设备表里还活着（mDNS 发现 + 探活未移除）
+    pub online: bool,
+}
+
+/// B 侧：接收配对 hello（Remote；鉴权层对本端点放行，合法性在此校验）。
+async fn pair_hello(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer_cert: Extension<crate::tls::PeerFingerprint>,
+    Json(req): Json<PairHelloRequest>,
+) -> std::result::Result<Json<PairHelloResponse>, (StatusCode, String)> {
+    let (mode_on, _) = state.discovery.pairing_status();
+    if !mode_on {
+        return Err((StatusCode::FORBIDDEN, "对方未开启配对模式".into()));
+    }
+    let pairing = state.discovery.pairing();
+    let ip = peer.ip().to_string();
+    if !pairing.allow_hello(&ip) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "请求过于频繁，请稍后再试".into()));
+    }
+    // mTLS：客户端证书必须在（TLS 层已验私钥持有，应用层不用再签名）
+    let Extension(fp_opt) = peer_cert;
+    let fp = fp_opt
+        .0
+        .ok_or((StatusCode::UNAUTHORIZED, "配对需要出示客户端证书".into()))?;
+    // 已配对拒绝覆盖（Q3）：fp 命中，或自称的 device_id 已在表里（重装需先解除）
+    if state.peers.contains_fp(&fp) {
+        return Err((StatusCode::CONFLICT, "该设备证书已配对".into()));
+    }
+    if state.peers.get(&req.device_id).is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "该设备已配对；若对方重装过，请先在设备管理中解除配对".into(),
+        ));
+    }
+    let session = uuid::Uuid::new_v4().simple().to_string();
+    pairing
+        .begin_in_pending(crate::pairing::InPending {
+            session: session.clone(),
+            peer_fp: fp.clone(),
+            peer_device_id: req.device_id.clone(),
+            peer_name: req.name.clone(),
+            peer_platform: req.platform.clone(),
+            peer_ip: ip.clone(),
+            peer_gateway_port: req.gateway_port,
+            created: tokio::time::Instant::now(),
+        })
+        .map_err(|_| (StatusCode::CONFLICT, "已有配对请求待处理".into()))?;
+
+    let code = crate::pairing::confirm_code(&fp, state.identity().fp());
+    let _ = state.ws_event_bus.send(WsEvent::PairRequest {
+        session: session.clone(),
+        name: req.name.clone(),
+        ip: ip.clone(),
+        platform: req.platform.clone(),
+        code: code.clone(),
+    });
+    info!(%ip, name = %req.name, "pairing hello accepted, awaiting confirm");
+    Ok(Json(PairHelloResponse {
+        pairing_session: session,
+    }))
+}
+
+/// A 侧：本机 UI 发起配对——对 B 发 hello，拿到会话与**自己屏上的**确认码。
+async fn pair_start(
+    State(state): State<AppState>,
+    Json(req): Json<PairStartRequest>,
+) -> std::result::Result<Json<PairStartResponse>, (StatusCode, String)> {
+    let hello_body = serde_json::json!({
+        "device_id": state.discovery.self_id(),
+        "name": state.discovery.self_name(),
+        "platform": crate::platform::platform_name(),
+        "gateway_port": state.config.lan_tls_port,
+    })
+    .to_string();
+    let (resp_body, server_fp) = crate::httpc::http_post_json_tls_peer_fp(
+        &req.ip,
+        req.gateway_port,
+        "/api/pair/hello",
+        &hello_body,
+        &state.config.receive_dir,
+    )
+    .await
+    .map_err(|e| {
+        let hint = if e.kind() == std::io::ErrorKind::InvalidData {
+            format!("对方拒绝了配对请求：{e}")
+        } else {
+            format!("连接对方失败：{e}")
+        };
+        (StatusCode::BAD_GATEWAY, hint)
+    })?;
+    let hello: PairHelloResponse = serde_json::from_str(&resp_body)
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("对端响应异常: {e}")))?;
+    // 确认码必须用**握手亲眼所见**的对端证书算——不能信任何响应体字段
+    let fp_b = server_fp.ok_or((
+        StatusCode::BAD_GATEWAY,
+        "对方未出示服务端证书".into(),
+    ))?;
+    let code = crate::pairing::confirm_code(state.identity().fp(), &fp_b);
+
+    state.discovery.pairing().set_out_pending(
+        crate::pairing::OutPending {
+            session: hello.pairing_session.clone(),
+            peer_fp: fp_b,
+            peer_device_id: req.device_id.clone(),
+            peer_name: req.name.clone(),
+            peer_platform: req.platform.clone(),
+            created: tokio::time::Instant::now(),
+        },
+    );
+    Ok(Json(PairStartResponse {
+        pairing_session: hello.pairing_session,
+        code,
+    }))
+}
+
+/// B 侧：本机用户点了「确认 / 拒绝」。确认 → 向 A 推 confirm，成功后落库。
+async fn pair_decide(
+    State(state): State<AppState>,
+    Json(req): Json<PairDecideRequest>,
+) -> std::result::Result<Json<PairDecideResponse>, (StatusCode, String)> {
+    let pairing = state.discovery.pairing();
+    let Some(pending) = pairing.in_pending() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "配对会话不存在或已过期".into(),
+        ));
+    };
+    if pending.session != req.session {
+        return Err((StatusCode::NOT_FOUND, "配对会话不匹配".into()));
+    }
+
+    if !req.accept {
+        pairing.clear_in_pending();
+        return Ok(Json(PairDecideResponse {
+            ok: true,
+            error: None,
+        }));
+    }
+
+    // 两阶段写：先让 A 落库（200），B 收到 200 后才落库——
+    // 200 丢失时只有 A 单边已配对，重新发起即可自愈（设计 §6）
+    let confirm_body = serde_json::json!({ "pairing_session": pending.session }).to_string();
+    crate::httpc::http_post_json_tls(
+        &pending.peer_ip,
+        pending.peer_gateway_port,
+        "/api/pair/confirm",
+        &confirm_body,
+        &state.config.receive_dir,
+    )
+    .await
+    .map_err(|e| {
+        pairing.clear_in_pending();
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("向对方确认失败（对方会话可能已过期）：{e}"),
+        )
+    })?;
+    // 确认成功后再取走 pending 落库
+    pairing.take_in_pending(&req.session);
+    state.peers.insert(
+        &pending.peer_device_id,
+        crate::pairing::PeerRecord {
+            name_hint: pending.peer_name,
+            platform: pending.peer_platform,
+            fp_sha256: pending.peer_fp,
+            paired_at: now_unix(),
+        },
+    );
+    info!(peer = %pending.peer_device_id, "pairing completed (B side)");
+    Ok(Json(PairDecideResponse {
+        ok: true,
+        error: None,
+    }))
+}
+
+/// A 侧：接收 B 的 confirm（Remote）。校验会话 + **对方客户端证书与
+/// hello 时同一把**，通过则 A 先落库（两阶段写第一步）。
+async fn pair_confirm(
+    State(state): State<AppState>,
+    peer_cert: Extension<crate::tls::PeerFingerprint>,
+    Json(req): Json<PairHelloResponse>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pairing = state.discovery.pairing();
+    let pending = pairing.check_out_session(&req.pairing_session).ok_or((
+        StatusCode::FORBIDDEN,
+        "无此配对会话或已过期（请重新发起配对）".into(),
+    ))?;
+    let Extension(fp_opt) = peer_cert;
+    let fp = fp_opt
+        .0
+        .ok_or((StatusCode::UNAUTHORIZED, "需要客户端证书".into()))?;
+    if fp != pending.peer_fp {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "证书与配对会话不一致，已拒绝".into(),
+        ));
+    }
+    state.peers.insert(
+        &pending.peer_device_id,
+        crate::pairing::PeerRecord {
+            name_hint: pending.peer_name.clone(),
+            platform: pending.peer_platform.clone(),
+            fp_sha256: fp,
+            paired_at: now_unix(),
+        },
+    );
+    pairing.clear_out_pending();
+    info!(peer = %pending.peer_device_id, "pairing completed (A side)");
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 本机 UI 轮询：当前待确认的配对请求（含确认码）
+async fn get_pair_pending(State(state): State<AppState>) -> Json<PairPendingResponse> {
+    let Some(p) = state.discovery.pairing().in_pending() else {
+        return Json(PairPendingResponse { pending: None });
+    };
+    let code = crate::pairing::confirm_code(&p.peer_fp, state.identity().fp());
+    Json(PairPendingResponse {
+        pending: Some(PairPendingView {
+            session: p.session,
+            name: p.peer_name,
+            ip: p.peer_ip,
+            platform: p.peer_platform,
+            code,
+        }),
+    })
+}
+
+/// 已配对设备列表（含在线状态，拼设备表）
+async fn list_peers(State(state): State<AppState>) -> Json<Vec<PeerView>> {
+    let devices = state.discovery.list_devices();
+    let rows = state
+        .peers
+        .list()
+        .into_iter()
+        .map(|(device_id, rec)| {
+            let online = devices.iter().any(|d| d.id == device_id);
+            PeerView {
+                device_id,
+                name_hint: rec.name_hint,
+                platform: rec.platform,
+                fp_sha256: rec.fp_sha256,
+                paired_at: rec.paired_at,
+                online,
+            }
+        })
+        .collect();
+    Json(rows)
+}
+
+/// 解除配对（撤销：该证书的双向信任立即失效）
+async fn delete_peer(
+    State(state): State<AppState>,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if state.peers.remove(&device_id) {
+        info!(%device_id, "peer removed (revoked)");
+        Ok(Json(serde_json::json!({ "ok": true })))
+    } else {
+        Err((StatusCode::NOT_FOUND, "该设备不在配对列表中".into()))
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub struct HttpGateway {
     state: AppState,
 }
@@ -159,6 +524,8 @@ impl HttpGateway {
     ) -> Self {
         let (progress_bus, _) = tokio::sync::broadcast::channel(256);
         let (ws_event_bus, _) = tokio::sync::broadcast::channel(256);
+        let peers =
+            crate::pairing::PeersStore::load(&config.receive_dir.join("peers.json"));
         Self {
             state: AppState {
                 discovery,
@@ -166,6 +533,8 @@ impl HttpGateway {
                 config,
                 progress_bus: Arc::new(progress_bus),
                 ws_event_bus: Arc::new(ws_event_bus),
+                peers,
+                identity: std::sync::OnceLock::new(),
             },
         }
     }
@@ -198,6 +567,8 @@ impl HttpGateway {
         // 身份先加载：拿不到证书就早失败，别把端口占了再退
         let identity = crate::tls::NodeIdentity::load_or_create(&config.receive_dir)?;
         let server_cfg = crate::tls::server_config(&identity)?;
+        // 预填 AppState：handler 侧 identity() 免二次读盘
+        let _ = self.state.identity.set(identity.clone());
 
         let lb_listener = tokio::net::TcpListener::bind(("127.0.0.1", config.gateway_port))
             .await
@@ -266,14 +637,32 @@ fn build_app(state: AppState, advertised_gateway_port: u16) -> Router {
         .route("/api/incoming-resp", post(incoming_resp))
         .route("/api/verify/:file_id", post(verify_file))
         .route("/api/pair/mode", get(get_pair_mode).post(set_pair_mode))
+        // 配对协议（P3）：hello/confirm 走局域网 TLS（Remote），
+        // start/decide/pending 是本机 UI 入口（LocalOnly）
+        .route("/api/pair/hello", post(pair_hello))
+        .route("/api/pair/confirm", post(pair_confirm))
+        .route("/api/pair/start", post(pair_start))
+        .route("/api/pair/decide", post(pair_decide))
+        .route("/api/pair/pending", get(get_pair_pending))
+        .route("/api/peers", get(list_peers))
+        .route(
+            "/api/peers/:device_id",
+            axum::routing::delete(delete_peer),
+        )
         .route("/api/config", get(get_config))
         .route("/api/config/receive-dir", post(set_receive_dir))
         .route("/api/config/device-name", post(set_device_name))
         .route("/ws/progress", get(ws_progress))
         .route("/", get(root_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_guard,
+        ))
         // route_layer 只对「已注册的路由」生效，404 / 405 的请求根本不会
         // 走到 middleware——所以不存在"未分级路径被误放行"的口子。
         //（换成 .layer() 则会对所有请求生效，包括 404，反而多一个面。）
+        // 注意：**后加的 route_layer 在外层**——先分级（access）再鉴权（auth），
+        // 远程访问 LocalOnly 时先得到 403（分级语义），而不是 401。
         .route_layer(middleware::from_fn(move |req: Request, next: Next| async move {
             access_guard(req, next, allow_remote_admin).await
         }))
@@ -381,7 +770,7 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
     //   gateway.rs:437  /api/incoming-resp（发送方回包）
     // 新增路由时若不在此登记，远程调用一律 403（fail-closed）。
     const TABLE: &[(Method, &str, AccessPolicy)] = &[
-        // ---- 允许远程：P2P 协商主流程 + 只读信息 ----
+        // ---- 允许远程：P2P 协商主流程 + 只读信息 + 配对协议 ----
         (Method::POST, "/api/incoming", Remote),
         (Method::POST, "/api/incoming-resp", Remote),
         (Method::POST, "/api/verify/:file_id", Remote),
@@ -390,9 +779,17 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
         (Method::POST, "/api/peer-resume/:file_id", Remote),
         (Method::POST, "/api/peer-resumed/:file_id", Remote),
         (Method::GET, "/api/whoami", Remote),
+        // 配对协议（P3）：鉴权在 auth_guard + handler 会话层（不要求已配对）
+        (Method::POST, "/api/pair/hello", Remote),
+        (Method::POST, "/api/pair/confirm", Remote),
         // ---- 仅本机：会控制本机的操作 ----
         (Method::POST, "/api/pair/mode", LocalOnly),
         (Method::GET, "/api/pair/mode", LocalOnly),
+        (Method::POST, "/api/pair/start", LocalOnly),
+        (Method::POST, "/api/pair/decide", LocalOnly),
+        (Method::GET, "/api/pair/pending", LocalOnly),
+        (Method::GET, "/api/peers", LocalOnly),
+        (Method::DELETE, "/api/peers/:device_id", LocalOnly),
         (Method::POST, "/api/send", LocalOnly),
         (Method::GET, "/api/transfers", LocalOnly),
         (Method::POST, "/api/transfers/:file_id/resume", LocalOnly),
@@ -420,6 +817,52 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
         .map(|(_, _, policy)| *policy)
 }
 
+/// 请求是否来自回环地址（取不到 ConnectInfo 按非本机处理，fail-closed）
+fn req_is_local(req: &Request) -> bool {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip().is_loopback())
+        .unwrap_or(false)
+}
+
+/// 鉴权 middleware（P3，mTLS 定案）：跑在分级**之内**、handler 之外。
+///
+/// - 本机（回环）：放行（回环口明文 + 本机信任域）
+/// - 免鉴权远程接口：`whoami`（信息与 mDNS TXT 重合）、配对协议两件套
+///   （hello / confirm 的合法性由 handler 按配对模式 + 会话 + 证书校验，
+///   那时对端还没进 peers 表，正是这里要放行的原因）
+/// - 其余远程：连接必须出示**已配对设备的客户端证书**，否则 401
+async fn auth_guard(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if req_is_local(&req) {
+        return next.run(req).await;
+    }
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let exempt = (method == Method::GET && path == "/api/whoami")
+        || (method == Method::POST && (path == "/api/pair/hello" || path == "/api/pair/confirm"));
+    if exempt {
+        return next.run(req).await;
+    }
+
+    let fp = req
+        .extensions()
+        .get::<crate::tls::PeerFingerprint>()
+        .and_then(|p| p.0.clone());
+    match fp {
+        Some(f) if state.peers.contains_fp(&f) => next.run(req).await,
+        Some(_) => (
+            StatusCode::UNAUTHORIZED,
+            "设备未配对：请先与本机完成配对后再试",
+        )
+            .into_response(),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            "对方未出示客户端证书，无法验证设备身份",
+        )
+            .into_response(),
+    }
+}
+
 /// 访问分级 middleware
 ///
 /// 两条放行路径：请求来自回环地址，或开了 `--remote-admin`。
@@ -427,11 +870,7 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
 async fn access_guard(req: Request, next: Next, allow_remote_admin: bool) -> Response {
     // 取不到 peer 地址时按「非本机」处理：宁可误拒，也不能让分级静默失效。
     // 若哪天忘了注入 ConnectInfo，症状是本机 UI 全部 403——动静很大，藏不住。
-    let is_local = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip().is_loopback())
-        .unwrap_or(false);
+    let is_local = req_is_local(&req);
 
     if is_local || allow_remote_admin {
         return next.run(req).await;
