@@ -418,97 +418,245 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  /// 发起配对：握手在 daemon 侧完成，本机展示确认码并轮询结果
-  Future<void> _startPairing(Device d) async {
-    String session;
-    String code;
+  /// 添加设备（P2 入口改版）：打开即开启配对模式，页内完成
+  /// 「发现 → 发起 → 等确认」，关闭页面自动退出配对模式。
+  /// 两台设备都打开此页即可互相发现；页面存续期间给配对模式续期，
+  /// 防止 120s TTL 在用户比对确认码时中途过期。
+  Future<void> _openAddDevice() async {
+    int ttl;
     try {
-      final r = await httpPost(
-        '$_httpBase/api/pair/start',
-        body: jsonEncode({
-          'device_id': d.id,
-          'name': d.name,
-          'platform': d.platform,
-          'ip': d.ip,
-          'gateway_port': d.gatewayPort,
-        }),
-      );
-      final j = jsonDecode(r) as Map<String, dynamic>;
-      session = j['pairing_session'] as String? ?? '';
-      code = j['code'] as String? ?? '';
+      final r = await httpPost('$_httpBase/api/pair/mode',
+          body: jsonEncode({'enabled': true}));
+      ttl = (jsonDecode(r) as Map<String, dynamic>)['seconds_left'] as int? ?? 120;
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('发起配对失败: $e')));
+            .showSnackBar(SnackBar(content: Text('开启配对模式失败: $e')));
       }
       return;
     }
-    if (!mounted || session.isEmpty) return;
+    if (!mounted) return;
 
-    var done = false;
-    Timer.periodic(const Duration(seconds: 1), (t) async {
-      if (done) {
-        t.cancel();
-        return;
-      }
+    var devices = <Device>[];
+    var peers = <Map<String, dynamic>>[];
+    Future<void> pull() async {
+      try {
+        final r = await httpGet('$_httpBase/api/devices');
+        devices = (jsonDecode(r) as List)
+            .cast<Map<String, dynamic>>()
+            .map(Device.fromJson)
+            .toList();
+      } catch (_) {/* 沿用上一帧 */}
       try {
         final r = await httpGet('$_httpBase/api/peers');
-        final list = (jsonDecode(r) as List).cast<Map<String, dynamic>>();
-        if (list.any((p) => p['device_id'] == d.id)) {
-          t.cancel();
-          done = true;
-          await _refreshDevices();
-          if (mounted) {
-            ScaffoldMessenger.of(context)
-                .showSnackBar(SnackBar(content: Text('已与 ${d.name} 配对')));
-            if (context.mounted) {
-              Navigator.of(context, rootNavigator: true).pop();
-            }
-          }
-        }
-      } catch (_) {/* 轮询失败静默 */}
-    });
-
+        peers = (jsonDecode(r) as List).cast<Map<String, dynamic>>();
+      } catch (_) {/* 沿用上一帧 */}
+    }
+    await pull();
     if (!mounted) return;
+
+    String? waitId;
+    String? waitName;
+    String? waitCode;
+    Timer? ticker;
+    var stopped = false;
+    Future<void> shutdown() async {
+      stopped = true;
+      ticker?.cancel();
+      try {
+        await httpPost('$_httpBase/api/pair/mode',
+            body: jsonEncode({'enabled': false}));
+      } catch (_) {/* 关闭失败靠 TTL 兜底 */}
+      await _refreshDevices();
+    }
+
     await showDialog<void>(
       context: context,
       barrierDismissible: true,
-      builder: (ctx) => AlertDialog(
-        title: Text('等待 ${d.name} 确认'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('请与对方屏幕核对确认码：',
-                style: TextStyle(fontSize: 12, color: Colors.grey)),
-            const SizedBox(height: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-              decoration: BoxDecoration(
-                color: Theme.of(ctx).colorScheme.primaryContainer,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Text(
-                code,
-                style: const TextStyle(
-                    fontSize: 36,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 6),
-              ),
-            ),
-            const SizedBox(height: 8),
-            const Text('对方确认后自动完成；60 秒未确认将过期。',
-                style: TextStyle(fontSize: 12, color: Colors.grey)),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('关闭'),
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setDialogState) {
+        ticker ??= Timer.periodic(const Duration(seconds: 1), (t) async {
+          if (stopped) {
+            t.cancel();
+            return;
+          }
+          if (waitId != null) {
+            try {
+              final r = await httpGet('$_httpBase/api/peers');
+              final list = (jsonDecode(r) as List).cast<Map<String, dynamic>>();
+              if (list.any((p) => p['device_id'] == waitId)) {
+                stopped = true;
+                t.cancel();
+                final name = waitName ?? '对方设备';
+                await _refreshDevices();
+                if (ctx.mounted) Navigator.pop(ctx);
+                if (mounted) {
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(SnackBar(content: Text('已与 $name 配对')));
+                }
+                return;
+              }
+            } catch (_) {/* 轮询失败下一轮再试 */}
+            if (ctx.mounted) setDialogState(() {});
+            return;
+          }
+          ttl -= 1;
+          if (ttl <= 15) {
+            // 页面还开着就续期：防止配对流程中 120s 到点被踢出去
+            try {
+              final r = await httpPost('$_httpBase/api/pair/mode',
+                  body: jsonEncode({'enabled': true}));
+              ttl = (jsonDecode(r) as Map<String, dynamic>)['seconds_left']
+                      as int? ??
+                  120;
+            } catch (_) {/* 续期失败：下一 tick 再试 */}
+          } else {
+            await pull();
+          }
+          if (ctx.mounted) setDialogState(() {});
+        });
+
+        final pairable = devices
+            .where((d) => d.pair && !peers.any((p) => p['device_id'] == d.id))
+            .toList();
+        final pairedCount =
+            devices.where((d) => peers.any((p) => p['device_id'] == d.id)).length;
+
+        return AlertDialog(
+          title: const Row(
+            children: [
+              Icon(Icons.add_circle_outline, size: 24),
+              SizedBox(width: 8),
+              Text('添加设备'),
+            ],
           ),
-        ],
-      ),
+          content: SizedBox(
+            width: 420,
+            child: waitId != null
+                ? Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('等待 ${waitName ?? '对方'} 确认…'),
+                      const SizedBox(height: 12),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 20, vertical: 10),
+                        decoration: BoxDecoration(
+                          color: Theme.of(ctx).colorScheme.primaryContainer,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text(
+                          waitCode ?? '',
+                          style: const TextStyle(
+                              fontSize: 36,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 6),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        '请与对方屏幕核对确认码，一致后由对方点「确认配对」；60 秒未确认将过期。',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 12, color: Colors.grey),
+                      ),
+                      TextButton(
+                        onPressed: () => setDialogState(() => waitId = null),
+                        child: const Text('返回设备列表'),
+                      ),
+                    ],
+                  )
+                : Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          const Text('配对模式',
+                              style: TextStyle(fontWeight: FontWeight.bold)),
+                          const Spacer(),
+                          Text(
+                            '剩余 ${ttl}s',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: Theme.of(ctx).colorScheme.primary,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      const Text(
+                        '两台设备都打开此页面即可互相发现；出现设备后点「配对」，两屏核对同一串确认码。',
+                        style: TextStyle(fontSize: 12, color: Colors.grey),
+                      ),
+                      const SizedBox(height: 8),
+                      if (pairable.isEmpty)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 16),
+                          child: Center(
+                            child: Text(
+                              '正在搜索附近可配对的设备…\n（要求对方也停在本页面）',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: Colors.grey),
+                            ),
+                          ),
+                        )
+                      else
+                        for (final d in pairable)
+                          ListTile(
+                            dense: true,
+                            contentPadding: EdgeInsets.zero,
+                            title: Text(d.name),
+                            subtitle: Text('${d.platform} · ${d.ip}',
+                                style: const TextStyle(fontSize: 12)),
+                            trailing: FilledButton.tonal(
+                              onPressed: () async {
+                                try {
+                                  final r = await httpPost(
+                                    '$_httpBase/api/pair/start',
+                                    body: jsonEncode({
+                                      'device_id': d.id,
+                                      'name': d.name,
+                                      'platform': d.platform,
+                                      'ip': d.ip,
+                                      'gateway_port': d.gatewayPort,
+                                    }),
+                                  );
+                                  final j =
+                                      jsonDecode(r) as Map<String, dynamic>;
+                                  setDialogState(() {
+                                    waitId = d.id;
+                                    waitName = d.name;
+                                    waitCode = j['code'] as String? ?? '';
+                                  });
+                                } catch (e) {
+                                  if (ctx.mounted) {
+                                    ScaffoldMessenger.of(ctx).showSnackBar(
+                                      SnackBar(content: Text('发起配对失败: $e')),
+                                    );
+                                  }
+                                }
+                              },
+                              child: const Text('配对'),
+                            ),
+                          ),
+                      if (pairedCount > 0) ...[
+                        const SizedBox(height: 8),
+                        Text('本机已配对 $pairedCount 台设备',
+                            style: const TextStyle(
+                                fontSize: 12, color: Colors.grey)),
+                      ],
+                    ],
+                  ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('关闭'),
+            ),
+          ],
+        );
+      }),
     );
-    done = true;
+    await shutdown();
   }
 
   Future<void> _connectWs() async {
@@ -890,9 +1038,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Widget _devicesSection() {
-    // 展示规则（设计 §5.4）：已配对 ∨（未配对 ∧ 对方处于配对模式）
-    final visible = _devices
-        .where((d) => d.pair || _peers.any((p) => p['device_id'] == d.id))
+    // 主列表只显示**已配对**设备；新设备的发现与配对统一走「添加设备」
+    //（P2 入口改版：配对模式的开关/倒计时/确认码都在添加设备页内）
+    final paired = _devices
+        .where((d) => _peers.any((p) => p['device_id'] == d.id))
         .toList();
     return Card(
       child: Padding(
@@ -900,33 +1049,30 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('设备列表 (${visible.length})',
-                style: Theme.of(context).textTheme.titleMedium),
+            Row(
+              children: [
+                Expanded(
+                  child: Text('设备列表 (${paired.length})',
+                      style: Theme.of(context).textTheme.titleMedium),
+                ),
+                FilledButton.tonalIcon(
+                  icon: const Icon(Icons.add),
+                  label: const Text('添加设备'),
+                  onPressed: _openAddDevice,
+                ),
+              ],
+            ),
             const SizedBox(height: 6),
-            if (visible.isEmpty)
+            if (paired.isEmpty)
               const Padding(
                 padding: EdgeInsets.symmetric(vertical: 6),
                 child: Text(
-                    '未发现可用设备。已配对设备始终显示；新设备需双方都进入配对模式（设置 → 配对）才能被发现。',
+                    '暂无已配对设备。点「添加设备」，在两台设备上都打开该页面即可互相发现并配对；配对过的设备从此始终可见。',
                     style: TextStyle(color: Colors.grey, fontSize: 13)),
               )
             else
               Column(
-                children: visible.map((d) {
-                  final paired = _peers.any((p) => p['device_id'] == d.id);
-                  if (!paired) {
-                    // 未配对（且对方在配对模式）：只有配对入口，无发送入口
-                    return ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: Text(d.name),
-                      subtitle: Text('${d.platform} · ${d.ip} · 可配对',
-                          style: const TextStyle(fontSize: 12)),
-                      trailing: FilledButton.tonal(
-                        onPressed: () => _startPairing(d),
-                        child: const Text('配对'),
-                      ),
-                    );
-                  }
+                children: paired.map((d) {
                   return ListTile(
                     contentPadding: EdgeInsets.zero,
                     title: Text(d.name),
