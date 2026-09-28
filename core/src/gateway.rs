@@ -121,6 +121,9 @@ pub struct WhoAmI {
     pub platform: String,
     pub gateway_port: u16,
     pub transfer_port: u16,
+    /// 本机是否处于配对模式（P2 修复：对端经 60s 探活/切换触发的 whoami
+    /// 主动拉取同步此标志，不再单靠 mDNS TXT 公告一条路）
+    pub pairing_enabled: bool,
 }
 
 /// POST /api/pair/mode 请求体（阶段 5 P2）
@@ -906,12 +909,14 @@ async fn whoami(
     State(state): State<AppState>,
     Extension(advertised_gateway_port): Extension<u16>,
 ) -> Json<WhoAmI> {
+    let (pairing_enabled, _) = state.discovery.pairing_status();
     Json(WhoAmI {
         id: state.discovery.self_id().to_string(),
         name: state.discovery.self_name().to_string(),
         platform: crate::platform::platform_name().to_string(),
         gateway_port: advertised_gateway_port,
         transfer_port: state.config.transfer_port,
+        pairing_enabled,
     })
 }
 

@@ -195,6 +195,43 @@ impl DiscoveryService {
         Ok(())
     }
 
+    /// identity 标记路径 → receive_dir（TLS 身份与标记同目录）
+    fn receive_dir_from(identity_path: Option<&Path>) -> Option<PathBuf> {
+        identity_path.and_then(|p| p.parent()).map(|p| p.to_path_buf())
+    }
+
+    /// 切换配对模式后的**即时**同步：不等 60s 探活周期，主动向已知设备
+    /// 各拉一次 whoami，把对方的 `pairing_enabled` 合并进本机设备表。
+    ///
+    /// 为什么不能只靠 mDNS：pair=1 靠 unsolicited 组播公告传播，而
+    /// Android 未持 MulticastLock 时系统直接丢组播、防火墙也可能拦
+    /// （真实反馈：双方都开了配对模式却互相看不见）。whoami 走
+    /// TCP+TLS 产品命脉通道，能传文件这条路就通。同机双 daemon 的
+    /// 传播测试（mdns_pair_propagation_test）证明 mDNS 逻辑本身无恙——
+    /// 这里兜的是通道层。
+    fn spawn_pair_flag_refresh(&self) {
+        let Some(dir) = Self::receive_dir_from(self.identity_path.as_deref()) else {
+            return; // 临时实例（CLI list 等）：无身份目录，跳过（60s 探活同样跳过）
+        };
+        let devices = Arc::clone(&self.devices);
+        let spawned = tokio::runtime::Handle::try_current().map(|h| {
+            h.spawn(async move {
+                let snapshot: Vec<(DeviceId, Device)> = {
+                    let map = devices.read();
+                    map.iter().map(|(id, d)| (id.clone(), d.clone())).collect()
+                };
+                for (id, mut dev) in snapshot {
+                    sync_device_via_whoami(&mut dev, &dir).await;
+                    devices.write().insert(id, dev);
+                }
+                info!("pair flag refresh over known devices done");
+            })
+        });
+        if spawned.is_err() {
+            warn!("no runtime for pair flag refresh; will catch up via 60s probe");
+        }
+    }
+
     /// 进入 / 退出配对模式（P2）。返回 (是否开启, 剩余秒数)。
     ///
     /// - 开启：mDNS TXT 置 `pair=1`（对端设备表标「可配对」），并 spawn
@@ -215,6 +252,8 @@ impl DiscoveryService {
         if let Err(e) = self.reregister_service() {
             warn!(error = %e, "pairing mode mDNS re-register failed");
         }
+        // 即时向已知设备同步 pair 标志（mDNS 公告可能被组播过滤/防火墙丢弃）
+        self.spawn_pair_flag_refresh();
 
         if on {
             let this = Arc::clone(&self);
@@ -253,7 +292,11 @@ impl DiscoveryService {
         };
 
         // 设备下线检测：应用层主动探测（mDNS 事件不可用于此目的，见 spawn_probe_loop 注释）
-        spawn_probe_loop(self.devices.clone(), rt.clone());
+        spawn_probe_loop(
+            self.devices.clone(),
+            Self::receive_dir_from(self.identity_path.as_deref()),
+            rt.clone(),
+        );
 
         rt.spawn(async move {
             loop {
@@ -366,11 +409,18 @@ impl DiscoveryService {
 /// （TTL 75 分钟）不会重新发 ServiceFound，设备从此消失、两端互相看不到。
 ///
 /// **本方案**：每 60 秒对表内每个设备的 gateway 端口做一次 TCP 握手
-/// （握手成功即代表对端 daemon 在监听，不发 HTTP 请求），连续 3 次失败
-/// 才移除——防 gateway 瞬时忙导致误判。强杀进程发不出 mDNS goodbye 的
-/// 僵尸条目在 ~3 分钟内被清掉，在线设备零误伤。
+/// （握手成功即代表对端 daemon 在监听），连续 3 次失败才移除——防
+/// gateway 瞬时忙导致误判。强杀进程发不出 mDNS goodbye 的僵尸条目在
+/// ~3 分钟内被清掉，在线设备零误伤。
+///
+/// **P2 增强**：TCP 存活时顺带 TLS GET `/api/whoami`，把 name/platform/
+/// 端口/**pairing_enabled** 合并进设备表（见 [`sync_device_via_whoami`]）。
+/// 这条路是产品命脉通道（能传文件就说明可达），专门兜住 mDNS 组播
+/// 单点依赖——真实反馈：双方都开了配对模式却互相看不见，根因之一是
+/// mDNS 公告被组播过滤（Android 未持 MulticastLock）/防火墙丢弃。
 fn spawn_probe_loop(
     devices: Arc<RwLock<HashMap<DeviceId, Device>>>,
+    receive_dir: Option<PathBuf>,
     rt: tokio::runtime::Handle,
 ) {
     rt.spawn(async move {
@@ -378,13 +428,13 @@ fn spawn_probe_loop(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            let snapshot: Vec<(DeviceId, String, u16)> = {
+            let snapshot: Vec<(DeviceId, Device)> = {
                 let map = devices.read();
-                map.iter()
-                    .map(|(id, d)| (id.clone(), d.ip.clone(), d.gateway_port))
-                    .collect()
+                map.iter().map(|(id, d)| (id.clone(), d.clone())).collect()
             };
-            for (id, ip, port) in snapshot {
+            for (id, dev) in snapshot {
+                let ip = dev.ip.clone();
+                let port = dev.gateway_port;
                 // 空 IP（解析失败）的条目也按探测失败处理
                 let alive = if ip.is_empty() {
                     false
@@ -400,6 +450,12 @@ fn spawn_probe_loop(
 
                 if alive {
                     fails.remove(&id);
+                    // 存活 → 拉 whoami 同步字段（失败保持原值，不降级）
+                    if let Some(dir) = receive_dir.as_ref() {
+                        let mut dev = dev;
+                        sync_device_via_whoami(&mut dev, dir).await;
+                        devices.write().insert(id, dev);
+                    }
                 } else {
                     let n = fails.entry(id.clone()).or_insert(0);
                     *n += 1;
@@ -412,6 +468,53 @@ fn spawn_probe_loop(
             }
         }
     });
+}
+
+/// TLS GET 对端 `/api/whoami` 并把字段合并进 `device`（原地修改）。
+///
+/// - 同步：`name` / `platform` / `gateway_port` / `transfer_port` /
+///   **`pairing_enabled`（→ device.pair）**
+/// - 任何失败（超时 / TLS / 解析）**保持原值**——探活的存活判定与字段
+///   同步解耦，whoami 挂了只是字段不刷新，不导致设备被误移除
+/// - whoami 是免配对接口（设计 §9.2），未配对/配对模式外都可拉取；
+///   TLS 客户端 accept-any（无 pin 依赖）
+async fn sync_device_via_whoami(device: &mut Device, receive_dir: &Path) {
+    if device.ip.is_empty() {
+        return;
+    }
+    let ip = device.ip.clone();
+    let lan_port = device.gateway_port;
+    let fut = crate::httpc::http_get_tls(&ip, lan_port, "/api/whoami", receive_dir, None);
+    let body = match tokio::time::timeout(std::time::Duration::from_secs(3), fut).await {
+        Ok(Ok(b)) => b,
+        _ => return,
+    };
+    let Ok(j) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return;
+    };
+    if let Some(v) = j.get("name").and_then(|v| v.as_str()) {
+        if !v.is_empty() {
+            device.name = v.to_string();
+        }
+    }
+    if let Some(v) = j.get("platform").and_then(|v| v.as_str()) {
+        if !v.is_empty() {
+            device.platform = v.to_string();
+        }
+    }
+    if let Some(v) = j.get("gateway_port").and_then(|v| v.as_u64()) {
+        if v > 0 && v <= u16::MAX as u64 {
+            device.gateway_port = v as u16;
+        }
+    }
+    if let Some(v) = j.get("transfer_port").and_then(|v| v.as_u64()) {
+        if v > 0 && v <= u16::MAX as u64 {
+            device.transfer_port = v as u16;
+        }
+    }
+    if let Some(v) = j.get("pairing_enabled").and_then(|v| v.as_bool()) {
+        device.pair = v;
+    }
 }
 
 /// 构造 mDNS 服务注册信息（id 作实例名与主机名，name 等走 TXT 属性）

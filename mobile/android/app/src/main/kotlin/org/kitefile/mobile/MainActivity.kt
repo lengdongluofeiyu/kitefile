@@ -1,9 +1,12 @@
 package org.kitefile.mobile
 
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.Bundle
 import android.os.Environment
 import android.provider.OpenableColumns
 import android.provider.Settings
@@ -18,6 +21,32 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val CHANNEL = "kitefile/native"
         private const val PICK_FILES_REQUEST = 4201
+
+        /// mDNS 组播接收锁（P2 修复：双方开了配对模式却互相看不见）。
+        ///
+        /// Android 只声明 `CHANGE_WIFI_MULTICAST_STATE` 权限**不够**——
+        /// 不持 MulticastLock 时系统直接丢弃发给本应用的组播包（发送不受
+        /// 影响），症状是「查询-单播应答的初次发现能通，unsolicited 组播
+        /// 公告（如配对模式 pair=1 的 TXT 更新）永远收不到」。
+        ///
+        /// 锁放在 companion 常驻：静态字段不会被 GC（锁对象被回收会
+        /// 隐式释放），Activity 重建也幂等。
+        private var multicastLock: WifiManager.MulticastLock? = null
+
+        fun acquireMulticastLock(context: Context) {
+            if (multicastLock?.isHeld == true) return
+            val wifi =
+                context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val lock = wifi.createMulticastLock("kitefile-mdns")
+            lock.setReferenceCounted(false)
+            lock.acquire()
+            multicastLock = lock
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        acquireMulticastLock(applicationContext)
     }
 
     /// pickFiles 的待返回结果（选择器返回后经 onActivityResult 回填）

@@ -3,7 +3,7 @@
 //! 每个测试用独立端口对（gateway/transfer），支持并行运行。
 //! 全链路测试：A 发送 → B 确认 → 多流传输 → 校验落盘 → 双端进度。
 
-use kitefile::{DiscoveryService, EngineConfig, HttpGateway, TransferEngine};
+use kitefile::{Device, DiscoveryService, EngineConfig, HttpGateway, TransferEngine};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -114,6 +114,8 @@ async fn start_stack_with(
 
 /// 同 start_stack，但用**本用例独占的离线 discovery**——
 /// 配对模式 / pending 是进程级状态，共享 discovery 会让并行用例互相污染。
+/// `identity_path` 指到本用例接收目录：P2 的 whoami 同步/60s 探活
+/// 需要它推导 receive_dir（TLS 身份），None 会静默跳过同步路径。
 async fn start_stack_isolated(
     tag: &str,
     gw_port: u16,
@@ -121,12 +123,27 @@ async fn start_stack_isolated(
     recv_dir: &std::path::Path,
     parallel: usize,
 ) -> Arc<TransferEngine> {
+    start_stack_isolated_full(tag, gw_port, tr_port, recv_dir, parallel)
+        .await
+        .0
+}
+
+/// 同 start_stack_isolated，但把 discovery 一并交出（测试需要直接操作设备表）
+async fn start_stack_isolated_full(
+    tag: &str,
+    gw_port: u16,
+    tr_port: u16,
+    recv_dir: &std::path::Path,
+    parallel: usize,
+) -> (Arc<TransferEngine>, Arc<DiscoveryService>) {
     let discovery = Arc::new(DiscoveryService::new_offline(
         format!("iso-{tag}"),
         format!("iso-{tag}-id"),
-        None,
+        Some(recv_dir.join(".kitefile-identity")),
     ));
-    start_stack_impl(discovery, gw_port, tr_port, recv_dir, parallel, false).await
+    let engine =
+        start_stack_impl(discovery.clone(), gw_port, tr_port, recv_dir, parallel, false).await;
+    (engine, discovery)
 }
 
 async fn start_stack_impl(
@@ -1485,6 +1502,13 @@ async fn test_pair_mode_toggle() {
         "开启后应有剩余秒数：{v}"
     );
     assert_eq!(v["ttl_seconds"].as_u64(), Some(120));
+    // P2 修复：whoami 必须携带 pairing_enabled（对端 whoami 同步的数据源）
+    let me = http_json(18049, "GET", "/api/whoami", None).await;
+    assert_eq!(
+        me["pairing_enabled"].as_bool(),
+        Some(true),
+        "whoami 应上报 pairing_enabled"
+    );
 
     let (status, _) = http(
         18049,
@@ -1497,6 +1521,8 @@ async fn test_pair_mode_toggle() {
     let v = http_json(18049, "GET", "/api/pair/mode", None).await;
     assert_eq!(v["enabled"].as_bool(), Some(false));
     assert_eq!(v["seconds_left"].as_u64(), Some(0));
+    let me = http_json(18049, "GET", "/api/whoami", None).await;
+    assert_eq!(me["pairing_enabled"].as_bool(), Some(false));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1611,6 +1637,68 @@ async fn test_pair_confirm_rejects_unknown_session() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P2 修复回归（真实反馈：双方开了配对模式却互相看不见）：
+/// mDNS 组播更新丢失时，pair 标志必须经「whoami over TCP+TLS」通道同步。
+///
+/// 构造：B 的设备表里**植入** A 的条目（模拟 mDNS 已发现但 TXT 更新
+/// 没到——Android 未持 MulticastLock / 防火墙丢组播的真实场景）；
+/// A 开启配对后触发 B 的即时刷新，B 表内该设备的 pair 必须变 true。
+#[tokio::test]
+async fn whoami_sync_delivers_pair_flag_without_mdns() {
+    let dir_a = temp_dir("whsync-a");
+    let dir_b = temp_dir("whsync-b");
+    let (_ea, _da) = start_stack_isolated_full("whsync-a", 18086, 18186, &dir_a, 2).await;
+    let (_eb, db) = start_stack_isolated_full("whsync-b", 18087, 18187, &dir_b, 2).await;
+
+    // A 进入配对模式 → A 的 whoami.pairing_enabled = true
+    let (st, _) = http(18086, "POST", "/api/pair/mode", Some(r#"{"enabled":true}"#)).await;
+    assert_eq!(st, 200);
+
+    // B 的设备表植入 A（无 mDNS 参与：pair 显式 false）
+    db.devices_handle().write().insert(
+        "planted-a".into(),
+        Device {
+            id: "planted-a".into(),
+            name: "planted".into(),
+            ip: "127.0.0.1".into(),
+            gateway_port: 19186, // A 的 LAN TLS 口
+            transfer_port: 18186,
+            platform: "test".into(),
+            pair: false,
+        },
+    );
+    assert!(!db.list_devices()[0].pair, "植入时应为 pair=false");
+
+    // 触发 B 的即时 whoami 刷新（切换配对模式会 spawn_pair_flag_refresh）
+    let (st, _) = http(18087, "POST", "/api/pair/mode", Some(r#"{"enabled":true}"#)).await;
+    assert_eq!(st, 200);
+
+    // 5 秒内 B 表内 planted-a 必须变为 pair=true
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let pair = db
+            .list_devices()
+            .into_iter()
+            .find(|d| d.id == "planted-a")
+            .map(|d| d.pair)
+            .unwrap_or(false);
+        if pair {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "whoami 同步通道未把 pair 标志送达（5s 超时）"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // 收尾：两端都关掉配对模式（隔离 discovery，互不影响其它用例）
+    let _ = http(18086, "POST", "/api/pair/mode", Some(r#"{"enabled":false}"#)).await;
+    let _ = http(18087, "POST", "/api/pair/mode", Some(r#"{"enabled":false}"#)).await;
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
 }
 
 /// N2 回归：stream_count 必须由发送方带过去，接收方按它建槽。

@@ -248,6 +248,7 @@ pub unsafe extern "C" fn kitefile_whoami_json() -> *const c_char {
         "gateway_port": ctx.config.gateway_port,
         "lan_tls_port": ctx.config.lan_tls_port,
         "transfer_port": ctx.config.transfer_port,
+        "pairing_enabled": ctx.discovery.pairing_status().0,
     });
     store(&LAST, CString::new(me.to_string()).unwrap_or_default())
 }
