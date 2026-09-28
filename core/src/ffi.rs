@@ -16,10 +16,64 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::runtime::Runtime;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::{EngineConfig, HttpGateway, TransferEngine};
 use crate::discovery::DiscoveryService;
+
+/// FFI 侧日志：写入 `<receive_dir>/daemon.log`（同时同步一份到 stdout）。
+///
+/// 为什么必须有：Android 上 FFI 此前**零 tracing 订阅器**，所有
+/// `warn!/error!`（端口绑定失败、gateway 启动失败……）全部静默——
+/// 真实反馈「手机端内嵌守护进程未就绪」只见结果、查无原因。
+///
+/// - 启动时若旧日志 >1MB 先截断（诊断只需要最近一次启动的现场）
+/// - 目录不可写时退化为仅 stdout（**写不进目录本身往往就是故障现场**，
+///   此时 receive_dir 的权限问题会由 NodeIdentity 的降级路径兜住并记日志）
+/// - 过滤 `kitefile=info`（与 cli 一致；设备上设 RUST_LOG 可覆盖）
+fn init_ffi_logging(receive_dir: &std::path::Path) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let log_path = receive_dir.join("daemon.log");
+        let _ = std::fs::create_dir_all(receive_dir);
+        if let Ok(md) = std::fs::metadata(&log_path) {
+            if md.len() > 1_048_576 {
+                let _ = std::fs::write(&log_path, b"");
+            }
+        }
+
+        struct LogWriter {
+            path: std::path::PathBuf,
+        }
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                use std::io::Write as _;
+                // stdout：能被 adb logcat 抓到就多一条通道（抓不到不影响文件）
+                let _ = std::io::stdout().write_all(buf);
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)?;
+                f.write_all(buf)?;
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let filter = tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive("kitefile=info".parse().expect("static directive"));
+        let writer_path = log_path.clone();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(move || LogWriter {
+                path: writer_path.clone(),
+            })
+            .try_init();
+    });
+}
 
 /// FFI 上下文句柄（不透明指针）
 pub struct FfiContext {
@@ -103,6 +157,14 @@ pub unsafe extern "C" fn kitefile_init(
     if let Some(dir) = receive_dir {
         config.receive_dir = std::path::PathBuf::from(dir);
     }
+
+    // 尽早开日志：之后的端口退避、身份、绑定……每一步失败都要留现场
+    init_ffi_logging(&config.receive_dir);
+    info!(
+        device = %config.device_name,
+        receive_dir = %config.receive_dir.display(),
+        "kitefile_init starting"
+    );
 
     let runtime = match Runtime::new() {
         Ok(rt) => rt,
@@ -223,6 +285,7 @@ pub unsafe extern "C" fn kitefile_init(
     });
 
     *lock(&CONTEXT) = Some(ctx);
+    info!("kitefile_init done (0 = ok); 网关/接收/发现任务已 spawn，等待端口就绪");
     0
 }
 

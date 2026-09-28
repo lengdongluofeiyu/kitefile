@@ -60,7 +60,7 @@ use tower::Service;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -566,25 +566,28 @@ impl HttpGateway {
         self.bind_buses().await;
         let config = self.state.config.clone();
 
-        // 身份先加载：拿不到证书就早失败，别把端口占了再退
+        // 身份先加载（tls 层写失败已降级为内存身份，此处失败≈不可能发生；
+        // handler 的 identity() 兜底也依赖它，保留硬失败避免半初始化）
         let identity = crate::tls::NodeIdentity::load_or_create(&config.receive_dir)?;
         let server_cfg = crate::tls::server_config(&identity)?;
         // 预填 AppState：handler 侧 identity() 免二次读盘
         let _ = self.state.identity.set(identity.clone());
 
-        let lb_listener = tokio::net::TcpListener::bind(("127.0.0.1", config.gateway_port))
-            .await
-            .map_err(|e| {
-                crate::CoreError::Gateway(format!("绑定回环端口 {} 失败: {e}", config.gateway_port))
-            })?;
-        let lan_listener = tokio::net::TcpListener::bind(("0.0.0.0", config.lan_tls_port))
-            .await
-            .map_err(|e| {
-                crate::CoreError::Gateway(format!(
-                    "绑定 TLS 端口 {} 失败: {e}",
-                    config.lan_tls_port
-                ))
-            })?;
+        // 回环口：优先配置值，被占则退避其它候选——Dart 的 whoami 扫描覆盖
+        // 全部候选，退避后依然能发现（真机反馈过「守护进程未就绪」，
+        // 每一次绑定失败都要留余地，而不是整体拒绝启动）
+        let lb_listener = {
+            let mut ports = vec![config.gateway_port];
+            ports.extend(crate::GATEWAY_PORT_CANDIDATES.iter().copied());
+            ports.dedup();
+            bind_first("127.0.0.1", &ports).await.map_err(|e| {
+                crate::CoreError::Gateway(format!("回环口全部候选绑定失败: {e}"))
+            })?
+        };
+        let lb_port = lb_listener
+            .local_addr()
+            .map_err(|e| crate::CoreError::Gateway(e.to_string()))?
+            .port();
 
         let allow_remote_admin = config.allow_remote_admin;
         if allow_remote_admin {
@@ -594,13 +597,29 @@ impl HttpGateway {
             );
         }
 
-        let lb_app = build_app(self.state.clone(), config.gateway_port);
-        let lan_app = build_app(self.state.clone(), config.lan_tls_port);
-        tokio::spawn(serve_tls_loop(lan_listener, server_cfg, lan_app));
+        // LAN TLS 侧：失败**只降级、不拖死网关**——本机 UI 必须活着，
+        // 否则手机端表现成「内嵌守护进程未就绪」，降级原因只能去日志里找
+        //（阶段 5 真机反馈：daemon 整体起不来却无从诊断）。
+        let mut lan_bound: Option<u16> = None;
+        match tokio::net::TcpListener::bind(("0.0.0.0", config.lan_tls_port)).await {
+            Ok(lan_listener) => {
+                let lan_app = build_app(self.state.clone(), config.lan_tls_port);
+                tokio::spawn(serve_tls_loop(lan_listener, server_cfg, lan_app));
+                lan_bound = Some(config.lan_tls_port);
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    port = config.lan_tls_port,
+                    "LAN TLS 口绑定失败，降级为仅本机回环可用（跨机传输暂不可用）"
+                );
+            }
+        }
 
+        let lb_app = build_app(self.state.clone(), lb_port);
         info!(
-            gateway_port = config.gateway_port,
-            lan_tls_port = config.lan_tls_port,
+            gateway_port = lb_port,
+            lan_tls_port = lan_bound.unwrap_or(0),
             identity_fp = %identity.fp(),
             "http gateway listening"
         );
@@ -613,6 +632,23 @@ impl HttpGateway {
         .map_err(|e| crate::CoreError::Gateway(e.to_string()))?;
         Ok(())
     }
+}
+
+/// 按优先级依次尝试绑定，返回首个成功者（全失败返回最后一个错误）。
+async fn bind_first(
+    ip: &str,
+    ports: &[u16],
+) -> std::result::Result<tokio::net::TcpListener, std::io::Error> {
+    let mut last: Option<std::io::Error> = None;
+    for p in ports {
+        match tokio::net::TcpListener::bind((ip, *p)).await {
+            Ok(l) => return Ok(l),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no port candidates")
+    }))
 }
 
 /// 构建路由表。`advertised_gateway_port` 是**本 listener 应答给外界的

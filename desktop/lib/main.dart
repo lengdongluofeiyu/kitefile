@@ -749,8 +749,8 @@ class _HomePageState extends State<HomePage> with WindowListener {
 
   /// 添加设备（P2 入口改版）：打开即开启配对模式，页内完成
   /// 「发现 → 发起 → 等确认」，关闭页面自动退出配对模式。
-  /// 两台设备都打开此页即可互相发现；页面存续期间给配对模式续期，
-  /// 防止 120s TTL 在用户比对确认码时中途过期。
+  /// 两台设备都打开此页即可互相发现；**120 秒到点即关、不自动续期**
+  /// （配对窗口必须是有意义的限时），结束态可点「重试」重新开始一轮。
   Future<void> _openAddDevice() async {
     int ttl;
     try {
@@ -759,6 +759,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
       ttl = (jsonDecode(r) as Map<String, dynamic>)['seconds_left'] as int? ?? 120;
     } catch (e) {
       if (mounted) {
+        debugPrint('[kitefile] 开启配对模式失败: $e ($kDaemonHttp/api/pair/mode)');
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text('开启配对模式失败: $e')));
       }
@@ -787,6 +788,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
     String? waitId;
     String? waitName;
     String? waitCode;
+    var expired = false; // 倒计时到点后的结束态（等「重试」重新开启）
     Timer? ticker;
     var stopped = false;
     Future<void> shutdown() async {
@@ -826,19 +828,31 @@ class _HomePageState extends State<HomePage> with WindowListener {
                 return;
               }
             } catch (_) {/* 轮询失败下一轮再试 */}
+            // 倒计时照走：到点即关（confirm 不依赖配对模式，等待不受影响）
+            if (!expired) {
+              ttl -= 1;
+              if (ttl <= 0) {
+                ttl = 0;
+                expired = true;
+                try {
+                  await httpPost('$kDaemonHttp/api/pair/mode',
+                      body: jsonEncode({'enabled': false}));
+                } catch (_) {/* daemon TTL 同时也会关 */}
+              }
+            }
             if (ctx.mounted) setDialogState(() {});
             return;
           }
+          if (expired) return; // 结束态：画面静止，等用户点「重试」
           ttl -= 1;
-          if (ttl <= 15) {
-            // 页面还开着就续期：防止配对流程中 120s 到点被踢出去
+          if (ttl <= 0) {
+            // 到点即关——**不自动续期**，配对窗口的 120s 必须有意义
+            ttl = 0;
+            expired = true;
             try {
-              final r = await httpPost('$kDaemonHttp/api/pair/mode',
-                  body: jsonEncode({'enabled': true}));
-              ttl = (jsonDecode(r) as Map<String, dynamic>)['seconds_left']
-                      as int? ??
-                  120;
-            } catch (_) {/* 续期失败：下一 tick 再试 */}
+              await httpPost('$kDaemonHttp/api/pair/mode',
+                  body: jsonEncode({'enabled': false}));
+            } catch (_) {/* daemon TTL 同时也会关 */}
           } else {
             await pull();
           }
@@ -905,77 +919,115 @@ class _HomePageState extends State<HomePage> with WindowListener {
                           const Text('配对模式',
                               style: TextStyle(fontWeight: FontWeight.bold)),
                           const Spacer(),
-                          Text(
-                            '剩余 ${ttl}s',
-                            style: TextStyle(
-                              fontSize: 13,
-                              color: Theme.of(ctx).colorScheme.primary,
-                            ),
-                          ),
+                          expired
+                              ? const Text('已结束',
+                                  style: TextStyle(
+                                      fontSize: 13, color: Colors.orange))
+                              : Text(
+                                  '剩余 ${ttl}s',
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    color: Theme.of(ctx).colorScheme.primary,
+                                  ),
+                                ),
                         ],
                       ),
                       const SizedBox(height: 4),
-                      const Text(
-                        '两台设备都打开此页面即可互相发现；出现设备后点「配对」，两屏核对同一串确认码。',
-                        style: TextStyle(fontSize: 12, color: Colors.grey),
-                      ),
-                      const SizedBox(height: 12),
-                      if (pairable.isEmpty)
-                        const Padding(
-                          padding: EdgeInsets.symmetric(vertical: 16),
-                          child: Center(
-                            child: Text(
-                              '正在搜索附近可配对的设备…\n（要求对方也停在本页面）',
-                              textAlign: TextAlign.center,
-                              style: TextStyle(color: Colors.grey),
-                            ),
-                          ),
-                        )
-                      else
-                        for (final d in pairable)
-                          ListTile(
-                            dense: true,
-                            contentPadding: EdgeInsets.zero,
-                            title: Text(d.name),
-                            subtitle: Text('${d.platform} · ${d.ip}',
-                                style: const TextStyle(fontSize: 12)),
-                            trailing: FilledButton.tonal(
-                              onPressed: () async {
-                                try {
-                                  final r = await httpPost(
-                                    '$kDaemonHttp/api/pair/start',
-                                    body: jsonEncode({
-                                      'device_id': d.id,
-                                      'name': d.name,
-                                      'platform': d.platform,
-                                      'ip': d.ip,
-                                      'gateway_port': d.gatewayPort,
-                                    }),
+                      if (expired) ...[
+                        const Text(
+                          '配对窗口已关闭：120 秒到点自动退出（停留在本页也不会续期）。需要继续时请重试。',
+                          style: TextStyle(fontSize: 12, color: Colors.grey),
+                        ),
+                        const SizedBox(height: 16),
+                        Center(
+                          child: FilledButton.icon(
+                            icon: const Icon(Icons.refresh, size: 18),
+                            label: const Text('重试 · 重新开启 120 秒'),
+                            onPressed: () async {
+                              try {
+                                final r = await httpPost(
+                                    '$kDaemonHttp/api/pair/mode',
+                                    body: jsonEncode({'enabled': true}));
+                                final j =
+                                    jsonDecode(r) as Map<String, dynamic>;
+                                setDialogState(() {
+                                  expired = false;
+                                  ttl = (j['seconds_left'] as num?)?.toInt() ??
+                                      120;
+                                });
+                              } catch (e) {
+                                if (ctx.mounted) {
+                                  ScaffoldMessenger.of(ctx).showSnackBar(
+                                    SnackBar(content: Text('重试失败: $e')),
                                   );
-                                  final j =
-                                      jsonDecode(r) as Map<String, dynamic>;
-                                  setDialogState(() {
-                                    waitId = d.id;
-                                    waitName = d.name;
-                                    waitCode = j['code'] as String? ?? '';
-                                  });
-                                } catch (e) {
-                                  if (ctx.mounted) {
-                                    ScaffoldMessenger.of(ctx).showSnackBar(
-                                      SnackBar(
-                                          content: Text('发起配对失败: $e')),
-                                    );
-                                  }
                                 }
-                              },
-                              child: const Text('配对'),
-                            ),
+                              }
+                            },
                           ),
-                      if (pairedCount > 0) ...[
-                        const SizedBox(height: 8),
-                        Text('本机已配对 $pairedCount 台设备',
-                            style: const TextStyle(
-                                fontSize: 12, color: Colors.grey)),
+                        ),
+                      ] else ...[
+                        const Text(
+                          '两台设备都打开此页面即可互相发现；出现设备后点「配对」，两屏核对同一串确认码。',
+                          style: TextStyle(fontSize: 12, color: Colors.grey),
+                        ),
+                        const SizedBox(height: 12),
+                        if (pairable.isEmpty)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 16),
+                            child: Center(
+                              child: Text(
+                                '正在搜索附近可配对的设备…\n（要求对方也停在本页面）',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(color: Colors.grey),
+                              ),
+                            ),
+                          )
+                        else
+                          for (final d in pairable)
+                            ListTile(
+                              dense: true,
+                              contentPadding: EdgeInsets.zero,
+                              title: Text(d.name),
+                              subtitle: Text('${d.platform} · ${d.ip}',
+                                  style: const TextStyle(fontSize: 12)),
+                              trailing: FilledButton.tonal(
+                                onPressed: () async {
+                                  try {
+                                    final r = await httpPost(
+                                      '$kDaemonHttp/api/pair/start',
+                                      body: jsonEncode({
+                                        'device_id': d.id,
+                                        'name': d.name,
+                                        'platform': d.platform,
+                                        'ip': d.ip,
+                                        'gateway_port': d.gatewayPort,
+                                      }),
+                                    );
+                                    final j = jsonDecode(r)
+                                        as Map<String, dynamic>;
+                                    setDialogState(() {
+                                      waitId = d.id;
+                                      waitName = d.name;
+                                      waitCode = j['code'] as String? ?? '';
+                                    });
+                                  } catch (e) {
+                                    if (ctx.mounted) {
+                                      ScaffoldMessenger.of(ctx).showSnackBar(
+                                        SnackBar(
+                                            content: Text('发起配对失败: $e ($kDaemonHttp)')),
+                                      );
+                                    }
+                                  }
+                                },
+                                child: const Text('配对'),
+                              ),
+                            ),
+                        if (pairedCount > 0) ...[
+                          const SizedBox(height: 8),
+                          Text('本机已配对 $pairedCount 台设备',
+                              style: const TextStyle(
+                                  fontSize: 12, color: Colors.grey)),
+                        ],
                       ],
                     ],
                   ),

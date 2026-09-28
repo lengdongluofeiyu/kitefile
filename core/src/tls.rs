@@ -56,12 +56,22 @@ impl NodeIdentity {
         let cert_path = base_dir.join(CERT_FILE);
         let key_path = base_dir.join(KEY_FILE);
         if cert_path.exists() && key_path.exists() {
-            let cert = CertificateDer::from_pem_file(&cert_path)
-                .map_err(|e| CoreError::Gateway(format!("读取 {CERT_FILE} 失败: {e}")))?;
-            let key = PrivateKeyDer::from_pem_file(&key_path)
-                .map_err(|e| CoreError::Gateway(format!("读取 {KEY_FILE} 失败: {e}")))?;
-            let fp = fingerprint(cert.as_ref());
-            return Ok(Arc::new(Self { cert, key, fp }));
+            match (
+                CertificateDer::from_pem_file(&cert_path),
+                PrivateKeyDer::from_pem_file(&key_path),
+            ) {
+                (Ok(cert), Ok(key)) => {
+                    let fp = fingerprint(cert.as_ref());
+                    return Ok(Arc::new(Self { cert, key, fp }));
+                }
+                _ => {
+                    // 损坏 / 不可读：重新生成（写盘失败会走下面的内存降级）
+                    tracing::warn!(
+                        path = %base_dir.display(),
+                        "身份文件损坏或不可读，重新生成"
+                    );
+                }
+            }
         }
 
         let cn = read_marker_device_id(base_dir).unwrap_or_else(|| "kitefile-node".to_string());
@@ -79,18 +89,37 @@ impl NodeIdentity {
         let cert_pem = cert.pem();
         let key_pem = key_pair.serialize_pem();
 
-        std::fs::create_dir_all(base_dir)?;
-        std::fs::write(&cert_path, cert_pem.as_bytes())?;
-        // 私钥收紧权限（Windows 上 fs::set_permissions 只认 read-only 位，
-        // 完整 0600 语义留给 unix；尽力而为，失败不阻断）
-        write_key_file(&key_path, key_pem.as_bytes())?;
+        // 持久化失败**不致命**：降级为内存身份，daemon 照常工作。
+        // 真实事故（阶段 5）：Android 公共目录（/sdcard）没有「所有文件访问」
+        // 权限时 create_dir_all/write 必失败——P1 把它当硬错误 `?`，直接把
+        // 整个 gateway/接收任务弄死，表现为「内嵌守护进程未就绪」且无日志；
+        // 旧版此处是静默忽略的。现在对齐旧版语义：能写则写（指纹跨重启稳定），
+        // 写不了就 warn 说明后果（重启后指纹变，对端需重新配对）。
+        let persist = || -> Result<()> {
+            std::fs::create_dir_all(base_dir)?;
+            std::fs::write(&cert_path, cert_pem.as_bytes())?;
+            write_key_file(&key_path, key_pem.as_bytes())?;
+            Ok(())
+        };
+        match persist() {
+            Ok(()) => {
+                info!(cn = %cn, "TLS identity persisted");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %base_dir.display(),
+                    "身份文件写入失败，降级为内存身份（重启后指纹会变化，对端需重新配对）"
+                );
+            }
+        }
 
         let cert = CertificateDer::from_pem_slice(cert_pem.as_bytes())
             .map_err(|e| CoreError::Gateway(format!("证书 PEM 回读失败: {e}")))?;
         let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
             .map_err(|e| CoreError::Gateway(format!("私钥 PEM 回读失败: {e}")))?;
         let fp = fingerprint(cert.as_ref());
-        info!(fp = %fp, cn = %cn, "TLS identity created");
+        info!(fp = %fp, cn = %cn, "TLS identity ready");
         Ok(Arc::new(Self { cert, key, fp }))
     }
 
