@@ -40,7 +40,6 @@
 //! （取不到时按非本机处理，会让本机 UI 全部 403）。
 
 use crate::discovery::DiscoveryService;
-use crate::httpc::http_post_json_tls;
 use crate::protocol::{HttpIncomingResponse, HttpOffer, IncomingEntry, WsEvent};
 use crate::transfer::{TransferEngine, TransferProgress};
 use crate::{EngineConfig, Result};
@@ -1226,6 +1225,8 @@ async fn incoming_offer(
     let config = state.config.clone();
     let incoming_id = entry.incoming_id.clone();
     let entry_for_spawn = entry.clone();
+    // 出站回包的对端 pin（P4：目标已配对时校验其服务端证书）
+    let state_transfer_pin = state.transfer.out_pin(&entry.from_ip);
 
     tokio::spawn(async move {
         // Some(true)=接受，Some(false)=用户拒绝，None=超时
@@ -1259,12 +1260,13 @@ async fn incoming_offer(
             transfer_port: config.transfer_port,
         };
         let resp_json = serde_json::to_string(&resp).unwrap_or_default();
-        if let Err(e) = http_post_json_tls(
+        if let Err(e) = crate::httpc::http_post_json_tls_pinned(
             &entry_for_spawn.from_ip,
             entry_for_spawn.from_gateway_port,
             "/api/incoming-resp",
             &resp_json,
             &config.receive_dir,
+            state_transfer_pin.as_deref(),
         )
         .await
         {

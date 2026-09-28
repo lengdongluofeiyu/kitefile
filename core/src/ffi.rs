@@ -186,6 +186,8 @@ pub unsafe extern "C" fn kitefile_init(
         config.parallel_streams,
         config.receive_dir.clone(),
     ));
+    // 信任上下文（P4）：数据面成员校验 + 出站 pin；须在 spawn_receiver 之前
+    transfer.set_trust(discovery.devices_handle());
 
     let ctx = Arc::new(FfiContext {
         runtime_handle: runtime_handle.clone(),

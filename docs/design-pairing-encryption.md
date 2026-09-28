@@ -352,6 +352,18 @@ TCP connect → TLS 握手
   （见 §14）——数据通道的对端认证由 TLS 客户端证书完成，不再需要应用层 AUTH。
 - TLS 记录层自己的 tag/nonce 由 rustls 管理，不进业务帧。
 
+**实现注记（P4 踩坑，写给后来者）**：
+
+1. **服务端必须 `send_tls13_tickets = 0`**：TLS 1.3 握手后 rustls 默认发
+   2 张 NewSessionTicket，数据面发送端只写不读 → 票据躺在接收缓冲里，
+   Windows 下带未读数据 close 发 RST → 对端刚建好的流整条重置
+   （症状：`ConnectionReset`、每流恰好丢最后一段）。本项目不做会话恢复，关掉即根治。
+2. **发送端关闭前显式 `flush()`**：tokio-rustls `poll_write` 文档明言
+   「不保证最后的数据已发出，必须手动 flush」——write_all 完直接 close
+   会丢掉缓冲里的记录。
+3. 单元测试无 trust（`set_trust` 未注入）→ 数据面 accept-any + 出站不 pin，
+   与配对流程的 pre-pairing 语义一致；生产 daemon（cli/ffi）一律注入。
+
 ### 8.4 降级与兼容（Q3）
 
 - **不做明文降级**：旧客户端拿明文 HTTP 打 7880 → TLS 握手失败，可见地报错；

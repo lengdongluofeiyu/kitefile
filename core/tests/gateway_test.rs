@@ -137,6 +137,7 @@ async fn start_stack_impl(
     parallel: usize,
     allow_remote_admin: bool,
 ) -> Arc<TransferEngine> {
+    let _ = tracing_subscriber::fmt().try_init();
     let lan_port = tr_port + 1000;
     let config = EngineConfig {
         device_name: format!("test-{}", gw_port),

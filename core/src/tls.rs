@@ -133,10 +133,32 @@ pub fn install_crypto_provider() {
 /// P3 在其上叠加应用层查表（PeerFingerprint 扩展）。
 pub fn server_config(id: &NodeIdentity) -> Result<Arc<ServerConfig>> {
     install_crypto_provider();
-    let cfg = ServerConfig::builder()
+    let mut cfg = ServerConfig::builder()
         .with_client_cert_verifier(Arc::new(AcceptAnyClientCert))
         .with_single_cert(vec![id.cert.clone()], id.key.clone_key())
         .map_err(|e| CoreError::Gateway(format!("TLS 服务端配置失败: {e}")))?;
+    // 不发 NewSessionTicket：本项目不做会话恢复；而数据面发送端只写不读，
+    // 握手后的票据会躺在它的接收缓冲里——Windows 下带未读数据 close 发 RST，
+    // 对端刚建好的流被整条重置（P4 实测：传输流 100% ConnectionReset）。
+    cfg.send_tls13_tickets = 0;
+    Ok(Arc::new(cfg))
+}
+
+/// 服务端配置（数据面，P4）：**强制**客户端证书且必须在配对表内。
+///
+/// 未配对 / 无证书的连接在 TLS 握手层直接被拒（rustls 侧查表——
+/// 设计 §9.2「实现取前者」）。生产 daemon 用这份；单元测试无 trust 的
+/// 引擎仍走 [`server_config`]（accept-any）。
+pub fn server_config_paired(
+    id: &NodeIdentity,
+    peers: Arc<crate::pairing::PeersStore>,
+) -> Result<Arc<ServerConfig>> {
+    install_crypto_provider();
+    let mut cfg = ServerConfig::builder()
+        .with_client_cert_verifier(Arc::new(PairedClientCert { peers }))
+        .with_single_cert(vec![id.cert.clone()], id.key.clone_key())
+        .map_err(|e| CoreError::Gateway(format!("TLS 服务端配置失败: {e}")))?;
+    cfg.send_tls13_tickets = 0; // 同 server_config：避免票据引发的 RST
     Ok(Arc::new(cfg))
 }
 
@@ -270,6 +292,58 @@ impl ServerCertVerifier for AcceptAnyServerCert {
         _now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, TlsError> {
         Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
+        verify_sig_12(message, cert, dss)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
+        verify_sig_13(message, cert, dss)
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        supported_schemes()
+    }
+}
+
+/// 数据面服务端（P4）：强制客户端证书，且证书必须在配对表内。
+/// 握手层拒绝 = 未配对设备连数据端口都无法进入协议解析。
+#[derive(Debug)]
+struct PairedClientCert {
+    peers: Arc<crate::pairing::PeersStore>,
+}
+
+impl ClientCertVerifier for PairedClientCert {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+    fn client_auth_mandatory(&self) -> bool {
+        // 必须强制：可选模式下"不交证书"会绕过 verify_client_cert
+        true
+    }
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> std::result::Result<ClientCertVerified, TlsError> {
+        let fp = fingerprint(end_entity.as_ref());
+        if self.peers.contains_fp(&fp) {
+            Ok(ClientCertVerified::assertion())
+        } else {
+            Err(TlsError::InvalidCertificate(CertificateError::UnknownIssuer))
+        }
     }
     fn verify_tls12_signature(
         &self,
@@ -493,5 +567,95 @@ mod tests {
             rustls::pki_types::ServerName::IpAddress(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST).into());
         let result = connector.connect(name, tcp).await;
         assert!(result.is_err(), "错误指纹必须握手失败");
+    }
+
+    /// 数据面成员校验（P4）：客户端证书在 peers 表内 → 握手成功；
+    /// 不在 / 不交证书 → 握手失败（强制模式，无证书绕不过）。
+    #[tokio::test]
+    async fn paired_server_requires_membership() {
+        let srv_dir = temp_dir("pserver");
+        let cli_dir = temp_dir("pclient");
+        let srv_id = NodeIdentity::load_or_create(&srv_dir).unwrap();
+        let cli_id = NodeIdentity::load_or_create(&cli_dir).unwrap();
+
+        let peers = crate::pairing::PeersStore::load(&srv_dir.join("peers.json"));
+        // 未配对：拒
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = server_config_paired(&srv_id, peers.clone()).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn({
+            let cfg = cfg.clone();
+            async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                match tokio_rustls::TlsAcceptor::from(cfg).accept(tcp).await {
+                    Ok(_) => {
+                        let _ = tx.send("server-accepted".into());
+                    }
+                    Err(e) => {
+                        let _ = tx.send(format!("server-rejected: {e}"));
+                    }
+                }
+            }
+        });
+        {
+            let client =
+                tokio_rustls::TlsConnector::from(client_config(&cli_id, None).unwrap());
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let name = rustls::pki_types::ServerName::IpAddress(
+                std::net::IpAddr::V4(Ipv4Addr::LOCALHOST).into(),
+            );
+            let client_res = client.connect(name, tcp).await;
+            let server_msg = rx.await.unwrap_or_else(|_| "server task died".into());
+            assert!(
+                server_msg.starts_with("server-rejected"),
+                "服务端必须在握手层拒绝未配对客户端，实际：{server_msg}"
+            );
+            // TLS 1.3：客户端证书的判决发生在 client Finished 之后，
+            // `connect()` 可能已经返回 Ok——拒绝体现在随后的 I/O 上
+            if let Ok(mut tls) = client_res {
+                let mut buf = [0u8; 1];
+                let r = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    tokio::io::AsyncReadExt::read(&mut tls, &mut buf),
+                )
+                .await;
+                let io_ok = matches!(r, Ok(Ok(n)) if n > 0);
+                assert!(!io_ok, "服务端已拒，客户端后续读不应拿到数据");
+            }
+        }
+
+        // 配对后：放行
+        peers.insert(
+            "client-dev",
+            crate::pairing::PeerRecord {
+                name_hint: "c".into(),
+                platform: "test".into(),
+                fp_sha256: cli_id.fp().to_string(),
+                paired_at: 0,
+            },
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = tokio_rustls::TlsAcceptor::from(cfg)
+                .accept(tcp)
+                .await
+                .unwrap();
+            let mut buf = [0u8; 2];
+            tokio::io::AsyncReadExt::read_exact(&mut tls, &mut buf)
+                .await
+                .unwrap();
+            assert_eq!(&buf, b"ok");
+        });
+        let client =
+            tokio_rustls::TlsConnector::from(client_config(&cli_id, None).unwrap());
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::IpAddress(
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST).into(),
+        );
+        let mut tls = client.connect(name, tcp).await.expect("已配对应放行");
+        tokio::io::AsyncWriteExt::write_all(&mut tls, b"ok").await.unwrap();
     }
 }

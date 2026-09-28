@@ -334,6 +334,13 @@ impl DiscoveryService {
             .collect()
     }
 
+    /// 设备表句柄（ip → device 解析供信任层查指纹用；阶段 5 P4）
+    pub fn devices_handle(
+        &self,
+    ) -> Arc<RwLock<HashMap<DeviceId, Device>>> {
+        Arc::clone(&self.devices)
+    }
+
     pub fn self_id(&self) -> &str {
         &self.self_id
     }

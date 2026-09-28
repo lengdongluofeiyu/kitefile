@@ -18,7 +18,7 @@
 //! 后续可按平台用 cfg 切到 sendfile/TransmitFile 等优化。
 
 use crate::fault::{from_io, FailureKind, Phase, TransferFailure};
-use crate::httpc::http_post_json_tls;
+use crate::httpc::http_post_json_tls_pinned;
 use crate::protocol::{
     compute_stream_count, stream_layout, HttpIncomingResponse, HttpOffer, IncomingEntry, StreamHeader,
 };
@@ -506,6 +506,14 @@ pub struct TransferEngine {
     /// 出站 offer 并发闸门：多文件批量发送时限制同时在途的 /api/incoming，
     /// 免得几个连接一起把手机网络栈打满（表现为 ETIMEDOUT）。
     offer_gate: Arc<tokio::sync::Semaphore>,
+    /// 已配对设备表（**唯一实例**：gateway 经 [`TransferEngine::peers`] 复用同一
+    /// Arc，撤销对两侧即时生效；文件 = receive_dir/peers.json）
+    peers: Arc<crate::pairing::PeersStore>,
+    /// 本机 TLS 身份（懒加载一次；数据面服务端/客户端出示）
+    identity: std::sync::OnceLock<Arc<crate::tls::NodeIdentity>>,
+    /// 信任上下文（P4）：`set_trust` 注入设备表后启用出站 pin 与
+    /// 数据面成员校验；None = accept-any（单元测试 / 未接 discovery 的路径）
+    trust: std::sync::OnceLock<Arc<crate::pairing::TrustContext>>,
 }
 
 impl TransferEngine {
@@ -514,6 +522,8 @@ impl TransferEngine {
         parallel_streams: usize,
         receive_dir: PathBuf,
     ) -> Self {
+        // 先于 storage 消费 receive_dir（PeersStore 与存储同目录）
+        let peers = crate::pairing::PeersStore::load(&receive_dir.join("peers.json"));
         Self {
             transfer_port,
             parallel_streams,
@@ -542,7 +552,51 @@ impl TransferEngine {
             incoming_endpoints: TokioMutex::new(HashMap::new()),
             outgoing_endpoints: TokioMutex::new(HashMap::new()),
             offer_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            peers,
+            identity: std::sync::OnceLock::new(),
+            trust: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 配对表（gateway 必须复用这个实例，别再自己 load——
+    /// 两份内存表会让撤销失效）
+    pub fn peers(&self) -> Arc<crate::pairing::PeersStore> {
+        Arc::clone(&self.peers)
+    }
+
+    /// 注入信任上下文（P4）。须在 `spawn_receiver` / 首次出站之前调用；
+    /// 注入后：数据面服务端强制「客户端证书 ∈ peers」，出站连接按
+    /// 「目标 IP → 设备表 → peers」做服务端证书 pin。
+    pub fn set_trust(
+        &self,
+        devices: Arc<
+            parking_lot::RwLock<HashMap<crate::discovery::DeviceId, crate::discovery::Device>>,
+        >,
+    ) {
+        let _ = self.trust.set(Arc::new(crate::pairing::TrustContext {
+            peers: self.peers(),
+            devices,
+        }));
+    }
+
+    pub fn get_trust(&self) -> Option<Arc<crate::pairing::TrustContext>> {
+        self.trust.get().cloned()
+    }
+
+    /// 本机 TLS 身份（首次调用读盘生成/复用）
+    pub fn identity(&self) -> Arc<crate::tls::NodeIdentity> {
+        self.identity
+            .get_or_init(|| {
+                crate::tls::NodeIdentity::load_or_create(&self.receive_dir)
+                    .expect("TLS identity 加载失败")
+            })
+            .clone()
+    }
+
+    /// 出站目标的服务端证书 pin：trust 未注入 / 设备不在线 / 未配对 → None
+    /// （accept-any——配对流程与无 trust 的测试路径同款语义）
+    pub fn out_pin(&self, ip: &str) -> Option<String> {
+        self.get_trust().and_then(|t| t.fp_for_ip(ip))
     }
 
     /// gateway 启动后注入 progress 广播
@@ -592,11 +646,18 @@ impl TransferEngine {
         {
             let file_id_owned = file_id.to_string();
             let receive_dir = self.receive_dir.clone();
+            let pin = self.out_pin(&target_ip);
             tokio::spawn(async move {
                 let path = format!("/api/cancel/{}", file_id_owned);
-                if let Err(e) =
-                    http_post_json_tls(&target_ip, target_gateway_port, &path, "{}", &receive_dir)
-                        .await
+                if let Err(e) = crate::httpc::http_post_json_tls_pinned(
+                    &target_ip,
+                    target_gateway_port,
+                    &path,
+                    "{}",
+                    &receive_dir,
+                    pin.as_deref(),
+                )
+                .await
                 {
                     warn!(error = %e, "notify receiver cancel failed");
                 }
@@ -659,14 +720,16 @@ impl TransferEngine {
             {
                 let file_id_owned = file_id.to_string();
                 let receive_dir = self.receive_dir.clone();
+                let pin = self.out_pin(&from_ip);
                 tokio::spawn(async move {
                     let path = format!("/api/cancel/{}", file_id_owned);
-                    if let Err(e) = http_post_json_tls(
+                    if let Err(e) = crate::httpc::http_post_json_tls_pinned(
                         &from_ip,
                         from_gateway_port,
                         &path,
                         "{}",
                         &receive_dir,
+                        pin.as_deref(),
                     )
                     .await
                     {
@@ -724,12 +787,21 @@ impl TransferEngine {
         }
     }
 
-    /// 启动接收端 TCP listener，等待对端发起的数据流连接
+    /// 启动接收端 TCP listener，等待对端发起的数据流连接。
+    ///
+    /// 阶段 5 P4：**TLS 终结在此**——服务端配置按 trust 二选一：
+    /// 注入过信任上下文 → 强制「客户端证书 ∈ peers」（未配对在握手层被拒）；
+    /// 未注入（单元测试）→ accept-any。`serve_data_stream` 保持传输无关。
     pub async fn spawn_receiver(self: Arc<Self>) -> Result<()> {
         let listener = TcpListener::bind(("0.0.0.0", self.transfer_port))
             .await
             .map_err(|e| crate::CoreError::Transfer(e.to_string()))?;
-        info!(port = self.transfer_port, "transfer listener bound");
+        let server_cfg = match self.get_trust() {
+            Some(t) => crate::tls::server_config_paired(&self.identity(), t.peers.clone())?,
+            None => crate::tls::server_config(&self.identity())?,
+        };
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+        info!(port = self.transfer_port, "transfer listener bound (TLS)");
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -738,8 +810,26 @@ impl TransferEngine {
                             warn!(?peer, error = %e, "set_nodelay failed (non-fatal)");
                         }
                         let engine = self.clone();
+                        let acceptor = acceptor.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = engine.serve_data_stream(stream).await {
+                            // 握手超时：防慢速客户端长期占坑
+                            let tls = match tokio::time::timeout(
+                                Duration::from_secs(10),
+                                acceptor.accept(stream),
+                            )
+                            .await
+                            {
+                                Ok(Ok(s)) => s,
+                                Ok(Err(e)) => {
+                                    warn!(?peer, error = %e, "data tls handshake rejected");
+                                    return;
+                                }
+                                Err(_) => {
+                                    warn!(?peer, "data tls handshake timeout");
+                                    return;
+                                }
+                            };
+                            if let Err(e) = engine.serve_data_stream(tls).await {
                                 warn!(?peer, error = %e, "data stream error");
                             }
                         });
@@ -758,7 +848,16 @@ impl TransferEngine {
     /// 一条连接只承载一段连续字节，没有分块 ACK。干净 EOF 且读满 `data_len` 即成功。
     /// 段体阶段的错误按 [`TransferFailure`] 分类（A3.4）并驱动接收方状态机（A3.2）：
     /// 可重试 → `Interrupted`（保留槽位与 .part）；不可重试 → `Failed`（清理槽位）。
-    async fn serve_data_stream(self: Arc<Self>, mut stream: TcpStream) -> std::result::Result<(), TransferFailure> {
+    ///
+    /// 传输无关（P4）：TLS 终结在 `spawn_receiver`，这里接受任意
+    /// AsyncRead+AsyncWrite——单测可直接喂裸 TCP。
+    async fn serve_data_stream<S>(
+        self: Arc<Self>,
+        mut stream: S,
+    ) -> std::result::Result<(), TransferFailure>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let idle = self.timeouts.idle;
         // ---- 头部：解析 + 定位 file_id（此阶段错误无法归属任务，只记日志） ----
         let mut header_buf = [0u8; StreamHeader::SIZE];
@@ -797,13 +896,16 @@ impl TransferEngine {
     }
 
     /// 接收一段字节：校验布局 → 流式落盘 → 标记完成 → 收尾。
-    async fn recv_segment(
+    async fn recv_segment<S>(
         self: &Arc<Self>,
         file_id: &str,
         header: &StreamHeader,
-        stream: &mut TcpStream,
+        stream: &mut S,
         idle: Duration,
-    ) -> std::result::Result<(), TransferFailure> {
+    ) -> std::result::Result<(), TransferFailure>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
         let slot = self
             .storage
             .get_slot(file_id)
@@ -1359,6 +1461,7 @@ impl TransferEngine {
                     "/api/incoming",
                     &offer_json,
                     &engine.receive_dir,
+                    engine.out_pin(&target_ip).as_deref(),
                 )
                 .await
             };
@@ -1527,12 +1630,13 @@ impl TransferEngine {
         // 不空烧数据面、不进入「继续→又中断」死循环；通知网络失败则继续，
         // 交由数据面重试自行判定（可能只是瞬时网络问题）。
         if is_resume {
-            let notify = http_post_json_tls(
+            let notify = http_post_json_tls_pinned(
                 &snap.target_ip,
                 snap.target_gateway_port,
                 &format!("/api/peer-resumed/{}", file_id),
                 "{}",
                 &self.receive_dir,
+                self.out_pin(&snap.target_ip).as_deref(),
             )
             .await;
             match notify {
@@ -1665,6 +1769,7 @@ impl TransferEngine {
                     &mut snap.cancel_rx,
                     &self.verify_backoff,
                     &self.receive_dir,
+                    self.out_pin(&snap.target_ip).as_deref(),
                 )
                 .await;
                 if *snap.cancel_rx.borrow() {
@@ -1806,12 +1911,13 @@ impl TransferEngine {
 
         // 本机先回到「传输中」，再通知对端续传
         self.on_peer_resumed(file_id).await;
-        let res = http_post_json_tls(
+        let res = http_post_json_tls_pinned(
             &peer_ip,
             peer_port,
             &format!("/api/peer-resume/{}", file_id),
             "{}",
             &self.receive_dir,
+            self.out_pin(&peer_ip).as_deref(),
         )
         .await;
         if let Err(e) = res {
@@ -1878,6 +1984,20 @@ impl TransferEngine {
         let file_id_prefix = file_id_prefix_u64(&file_id);
         let layout = stream_layout(file_size, stream_count);
 
+        // 数据面 TLS 客户端配置（P4）：出示本机证书；pin 按目标 IP 经
+        // trust 解析（未注入 / 未配对 → accept-any）
+        let client_cfg = match crate::tls::client_config(
+            &self.identity(),
+            self.out_pin(&target_ip).as_deref(),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                return SendOutcome::Failed(TransferFailure::protocol(format!(
+                    "tls client config: {e}"
+                )))
+            }
+        };
+
         // 续传基数：已完成段的字节/计数直接入账，未完成段从 0 开始累计
         let (base_chunks, base_bytes) =
             done_stats(&streams_done, file_size, stream_count);
@@ -1910,6 +2030,7 @@ impl TransferEngine {
                 last_sample: last_sample.clone(),
             };
             let file_id_prefix = file_id_prefix;
+            let client_cfg = client_cfg.clone();
 
             handles.push(tokio::spawn(async move {
                 let stream_id_u32 = stream_id as u32;
@@ -1968,6 +2089,7 @@ impl TransferEngine {
                         &mut cancel_rx,
                         &pctx,
                         timeouts,
+                        &client_cfg,
                     )
                     .await
                     {
@@ -2135,8 +2257,10 @@ async fn send_one_stream(
     cancel_rx: &mut watch::Receiver<bool>,
     pctx: &SendProgress,
     timeouts: crate::timeouts::Timeouts,
+    client_cfg: &Arc<rustls::ClientConfig>,
 ) -> std::result::Result<(), TransferFailure> {
-    let mut conn = connect_with_retry(target_ip, target_port, cancel_rx, timeouts.connect).await?;
+    // 连接 + TLS 握手一体（握手失败与连接失败同路径重试）
+    let mut conn = connect_with_retry(target_ip, target_port, cancel_rx, timeouts.connect, client_cfg).await?;
     let header = StreamHeader {
         file_id_prefix,
         stream_id,
@@ -2159,6 +2283,9 @@ async fn send_one_stream(
     )
     .await?;
 
+    // 显式 flush：tokio-rustls 的 poll_write 文档明言「不保证最后的数据已发出，
+    // 必须手动 flush」——不 flush 直接 close 会丢缓冲里的记录（对端见 RST）
+    let _ = conn.flush().await;
     let _ = conn.shutdown().await;
     Ok(())
 }
@@ -2250,18 +2377,22 @@ impl SendProgress {
     }
 }
 
-/// 连接对端数据端口，带少量重试；取消可打断退避**与** connect。
+/// 连接对端数据端口 **并完成 TLS 握手（P4）**，带少量重试；
+/// 取消可打断退避、connect 与握手。
 ///
-/// connect 施加 `connect_limit`（A3.1，值来自引擎可注入超时），
-/// 失败按阶段分类为 ConnectTimeout / ConnectFailed（均可重试，A3.4）。
+/// connect / 握手均施加 `connect_limit`（A3.1），失败按阶段分类为
+/// ConnectTimeout / ConnectFailed（均可重试，A3.4）——握手被拒
+/// （如数据面成员校验失败）也走同一重试路径，耗尽后报连接类错误。
 async fn connect_with_retry(
     target_ip: &str,
     target_port: u16,
     cancel_rx: &mut watch::Receiver<bool>,
     connect_limit: Duration,
-) -> std::result::Result<TcpStream, TransferFailure> {
+    client_cfg: &Arc<rustls::ClientConfig>,
+) -> std::result::Result<tokio_rustls::client::TlsStream<TcpStream>, TransferFailure> {
     const ATTEMPTS: u32 = 3;
     const BACKOFF_MS: [u64; 3] = [0, 200, 500];
+    let connector = tokio_rustls::TlsConnector::from(Arc::clone(client_cfg));
     let mut last_err: Option<TransferFailure> = None;
     for attempt in 0..ATTEMPTS {
         if *cancel_rx.borrow() {
@@ -2279,7 +2410,7 @@ async fn connect_with_retry(
                 }
             }
         }
-        let connect_result = tokio::select! {
+        let tcp_result = tokio::select! {
             r = tokio::time::timeout(connect_limit, TcpStream::connect((target_ip, target_port))) => {
                 r.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))
                     .and_then(|r| r)
@@ -2288,15 +2419,40 @@ async fn connect_with_retry(
                 return Err(TransferFailure::canceled("canceled"));
             }
         };
-        match connect_result {
+        let result = match tcp_result {
             Ok(s) => {
                 if let Err(e) = s.set_nodelay(true) {
                     warn!(error = %e, "set_nodelay failed (non-fatal)");
                 }
-                return Ok(s);
+                match crate::httpc::server_name_for(target_ip) {
+                    Err(e) => Err(e),
+                    Ok(name) => tokio::select! {
+                        r = tokio::time::timeout(connect_limit, connector.connect(name, s)) => {
+                            r.map_err(|_| std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "tls handshake timeout",
+                            ))
+                            .and_then(|r| {
+                                r.map_err(|e| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::ConnectionAborted,
+                                        format!("tls: {e}"),
+                                    )
+                                })
+                            })
+                        }
+                        _ = cancel_rx.changed() => {
+                            return Err(TransferFailure::canceled("canceled"));
+                        }
+                    },
+                }
             }
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(tls) => return Ok(tls),
             Err(e) => {
-                warn!(attempt, error = %e, "connect failed, will retry");
+                warn!(attempt, error = %e, "connect/tls failed, will retry");
                 last_err = Some(from_io(&e, Phase::Connect));
             }
         }
@@ -2310,15 +2466,18 @@ async fn connect_with_retry(
 ///
 /// 失败分类（A3.4）：本地读 → SourceError（不可重试）；
 /// socket 写（按 `idle` 空闲上限）→ 网络类（可重试）。
-async fn send_stream_body(
-    conn: &mut TcpStream,
+async fn send_stream_body<S>(
+    conn: &mut S,
     file_path: &std::path::Path,
     start_offset: u64,
     seg_len: u64,
     cancel_rx: &mut watch::Receiver<bool>,
     pctx: &SendProgress,
     idle: Duration,
-) -> std::result::Result<(), TransferFailure> {
+) -> std::result::Result<(), TransferFailure>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
     use std::io::SeekFrom;
     let mut file = open_source_file(file_path)
         .await
@@ -2373,12 +2532,15 @@ async fn send_stream_body(
 ///
 /// 每次底层 read 施加空闲上限 `idle`（A3.1，值来自引擎可注入超时）：
 /// 连续无字节到达即收敛为 TimedOut，再按 `phase` 分类（Recv → 可重试的空闲超时）。
-async fn read_full(
-    stream: &mut TcpStream,
+async fn read_full<S>(
+    stream: &mut S,
     buf: &mut [u8],
     phase: Phase,
     idle: Duration,
-) -> std::result::Result<usize, TransferFailure> {
+) -> std::result::Result<usize, TransferFailure>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     let mut read = 0;
     while read < buf.len() {
         let n = match with_idle_timeout(stream.read(&mut buf[read..]), idle).await {
@@ -2470,13 +2632,15 @@ async fn post_verify_once(
     file_id: &str,
     body: &str,
     receive_dir: &std::path::Path,
+    pin: Option<&str>,
 ) -> VerifyPost {
-    match http_post_json_tls(
+    match http_post_json_tls_pinned(
         host,
         port,
         &format!("/api/verify/{}", file_id),
         body,
         receive_dir,
+        pin,
     )
     .await
     {
@@ -2510,6 +2674,7 @@ async fn negotiate_verify(
     cancel_rx: &mut watch::Receiver<bool>,
     backoff: &[Duration],
     receive_dir: &std::path::Path,
+    pin: Option<&str>,
 ) -> VerifyNegotiation {
     let mut saw_pending: Option<Vec<bool>> = None;
     for (i, wait) in backoff.iter().enumerate() {
@@ -2522,7 +2687,7 @@ async fn negotiate_verify(
                 break;
             }
         }
-        match post_verify_once(host, port, file_id, body, receive_dir).await {
+        match post_verify_once(host, port, file_id, body, receive_dir, pin).await {
             VerifyPost::Receipt(receipt) => match parse_verify_result(&receipt) {
                 Some(VerifyOutcome::Finalized) | Some(VerifyOutcome::Missing) => {
                     return VerifyNegotiation::Finalized;
@@ -2615,6 +2780,7 @@ async fn http_post_json_retry(
     path: &str,
     body: &str,
     receive_dir: &std::path::Path,
+    pin: Option<&str>,
 ) -> std::io::Result<String> {
     const ATTEMPTS: u32 = 3;
     const BACKOFF_MS: [u64; 3] = [0, 300, 800];
@@ -2624,7 +2790,7 @@ async fn http_post_json_retry(
         if backoff > 0 {
             tokio::time::sleep(Duration::from_millis(backoff)).await;
         }
-        match http_post_json_tls(host, port, path, body, receive_dir).await {
+        match http_post_json_tls_pinned(host, port, path, body, receive_dir, pin).await {
             Ok(r) => return Ok(r),
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                 // 对端明确 HTTP 拒绝（如协议版本 400）：再试结果一样，
@@ -2929,6 +3095,7 @@ mod tests {
                 1,
                 &mut cancel_rx,
                 crate::timeouts::CONNECT_TIMEOUT,
+                &test_client_cfg(),
             )
             .await
         });
@@ -3314,7 +3481,8 @@ mod tests {
             .insert(file_id_prefix_u64(file_id), file_id.to_string());
 
         // 手工扮演发送方：发头 + 10 字节后彻底静默（保持连接不关闭）
-        let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        //（P4：接收端只收 TLS，客户端也要先握手）
+        let mut sock = tls_data_client(port).await;
         let header = StreamHeader {
             file_id_prefix: file_id_prefix_u64(file_id),
             stream_id: 0,
@@ -3455,6 +3623,30 @@ mod tests {
         let id = crate::tls::NodeIdentity::load_or_create(&base.join("kitefile-test-identity"))
             .expect("test identity");
         crate::tls::server_config(&id).expect("test tls server config")
+    }
+
+    /// 测试用客户端 TLS 配置（accept-any；与 test_server_tls_cfg 同一身份目录）
+    fn test_client_cfg() -> Arc<rustls::ClientConfig> {
+        let base = std::env::var("FTCORE_TEST_TMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let id = crate::tls::NodeIdentity::load_or_create(&base.join("kitefile-test-identity"))
+            .expect("test identity");
+        crate::tls::client_config(&id, None).expect("test tls client config")
+    }
+
+    /// 测试用：连本机数据端口并完成 TLS 握手（引擎接收端 trust=None → accept-any）
+    async fn tls_data_client(
+        port: u16,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let name = crate::httpc::server_name_for("127.0.0.1").unwrap();
+        tokio_rustls::TlsConnector::from(test_client_cfg())
+            .connect(name, tcp)
+            .await
+            .expect("data tls handshake")
     }
 
     /// 极简 **TLS** HTTP 服务：回固定状态行与 body，统计命中次数。
@@ -3624,7 +3816,7 @@ mod tests {
     async fn offer_retry_short_circuits_on_http_rejection() {
         let (port, hits) = spawn_fixed_http("400 Bad Request", "bad").await;
         let dir = tmp_dir("retry-400");
-        let err = http_post_json_retry("127.0.0.1", port, "/api/incoming", "{}", &dir)
+        let err = http_post_json_retry("127.0.0.1", port, "/api/incoming", "{}", &dir, None)
             .await
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -3710,7 +3902,7 @@ mod tests {
     async fn post_verify_reject_short_circuits() {
         let (port, hits) = spawn_fixed_http("500 Internal Server Error", "boom").await;
         let dir = tmp_dir("verify-reject");
-        let out = post_verify_once("127.0.0.1", port, "fid", "{}", &dir).await;
+        let out = post_verify_once("127.0.0.1", port, "fid", "{}", &dir, None).await;
         assert!(matches!(out, VerifyPost::Rejected));
         assert_eq!(hits.load(Ordering::SeqCst), 1, "HTTP 判决不重试");
     }
@@ -3938,7 +4130,7 @@ mod tests {
         };
 
         // 第一次：段1 发 10 字节后静默 → idle(2s) 超时 → Interrupted（标记置位）
-        let mut sock1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut sock1 = tls_data_client(port).await;
         sock1.write_all(&header(1).to_bytes()).await.unwrap();
         sock1.write_all(&[0xAB; 10]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(2600)).await;
@@ -3955,9 +4147,15 @@ mod tests {
         // → 首块返回即须清标记推「传输中」；余下 37_856 字节不发，
         // 此刻段0 未 finish、任务未 complete——若清除只在 finish/complete，
         // 断言会失败（这正是真机分钟级卡「已中断」的窗口）。
-        let mut sock2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut sock2 = tls_data_client(port).await;
+        // TLS1.3：客户端 connect 可能先于服务端 accept 收尾返回；紧跟着写
+        // 数据会与握手尾巴竞争（实测服务端读不到，IdleTimeout 误伤）。
+        // 空一拍 + 显式 flush，让握手字节先行落线。
+        tokio::time::sleep(Duration::from_millis(100)).await;
         sock2.write_all(&header(0).to_bytes()).await.unwrap();
+        sock2.flush().await.unwrap();
         sock2.write_all(&vec![0xCDu8; STREAM_IO_BUF]).await.unwrap();
+        sock2.flush().await.unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut latest = TransferStatus::Interrupted;

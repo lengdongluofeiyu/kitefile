@@ -178,7 +178,32 @@ pub async fn http_post_json_tls_peer_fp(
     Ok((resp, server_fp))
 }
 
-fn server_name_for(host: &str) -> io::Result<rustls::pki_types::ServerName<'static>> {
+/// POST JSON over TLS，带服务端证书 pin（P4：出站控制面按
+/// 「目标 → trust → peers」解析出的指纹校验对端；`None` = accept-any，
+/// 配对流程与未接 trust 的测试路径同款语义）。
+pub async fn http_post_json_tls_pinned(
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &str,
+    receive_dir: &Path,
+    pinned_fp: Option<&str>,
+) -> io::Result<String> {
+    http_post_json_tls_with(
+        host,
+        port,
+        path,
+        body,
+        receive_dir,
+        pinned_fp,
+        timeouts::CONNECT_TIMEOUT,
+        timeouts::HTTP_RESPONSE_TIMEOUT,
+    )
+    .await
+}
+
+/// 主机 → TLS ServerName（IP 字面量 / 域名）。数据面 TLS 握手共用。
+pub fn server_name_for(host: &str) -> io::Result<rustls::pki_types::ServerName<'static>> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(rustls::pki_types::ServerName::IpAddress(ip.into()));
     }

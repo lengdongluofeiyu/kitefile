@@ -92,6 +92,8 @@ async fn run_daemon(allow_remote_admin: bool) -> anyhow::Result<()> {
         config.parallel_streams,
         config.receive_dir.clone(),
     ));
+    // 信任上下文（P4）：数据面成员校验 + 出站 pin；须在 spawn_receiver 之前
+    transfer.set_trust(discovery.devices_handle());
 
     Arc::clone(&transfer).spawn_receiver().await?;
     Arc::clone(&discovery).spawn_event_loop(tokio::runtime::Handle::current());
@@ -217,6 +219,8 @@ async fn send(ip: String, path: String) -> anyhow::Result<()> {
         config.parallel_streams,
         config.receive_dir.clone(),
     ));
+    // 信任上下文（P4）：数据面成员校验 + 出站 pin
+    transfer.set_trust(discovery.devices_handle());
 
     transfer.clone().spawn_receiver().await?;
     discovery.clone().spawn_event_loop(tokio::runtime::Handle::current());

@@ -407,6 +407,7 @@ pub struct PeerRecord {
 /// - 加载损坏文件 → 降级为空表 + warn（设计 §13：不 panic）
 /// - 写入 = 临时文件 + rename 原子替换（半写文件 = 配对表损坏，不可接受）
 /// - 鉴权查询按指纹线性扫（LAN 设备数个位数，建哈希索引是过度设计）
+#[derive(Debug)]
 pub struct PeersStore {
     path: PathBuf,
     map: RwLock<std::collections::HashMap<String, PeerRecord>>,
@@ -494,6 +495,31 @@ impl PeersStore {
         if let Err(e) = std::fs::rename(&tmp, &self.path) {
             warn!(error = %e, path = %self.path.display(), "peers.json 原子替换失败");
         }
+    }
+}
+
+/// 信任上下文（P4）：出站连接做证书 pin、数据面做成员校验时的共享视图。
+///
+/// - `peers`：**全进程唯一**的配对表实例（engine 创建、gateway 复用同一 Arc，
+///   撤销即时生效）
+/// - `devices`：discovery 的设备表（ip → device_id 解析——
+///   连接目标只有 IP，pin 需要先知道「这个 IP 是谁」）
+///
+/// 任何解析失败（设备不在线 / 未配对）→ `None` → 调用方退化为
+/// accept-any（配对流程、本机测试的 trust=None 路径同款语义）。
+pub struct TrustContext {
+    pub peers: Arc<PeersStore>,
+    pub devices: Arc<parking_lot::RwLock<std::collections::HashMap<String, crate::discovery::Device>>>,
+}
+
+impl TrustContext {
+    /// 目标 IP 对应的已配对指纹（设备表查 id → peers 查 fp）
+    pub fn fp_for_ip(&self, ip: &str) -> Option<String> {
+        let device_id = {
+            let map = self.devices.read();
+            map.values().find(|d| d.ip == ip).map(|d| d.id.clone())?
+        };
+        self.peers.get(&device_id).map(|r| r.fp_sha256)
     }
 }
 
