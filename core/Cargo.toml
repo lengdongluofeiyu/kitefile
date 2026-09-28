@@ -49,6 +49,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"
 anyhow = "1"
 
+# TLS（阶段 5 P1）：控制面 7880 / 数据面 7879 的加密与客户端证书认证。
+# ring 后端：纯 C/ASM 无 cmake，Android 交叉编译友好（aws-lc-rs 需要 cmake）。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+# 自签证书生成（Ed25519，首启一次）
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+# TLS accept 循环里逐连接喂给 axum Router（axum 0.7 的 serve 只吃 TcpListener）
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+tower = { version = "0.5", features = ["util"] }
+
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 # 注：bytes 与 dashmap 已移除，src/ 下零使用（当初按"大概会用到"先加的）。

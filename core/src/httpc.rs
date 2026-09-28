@@ -4,14 +4,20 @@
 //! connect 可无限阻塞、响应 `read_to_end` 可无限等待（对端收到请求但
 //! 不回包时整个调用方任务挂死）。合并到本模块后统一施加
 //! [`timeouts::CONNECT_TIMEOUT`] / [`timeouts::HTTP_RESPONSE_TIMEOUT`]。
+//!
+//! 阶段 5 P1 起，**所有跨机（LAN）调用一律走 `*_tls` 变体**：
+//! 明文版本只服务回环 / 测试场景。TLS 客户端加载 `receive_dir` 下的
+//! 本机身份证书（双向认证的客户端侧），P1 尚不做服务端 pin
+//! （peers 表与 pin 校验在 P3 接入，见 `docs/design-pairing-encryption.md`）。
 
 use crate::timeouts;
+use std::io;
+use std::path::Path;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use std::io;
-use std::time::Duration;
 
-/// POST JSON，返回响应体字符串。
+/// POST JSON，返回响应体字符串（明文；仅回环 / 测试）。
 ///
 /// 超时语义见 `timeouts` 模块：connect 上限 + 响应读取上限。
 pub async fn http_post_json(
@@ -43,13 +49,127 @@ pub async fn http_post_json_with(
     let mut stream = tokio::time::timeout(connect_timeout, TcpStream::connect((host, port)))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
+    let req = build_req(host, port, path, body);
+    stream.write_all(req.as_bytes()).await?;
+    stream.flush().await?;
+    read_response(stream, response_timeout).await
+}
+
+/// POST JSON over TLS（阶段 5 P1：跨机 HTTP 唯一入口）。
+///
+/// - `receive_dir`：加载 `identity_cert.pem` / `identity_key.pem`（本机身份）
+/// - `pinned_fp`：`Some` 时服务端证书必须匹配（P3 起由调用方传入）；
+///   P1 传 `None`——先加密、后认证
+pub async fn http_post_json_tls(
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &str,
+    receive_dir: &Path,
+) -> io::Result<String> {
+    http_post_json_tls_with(
+        host,
+        port,
+        path,
+        body,
+        receive_dir,
+        None,
+        timeouts::CONNECT_TIMEOUT,
+        timeouts::HTTP_RESPONSE_TIMEOUT,
+    )
+    .await
+}
+
+/// 可注入 pin 与超时的 TLS 实现（P3 pin 校验与测试用）。
+#[allow(clippy::too_many_arguments)]
+pub async fn http_post_json_tls_with(
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &str,
+    receive_dir: &Path,
+    pinned_fp: Option<&str>,
+    connect_timeout: Duration,
+    response_timeout: Duration,
+) -> io::Result<String> {
+    let mut stream =
+        tls_connect(host, port, receive_dir, pinned_fp, connect_timeout).await?;
+    let req = build_req(host, port, path, body);
+    stream.write_all(req.as_bytes()).await?;
+    stream.flush().await?;
+    read_response(stream, response_timeout).await
+}
+
+/// GET over TLS，返回响应体字符串（CLI 探测对端 whoami 用）。
+pub async fn http_get_tls(
+    host: &str,
+    port: u16,
+    path: &str,
+    receive_dir: &Path,
+    pinned_fp: Option<&str>,
+) -> io::Result<String> {
+    let mut stream = tls_connect(
+        host,
+        port,
+        receive_dir,
+        pinned_fp,
+        timeouts::CONNECT_TIMEOUT,
+    )
+    .await?;
     let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path, host, port, body.len(), body
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(req.as_bytes()).await?;
     stream.flush().await?;
+    read_response(stream, timeouts::HTTP_RESPONSE_TIMEOUT).await
+}
 
+/// 建立 TLS 连接（含握手超时）。
+async fn tls_connect(
+    host: &str,
+    port: u16,
+    receive_dir: &Path,
+    pinned_fp: Option<&str>,
+    connect_timeout: Duration,
+) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let identity = crate::tls::NodeIdentity::load_or_create(receive_dir)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("加载 TLS 身份失败: {e}")))?;
+    let client_cfg = crate::tls::client_config(&identity, pinned_fp)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS 客户端配置失败: {e}")))?;
+    let connector = tokio_rustls::TlsConnector::from(client_cfg);
+
+    let tcp = tokio::time::timeout(connect_timeout, TcpStream::connect((host, port)))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
+    let server_name = server_name_for(host)?;
+    tokio::time::timeout(connect_timeout, connector.connect(server_name, tcp))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tls handshake timeout"))?
+        // 握手失败按传输类错误（非 InvalidData——InvalidData 保留给
+        // 「对端应用层明确判决」，调用方靠 kind 区分离线 vs 被拒）
+        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, format!("tls: {e}")))
+}
+
+fn server_name_for(host: &str) -> io::Result<rustls::pki_types::ServerName<'static>> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(rustls::pki_types::ServerName::IpAddress(ip.into()));
+    }
+    rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid host {host}")))
+}
+
+fn build_req(host: &str, port: u16, path: &str, body: &str) -> String {
+    format!(
+        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path, host, port, body.len(), body
+    )
+}
+
+/// 读完整响应并拆出 body；非 2xx → `InvalidData`（与 transport 错误可区分）。
+async fn read_response<S>(mut stream: S, response_timeout: Duration) -> io::Result<String>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     let mut response = Vec::new();
     tokio::time::timeout(response_timeout, stream.read_to_end(&mut response))
         .await

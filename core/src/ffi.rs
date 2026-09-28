@@ -121,13 +121,24 @@ pub unsafe extern "C" fn kitefile_init(
     // 为什么要退避：Windows 上 Hyper-V / WSL / Docker 会动态保留成片 TCP
     // 端口，7878 可能正好落在保留区，bind 失败报 os error 10013，
     // 且保留区间每次开机都可能变 —— 症状是 daemon 间歇性起不来。
-    if let Some(p) = crate::pick_available_port(crate::GATEWAY_PORT_CANDIDATES) {
+    // 回环口（UI 用）按 127.0.0.1 探测，LAN TLS 口按 0.0.0.0 探测
+    if let Some(p) =
+        crate::pick_available_port_on("127.0.0.1", crate::GATEWAY_PORT_CANDIDATES)
+    {
         if p != config.gateway_port {
             warn!(from = config.gateway_port, to = p, "gateway port unavailable, fell back");
             config.gateway_port = p;
         }
     } else {
         warn!("no gateway port available; will try default and likely fail");
+    }
+    if let Some(p) = crate::pick_available_port(crate::LAN_TLS_PORT_CANDIDATES) {
+        if p != config.lan_tls_port {
+            warn!(from = config.lan_tls_port, to = p, "lan tls port unavailable, fell back");
+            config.lan_tls_port = p;
+        }
+    } else {
+        warn!("no lan tls port available; will try default and likely fail");
     }
     if let Some(p) = crate::pick_available_port(crate::TRANSFER_PORT_CANDIDATES) {
         if p != config.transfer_port {
@@ -149,10 +160,11 @@ pub unsafe extern "C" fn kitefile_init(
     let identity_path =
         Some(crate::discovery::identity_marker_path(&config.receive_dir));
 
+    // mDNS TXT 广播 LAN TLS 端口：对端拿它建跨机连接
     let discovery = match DiscoveryService::new(
         config.device_name.clone(),
         self_id.clone(),
-        config.gateway_port,
+        config.lan_tls_port,
         config.transfer_port,
         identity_path.clone(),
     ) {
@@ -201,10 +213,9 @@ pub unsafe extern "C" fn kitefile_init(
     let gateway_discovery = ctx.discovery.clone();
     let gateway_transfer = ctx.transfer.clone();
     let gateway_config = ctx.config.clone();
-    let port = ctx.config.gateway_port;
     runtime_handle.spawn(async move {
         let gateway = HttpGateway::new(gateway_discovery, gateway_transfer, gateway_config);
-        if let Err(e) = gateway.run(port).await {
+        if let Err(e) = gateway.run().await {
             error!("gateway run failed: {}", e);
         }
     });
@@ -231,7 +242,9 @@ pub unsafe extern "C" fn kitefile_whoami_json() -> *const c_char {
         "id": ctx.discovery.self_id(),
         "name": ctx.discovery.self_name(),
         "platform": crate::platform::platform_name(),
+        // 本机 UI 走回环明文口；跨机对端走 lan_tls_port（mDNS/whoami 广告的也是它）
         "gateway_port": ctx.config.gateway_port,
+        "lan_tls_port": ctx.config.lan_tls_port,
         "transfer_port": ctx.config.transfer_port,
     });
     store(&LAST, CString::new(me.to_string()).unwrap_or_default())
@@ -290,7 +303,9 @@ pub unsafe extern "C" fn kitefile_send_file(
     let self_id = ctx.discovery.self_id().to_string();
     let self_name = ctx.discovery.self_name().to_string();
     let self_ip = ctx.discovery.self_ip().unwrap_or_else(|| "127.0.0.1".into());
-    let target_gateway_port = config.gateway_port;
+    // 目标是跨机设备：默认按对端同款 LAN TLS 端口试（与旧版"两端同配置"
+    // 的假设一致；端口退避差异由 mDNS TXT / whoami 覆盖的路径处理）
+    let target_gateway_port = config.lan_tls_port;
 
     // FFI 同步返回：spawn 到 runtime 后通过 channel 拿回 file_id，
     // 传输在后台进行，进度通过 gateway 的 /api/transfers 与 /ws/progress 查询。
@@ -307,7 +322,8 @@ pub unsafe extern "C" fn kitefile_send_file(
                 self_id,
                 self_name,
                 self_ip,
-                config.gateway_port,
+                // 对端回包地址：本机 LAN TLS 口（回环口对端不可达）
+                config.lan_tls_port,
                 // FFI 层是"一次发一个文件"的入口，批量由 UI 走 HTTP /api/send，
                 // 所以这里永远按单文件处理。
                 None,

@@ -19,6 +19,7 @@ pub mod ffi;
 pub mod timeouts;
 pub mod fault;
 pub mod httpc;
+pub mod tls;
 
 pub use discovery::{Device, DeviceId, DiscoveryService};
 pub use transfer::{TransferEngine, TransferHandle, TransferProgress, TransferStatus};
@@ -47,8 +48,14 @@ pub type Result<T> = std::result::Result<T, CoreError>;
 pub struct EngineConfig {
     /// 设备显示名
     pub device_name: String,
-    /// HTTP 网关监听端口（默认 7878，Web 前端访问）
+    /// HTTP 网关监听端口（默认 7878）。
+    ///
+    /// 阶段 5 P1 起**只绑 127.0.0.1**：本机 UI / WS 走明文回环；
+    /// 局域网跨机流量一律走 `lan_tls_port`（TLS）。
     pub gateway_port: u16,
+    /// 局域网 TLS 控制面端口（默认 7880，绑 0.0.0.0，HTTPS + 客户端证书）。
+    /// mDNS TXT 的 `gateway_port` 广播的是这个端口，对端拿它建连。
+    pub lan_tls_port: u16,
     /// TCP 传输端口（默认 7879）
     pub transfer_port: u16,
     /// 并行流数量上限（默认 = CPU 核数，封顶 8）。
@@ -77,6 +84,7 @@ impl Default for EngineConfig {
         Self {
             device_name: format!("{}-{}", whoami_fallback(), rand_short()),
             gateway_port: 7878,
+            lan_tls_port: 7880,
             transfer_port: 7879,
             parallel_streams,
             receive_dir: crate::platform::default_receive_dir(),
@@ -85,7 +93,7 @@ impl Default for EngineConfig {
     }
 }
 
-/// HTTP 网关端口候选（首选 + 备选）
+/// HTTP 网关端口候选（首选 + 备选）——**回环明文口**
 ///
 /// 为什么不能只认一个端口：Windows 上 Hyper-V / WSL / Docker 会**动态保留**
 /// 成片 TCP 端口，用
@@ -96,6 +104,9 @@ impl Default for EngineConfig {
 /// 有时 daemon 起得来，有时起不来，很容易误判成别的问题。
 pub const GATEWAY_PORT_CANDIDATES: &[u16] = &[7878, 17878, 27878];
 
+/// 局域网 TLS 控制面端口候选（与上面一一对应：同下标表示同一次退避）
+pub const LAN_TLS_PORT_CANDIDATES: &[u16] = &[7880, 17880, 27880];
+
 /// TCP 数据通道端口候选（与上面一一对应）
 pub const TRANSFER_PORT_CANDIDATES: &[u16] = &[7879, 17879, 27879];
 
@@ -104,8 +115,15 @@ pub const TRANSFER_PORT_CANDIDATES: &[u16] = &[7879, 17879, 27879];
 /// 注意这是"先探再绑"，两者之间理论上有竞态；本机启动瞬间窗口极小，
 /// 而且真撞上了也只是退化成启动失败并记 error，不会静默出错。
 pub fn pick_available_port(candidates: &[u16]) -> Option<u16> {
+    pick_available_port_on("0.0.0.0", candidates)
+}
+
+/// 指定绑定地址的版本：回环口用 `127.0.0.1` 探测（与实际 bind 一致），
+/// LAN 口用 `0.0.0.0`。绑错地址探测会得出错误的可用性结论
+/// （0.0.0.0:7878 被占不等于 127.0.0.1:7878 被占）。
+pub fn pick_available_port_on(ip: &str, candidates: &[u16]) -> Option<u16> {
     for &p in candidates {
-        if std::net::TcpListener::bind(("0.0.0.0", p)).is_ok() {
+        if std::net::TcpListener::bind((ip, p)).is_ok() {
             return Some(p);
         }
     }
@@ -143,9 +161,10 @@ mod tests {
 
     #[test]
     fn port_candidate_lists_are_same_length() {
-        // gateway 与 transfer 的候选一一对应，少了任何一个都会让退避后
-        // 两个端口错配（一端通告 7878/17879 这种组合）
+        // gateway / lan_tls / transfer 的候选一一对应，少了任何一个都会让
+        // 退避后端口错配（如通告 17878 却探 7880 的组合）
         assert_eq!(GATEWAY_PORT_CANDIDATES.len(), TRANSFER_PORT_CANDIDATES.len());
+        assert_eq!(GATEWAY_PORT_CANDIDATES.len(), LAN_TLS_PORT_CANDIDATES.len());
     }
 }
 

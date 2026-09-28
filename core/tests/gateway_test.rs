@@ -88,6 +88,12 @@ async fn start_stack(
 }
 
 /// 同 start_stack，但可指定是否放开「仅本机」接口（用于验证访问分级）
+///
+/// 端口约定（阶段 5 P1 双监听）：
+/// - `gw_port` → 回环明文口（本机 UI / 测试的 `http_*` 助手打这里）
+/// - `gw_port+…` 不用；LAN TLS 口 = `tr_port + 1000`（与 (gw, tr) 固定错开，
+///   避免与其它用例的固定端口在并行下相撞）
+/// - 跨机流量（引擎互发 offer、远程策略用例）打 LAN TLS 口
 async fn start_stack_with(
     gw_port: u16,
     tr_port: u16,
@@ -95,9 +101,11 @@ async fn start_stack_with(
     parallel: usize,
     allow_remote_admin: bool,
 ) -> Arc<TransferEngine> {
+    let lan_port = tr_port + 1000;
     let config = EngineConfig {
         device_name: format!("test-{}", gw_port),
         gateway_port: gw_port,
+        lan_tls_port: lan_port,
         transfer_port: tr_port,
         parallel_streams: parallel,
         receive_dir: recv_dir.to_path_buf(),
@@ -113,7 +121,7 @@ async fn start_stack_with(
 
     let gateway = HttpGateway::new(discovery, transfer.clone(), Arc::new(config));
     tokio::spawn(async move {
-        let _ = gateway.run(gw_port).await;
+        let _ = gateway.run().await;
     });
 
     // 等 gateway 就绪
@@ -167,6 +175,61 @@ async fn http_json(port: u16, method: &str, path: &str, body: Option<&str>) -> V
     let (status, body) = http(port, method, path, body).await;
     assert!(status == 200, "expected 200, got {status} for {method} {path}");
     serde_json::from_slice(&body).unwrap_or(Value::Null)
+}
+
+/// 测试身份（TLS 客户端出示用；进程内加载一次）
+fn test_identity() -> std::sync::Arc<kitefile::tls::NodeIdentity> {
+    static ID: std::sync::OnceLock<std::sync::Arc<kitefile::tls::NodeIdentity>> =
+        std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let base = std::env::var("FTCORE_TEST_TMP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        kitefile::tls::NodeIdentity::load_or_create(&base.join("kitefile-gw-test-identity"))
+            .expect("test identity")
+    })
+    .clone()
+}
+
+/// TLS 版 `http_to`：打局域网 TLS 口（阶段 5 P1）。返回 (status, body_bytes)。
+async fn https_to(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> (u16, Vec<u8>) {
+    let cfg = kitefile::tls::client_config(&test_identity(), None).unwrap();
+    let connector = tokio_rustls::TlsConnector::from(cfg);
+    let tcp = tokio::net::TcpStream::connect((host, port)).await.unwrap();
+    let ip: std::net::IpAddr = host.parse().unwrap();
+    let name = rustls::pki_types::ServerName::IpAddress(ip.into());
+    let mut stream = connector.connect(name, tcp).await.unwrap();
+
+    let body_bytes = body.map(|b| b.as_bytes().to_vec()).unwrap_or_default();
+    let req = format!(
+        "{} {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        method, path, host, port, body_bytes.len()
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut stream, req.as_bytes())
+        .await
+        .unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &body_bytes)
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut resp)
+        .await
+        .unwrap();
+
+    let text = String::from_utf8_lossy(&resp);
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body_start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(resp.len());
+    (status, resp[body_start..].to_vec())
 }
 
 /// 生成确定性伪随机内容
@@ -405,7 +468,7 @@ async fn test_concurrent_multi_file_transfers() {
         let send_body = json!({
             "target_ip": "127.0.0.1",
             "target_port": 18161,
-            "target_gateway_port": 18061,
+            "target_gateway_port": 19161,
             "file_path": src.to_string_lossy(),
         })
         .to_string();
@@ -473,7 +536,7 @@ async fn test_cancel_after_completion_keeps_terminal_state() {
     let send_body = json!({
         "target_ip": "127.0.0.1",
         "target_port": 18171,
-        "target_gateway_port": 18071,
+        "target_gateway_port": 19171,
         "file_path": src.to_string_lossy(),
     })
     .to_string();
@@ -740,7 +803,7 @@ async fn test_full_transfer_flow() {
     let send_body = json!({
         "target_ip": "127.0.0.1",
         "target_port": 18111,
-        "target_gateway_port": 18011,
+        "target_gateway_port": 19111,
         "file_path": src.to_string_lossy(),
     })
     .to_string();
@@ -833,7 +896,7 @@ async fn test_reject_flow() {
     let send_body = json!({
         "target_ip": "127.0.0.1",
         "target_port": 18113,
-        "target_gateway_port": 18013,
+        "target_gateway_port": 19113,
         "file_path": src.to_string_lossy(),
     })
     .to_string();
@@ -893,7 +956,7 @@ async fn test_cancel_while_pending() {
     let send_body = json!({
         "target_ip": "127.0.0.1",
         "target_port": 18115,
-        "target_gateway_port": 18015,
+        "target_gateway_port": 19115,
         "file_path": src.to_string_lossy(),
     })
     .to_string();
@@ -952,7 +1015,7 @@ async fn test_receiver_cancel_notifies_sender() {
     let send_body = json!({
         "target_ip": "127.0.0.1",
         "target_port": 18117,
-        "target_gateway_port": 18017,
+        "target_gateway_port": 19117,
         "file_path": src.to_string_lossy(),
     })
     .to_string();
@@ -1270,21 +1333,23 @@ async fn test_remote_access_blocked_by_policy() {
     };
     // 探测必须在 start_stack 之后：网关还没监听时 connect 必然失败，
     // 放在前面会让这个测试永远走 SKIP 分支，等于没跑。
+    // 远程面 = LAN TLS 口（tr+1000）；回环口对非回环地址不可达。
     let dir = temp_dir("remote-policy");
     let _s = start_stack(18030, 18130, &dir, 2).await;
+    let lan = 18130 + 1000;
 
-    if tokio::net::TcpStream::connect((ip.as_str(), 18030)).await.is_err() {
+    if tokio::net::TcpStream::connect((ip.as_str(), lan)).await.is_err() {
         eprintln!("SKIP test_remote_access_blocked_by_policy: 无法从 {ip} 连到网关");
         let _ = std::fs::remove_dir_all(&dir);
         return;
     }
 
     // Remote 档：放行
-    let (status, _) = http_to(&ip, 18030, "GET", "/api/whoami", None).await;
+    let (status, _) = https_to(&ip, lan, "GET", "/api/whoami", None).await;
     assert_eq!(status, 200, "whoami 是只读信息，应允许远程访问");
 
     // LocalOnly 档：拒绝，且提示里带开关名，方便用户自助排查
-    let (status, body) = http_to(&ip, 18030, "GET", "/api/transfers", None).await;
+    let (status, body) = https_to(&ip, lan, "GET", "/api/transfers", None).await;
     assert_eq!(status, 403, "transfers 应拒绝远程访问");
     assert!(
         String::from_utf8_lossy(&body).contains("--remote-admin"),
@@ -1293,9 +1358,9 @@ async fn test_remote_access_blocked_by_policy() {
     );
 
     // 同一路径不同方法，档位不同
-    let (status, _) = http_to(&ip, 18030, "GET", "/api/incoming", None).await;
+    let (status, _) = https_to(&ip, lan, "GET", "/api/incoming", None).await;
     assert_eq!(status, 403, "GET /api/incoming 是本机 UI 拉收件箱");
-    let (status, _) = http_to(&ip, 18030, "POST", "/api/incoming", Some("{}")).await;
+    let (status, _) = https_to(&ip, lan, "POST", "/api/incoming", Some("{}")).await;
     assert_ne!(status, 403, "POST /api/incoming 是对端发 offer 的入口，不能拒");
 
     // 本机访问不被误伤（回环地址一律放行）
@@ -1319,17 +1384,18 @@ async fn test_remote_admin_opens_local_only_routes() {
     };
     let dir = temp_dir("remote-admin-on");
     let _s = start_stack_with(18031, 18131, &dir, 2, true).await;
+    let lan = 18131 + 1000;
 
-    if tokio::net::TcpStream::connect((ip.as_str(), 18031)).await.is_err() {
+    if tokio::net::TcpStream::connect((ip.as_str(), lan)).await.is_err() {
         eprintln!("SKIP test_remote_admin_opens_local_only_routes: 无法从 {ip} 连到网关");
         let _ = std::fs::remove_dir_all(&dir);
         return;
     }
 
-    let (status, _) = http_to(&ip, 18031, "GET", "/api/transfers", None).await;
+    let (status, _) = https_to(&ip, lan, "GET", "/api/transfers", None).await;
     assert_eq!(status, 200, "开了 --remote-admin 后应放行");
 
-    let (status, _) = http_to(&ip, 18031, "GET", "/api/files", None).await;
+    let (status, _) = https_to(&ip, lan, "GET", "/api/files", None).await;
     assert_eq!(status, 200);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -1358,7 +1424,7 @@ async fn test_stream_count_negotiated_across_peers() {
     let send_body = json!({
         "target_ip": "127.0.0.1",
         "target_port": 18141,
-        "target_gateway_port": 18041,
+        "target_gateway_port": 19141,
         "file_path": src.to_string_lossy(),
     })
     .to_string();

@@ -18,7 +18,7 @@
 //! 后续可按平台用 cfg 切到 sendfile/TransmitFile 等优化。
 
 use crate::fault::{from_io, FailureKind, Phase, TransferFailure};
-use crate::httpc::http_post_json;
+use crate::httpc::http_post_json_tls;
 use crate::protocol::{
     compute_stream_count, stream_layout, HttpIncomingResponse, HttpOffer, IncomingEntry, StreamHeader,
 };
@@ -591,9 +591,12 @@ impl TransferEngine {
             self.outgoing_endpoints.lock().await.remove(file_id)
         {
             let file_id_owned = file_id.to_string();
+            let receive_dir = self.receive_dir.clone();
             tokio::spawn(async move {
                 let path = format!("/api/cancel/{}", file_id_owned);
-                if let Err(e) = http_post_json(&target_ip, target_gateway_port, &path, "{}").await
+                if let Err(e) =
+                    http_post_json_tls(&target_ip, target_gateway_port, &path, "{}", &receive_dir)
+                        .await
                 {
                     warn!(error = %e, "notify receiver cancel failed");
                 }
@@ -655,9 +658,17 @@ impl TransferEngine {
                 self.incoming_endpoints.lock().await.remove(file_id)
             {
                 let file_id_owned = file_id.to_string();
+                let receive_dir = self.receive_dir.clone();
                 tokio::spawn(async move {
                     let path = format!("/api/cancel/{}", file_id_owned);
-                    if let Err(e) = http_post_json(&from_ip, from_gateway_port, &path, "{}").await
+                    if let Err(e) = http_post_json_tls(
+                        &from_ip,
+                        from_gateway_port,
+                        &path,
+                        "{}",
+                        &receive_dir,
+                    )
+                    .await
                     {
                         warn!(error = %e, "notify sender cancel failed");
                     }
@@ -1347,6 +1358,7 @@ impl TransferEngine {
                     target_gateway_port,
                     "/api/incoming",
                     &offer_json,
+                    &engine.receive_dir,
                 )
                 .await
             };
@@ -1515,11 +1527,12 @@ impl TransferEngine {
         // 不空烧数据面、不进入「继续→又中断」死循环；通知网络失败则继续，
         // 交由数据面重试自行判定（可能只是瞬时网络问题）。
         if is_resume {
-            let notify = http_post_json(
+            let notify = http_post_json_tls(
                 &snap.target_ip,
                 snap.target_gateway_port,
                 &format!("/api/peer-resumed/{}", file_id),
                 "{}",
+                &self.receive_dir,
             )
             .await;
             match notify {
@@ -1651,6 +1664,7 @@ impl TransferEngine {
                     &body,
                     &mut snap.cancel_rx,
                     &self.verify_backoff,
+                    &self.receive_dir,
                 )
                 .await;
                 if *snap.cancel_rx.borrow() {
@@ -1792,11 +1806,12 @@ impl TransferEngine {
 
         // 本机先回到「传输中」，再通知对端续传
         self.on_peer_resumed(file_id).await;
-        let res = http_post_json(
+        let res = http_post_json_tls(
             &peer_ip,
             peer_port,
             &format!("/api/peer-resume/{}", file_id),
             "{}",
+            &self.receive_dir,
         )
         .await;
         if let Err(e) = res {
@@ -2449,8 +2464,22 @@ enum VerifyPost {
 }
 
 /// 单次 POST /api/verify（不重试；轮询节奏由 [`negotiate_verify`] 统一管）。
-async fn post_verify_once(host: &str, port: u16, file_id: &str, body: &str) -> VerifyPost {
-    match http_post_json(host, port, &format!("/api/verify/{}", file_id), body).await {
+async fn post_verify_once(
+    host: &str,
+    port: u16,
+    file_id: &str,
+    body: &str,
+    receive_dir: &std::path::Path,
+) -> VerifyPost {
+    match http_post_json_tls(
+        host,
+        port,
+        &format!("/api/verify/{}", file_id),
+        body,
+        receive_dir,
+    )
+    .await
+    {
         Ok(r) => VerifyPost::Receipt(r),
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
             warn!(error = %e, "verify rejected by peer");
@@ -2480,6 +2509,7 @@ async fn negotiate_verify(
     body: &str,
     cancel_rx: &mut watch::Receiver<bool>,
     backoff: &[Duration],
+    receive_dir: &std::path::Path,
 ) -> VerifyNegotiation {
     let mut saw_pending: Option<Vec<bool>> = None;
     for (i, wait) in backoff.iter().enumerate() {
@@ -2492,7 +2522,7 @@ async fn negotiate_verify(
                 break;
             }
         }
-        match post_verify_once(host, port, file_id, body).await {
+        match post_verify_once(host, port, file_id, body, receive_dir).await {
             VerifyPost::Receipt(receipt) => match parse_verify_result(&receipt) {
                 Some(VerifyOutcome::Finalized) | Some(VerifyOutcome::Missing) => {
                     return VerifyNegotiation::Finalized;
@@ -2584,6 +2614,7 @@ async fn http_post_json_retry(
     port: u16,
     path: &str,
     body: &str,
+    receive_dir: &std::path::Path,
 ) -> std::io::Result<String> {
     const ATTEMPTS: u32 = 3;
     const BACKOFF_MS: [u64; 3] = [0, 300, 800];
@@ -2593,7 +2624,7 @@ async fn http_post_json_retry(
         if backoff > 0 {
             tokio::time::sleep(Duration::from_millis(backoff)).await;
         }
-        match http_post_json(host, port, path, body).await {
+        match http_post_json_tls(host, port, path, body, receive_dir).await {
             Ok(r) => return Ok(r),
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                 // 对端明确 HTTP 拒绝（如协议版本 400）：再试结果一样，
@@ -3415,7 +3446,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 极简 HTTP 服务：回固定状态行与 body，统计命中次数。
+    /// 测试用服务端 TLS 配置（接受任意客户端证书；进程内每个测试目录
+    /// 各自加载一次身份，`load_or_create` 幂等）。
+    fn test_server_tls_cfg() -> Arc<rustls::ServerConfig> {
+        let base = std::env::var("FTCORE_TEST_TMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let id = crate::tls::NodeIdentity::load_or_create(&base.join("kitefile-test-identity"))
+            .expect("test identity");
+        crate::tls::server_config(&id).expect("test tls server config")
+    }
+
+    /// 极简 **TLS** HTTP 服务：回固定状态行与 body，统计命中次数。
+    ///
+    /// 阶段 5 P1 起跨机 HTTP 一律走 TLS，测试对端也必须是 TLS 才能被
+    /// `http_post_json_tls` 打到。
     async fn spawn_fixed_http(
         status: &'static str,
         body: &'static str,
@@ -3423,7 +3468,7 @@ mod tests {
         spawn_scripted_http(vec![(status, body)]).await
     }
 
-    /// 极简 HTTP 服务：按命中序号返回 `responses[i]`（超出取最后一项）。
+    /// 极简 TLS HTTP 服务：按命中序号返回 `responses[i]`（超出取最后一项）。
     async fn spawn_scripted_http(
         responses: Vec<(&'static str, &'static str)>,
     ) -> (u16, Arc<std::sync::atomic::AtomicU32>) {
@@ -3431,14 +3476,19 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let hits2 = hits.clone();
+        let acceptor = tokio_rustls::TlsAcceptor::from(test_server_tls_cfg());
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
+                let Ok((tcp, _)) = listener.accept().await else {
                     break;
                 };
+                let acceptor = acceptor.clone();
                 let hits = hits2.clone();
                 let responses = responses.clone();
                 tokio::spawn(async move {
+                    let Ok(mut sock) = acceptor.accept(tcp).await else {
+                        return;
+                    };
                     let mut buf = [0u8; 4096];
                     let _ = sock.read(&mut buf).await;
                     let idx = hits.fetch_add(1, Ordering::SeqCst) as usize;
@@ -3451,6 +3501,9 @@ mod tests {
                         body.len()
                     );
                     let _ = sock.write_all(resp.as_bytes()).await;
+                    // 必须优雅关闭：不发 close_notify 的裸 TCP FIN 会让
+                    // rustls 客户端报 UnexpectedEof，body 到了也读不出来
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut sock).await;
                 });
             }
         });
@@ -3570,7 +3623,8 @@ mod tests {
     #[tokio::test]
     async fn offer_retry_short_circuits_on_http_rejection() {
         let (port, hits) = spawn_fixed_http("400 Bad Request", "bad").await;
-        let err = http_post_json_retry("127.0.0.1", port, "/api/incoming", "{}")
+        let dir = tmp_dir("retry-400");
+        let err = http_post_json_retry("127.0.0.1", port, "/api/incoming", "{}", &dir)
             .await
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -3655,7 +3709,8 @@ mod tests {
     #[tokio::test]
     async fn post_verify_reject_short_circuits() {
         let (port, hits) = spawn_fixed_http("500 Internal Server Error", "boom").await;
-        let out = post_verify_once("127.0.0.1", port, "fid", "{}").await;
+        let dir = tmp_dir("verify-reject");
+        let out = post_verify_once("127.0.0.1", port, "fid", "{}", &dir).await;
         assert!(matches!(out, VerifyPost::Rejected));
         assert_eq!(hits.load(Ordering::SeqCst), 1, "HTTP 判决不重试");
     }

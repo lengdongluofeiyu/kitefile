@@ -1,4 +1,4 @@
-﻿# KiteFile 一键构建脚本
+# KiteFile 一键构建脚本
 #
 # 用法：
 #   .\scripts\build-all.ps1                    # 全量构建
@@ -109,6 +109,14 @@ if (-not $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER -and $env:ANDROID_HOME) 
             }
             if ($clang) {
                 $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = $clang
+                # ring/rustls 的 cc-rs 还需要 C 编译器与归档器（阶段 5 P1 引入
+                # TLS 依赖后新增；只设 LINKER 会在 ring build script 报
+                # "failed to find tool clang.exe"）
+                if (-not $env:CC_aarch64_linux_android) { $env:CC_aarch64_linux_android = $clang }
+                if (-not $env:AR_aarch64_linux_android) {
+                    $llvmAr = Join-Path (Split-Path -Parent $clang) 'llvm-ar.exe'
+                    if (Test-Path $llvmAr) { $env:AR_aarch64_linux_android = $llvmAr }
+                }
                 Write-Host "[env] NDK linker = $clang" -ForegroundColor DarkGray
             }
         }

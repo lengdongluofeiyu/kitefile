@@ -47,16 +47,26 @@ async fn run_daemon(allow_remote_admin: bool) -> anyhow::Result<()> {
     // Docker 会动态保留成片端口），bind 失败报 os error 10013。
     // 必须在构造 discovery / transfer 之前定下来——mDNS 的 TXT 会把实际端口
     // 广播出去，对端靠它建连。
-    let gateway_port = kitefile::pick_available_port(kitefile::GATEWAY_PORT_CANDIDATES)
-        .unwrap_or_else(|| os_pick_port(config.gateway_port));
+    // 回环口（UI 用）按 127.0.0.1 探测，LAN TLS 口按 0.0.0.0 探测，
+    // 与实际 bind 地址一致（P1 端口重划）。
+    let gateway_port =
+        kitefile::pick_available_port_on("127.0.0.1", kitefile::GATEWAY_PORT_CANDIDATES)
+            .unwrap_or_else(|| os_pick_port(config.gateway_port));
+    let lan_tls_port = kitefile::pick_available_port(kitefile::LAN_TLS_PORT_CANDIDATES)
+        .unwrap_or_else(|| os_pick_port(config.lan_tls_port));
     let transfer_port = kitefile::pick_available_port(kitefile::TRANSFER_PORT_CANDIDATES)
         .unwrap_or_else(|| os_pick_port(config.transfer_port));
-    if gateway_port != config.gateway_port || transfer_port != config.transfer_port {
+    if gateway_port != config.gateway_port
+        || lan_tls_port != config.lan_tls_port
+        || transfer_port != config.transfer_port
+    {
         warn!(
             gateway_port,
+            lan_tls_port,
             transfer_port, "default ports unavailable, fell back"
         );
         config.gateway_port = gateway_port;
+        config.lan_tls_port = lan_tls_port;
         config.transfer_port = transfer_port;
     }
 
@@ -68,10 +78,11 @@ async fn run_daemon(allow_remote_admin: bool) -> anyhow::Result<()> {
     );
     config.device_name = identity.name.clone();
 
+    // mDNS TXT 广播的是 LAN TLS 端口：对端拿它建跨机连接
     let discovery = Arc::new(kitefile::DiscoveryService::new(
         config.device_name.clone(),
         identity.id,
-        config.gateway_port,
+        config.lan_tls_port,
         config.transfer_port,
         Some(kitefile::discovery::identity_marker_path(&config.receive_dir)),
     )?);
@@ -86,7 +97,7 @@ async fn run_daemon(allow_remote_admin: bool) -> anyhow::Result<()> {
     Arc::clone(&discovery).spawn_event_loop(tokio::runtime::Handle::current());
 
     let gateway = kitefile::HttpGateway::new(discovery, transfer, Arc::new(config.clone()));
-    gateway.run(config.gateway_port).await?;
+    gateway.run().await?;
     Ok(())
 }
 
@@ -96,7 +107,7 @@ async fn list_devices() -> anyhow::Result<()> {
     let discovery = Arc::new(kitefile::DiscoveryService::new(
         config.device_name,
         self_id,
-        config.gateway_port,
+        config.lan_tls_port,
         config.transfer_port,
         None, // 一次性查询实例，无需身份持久化
     )?);
@@ -118,30 +129,26 @@ async fn list_devices() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 选一个空闲端口：优先 preferred，被占用时依次尝试备选
-/// 一次极简 HTTP GET，只取响应体。失败一律返回 None（调用方继续试下一个端口）。
-async fn http_get_body(host: &str, port: u16, path: &str) -> Option<String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = tokio::net::TcpStream::connect((host, port)).await.ok()?;
-    let req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
-        path, host, port
-    );
-    s.write_all(req.as_bytes()).await.ok()?;
-    s.flush().await.ok()?;
-    let mut resp = Vec::new();
-    s.read_to_end(&mut resp).await.ok()?;
-    let text = String::from_utf8_lossy(&resp).to_string();
-    Some(text.split("\r\n\r\n").nth(1)?.to_string())
+/// 一次 TLS HTTP GET，只取响应体。失败一律返回 None（调用方继续试下一个端口）。
+async fn http_get_body(
+    host: &str,
+    port: u16,
+    path: &str,
+    receive_dir: &std::path::Path,
+) -> Option<String> {
+    kitefile::httpc::http_get_tls(host, port, path, receive_dir, None)
+        .await
+        .ok()
 }
 
 /// 探测对端真实在用的一对端口。
 ///
-/// 对端可能因为默认端口被系统保留而退避到备选，所以不能假定 7878/7879。
-/// 依次试候选 gateway 端口，命中后从 whoami 响应里读出它实际通告的端口。
-async fn probe_peer_ports(ip: &str) -> anyhow::Result<(u16, u16)> {
-    for &p in kitefile::GATEWAY_PORT_CANDIDATES {
-        let Some(body) = http_get_body(ip, p, "/api/whoami").await else {
+/// 对端可能因为默认端口被系统保留而退避到备选，所以不能假定 7880/7879。
+/// 依次试候选 **LAN TLS** 端口（回环口对端不可达），命中后从 whoami 响应里
+/// 读出它实际通告的端口。
+async fn probe_peer_ports(ip: &str, receive_dir: &std::path::Path) -> anyhow::Result<(u16, u16)> {
+    for &p in kitefile::LAN_TLS_PORT_CANDIDATES {
+        let Some(body) = http_get_body(ip, p, "/api/whoami", receive_dir).await else {
             continue;
         };
         let Ok(j) = serde_json::from_str::<serde_json::Value>(&body) else {
@@ -157,7 +164,7 @@ async fn probe_peer_ports(ip: &str) -> anyhow::Result<(u16, u16)> {
     }
     Err(anyhow::anyhow!(
         "peer {ip} 在候选端口 {:?} 上都没有响应，确认对端 daemon 已启动且在同一网段",
-        kitefile::GATEWAY_PORT_CANDIDATES
+        kitefile::LAN_TLS_PORT_CANDIDATES
     ))
 }
 
@@ -176,24 +183,32 @@ async fn send(ip: String, path: String) -> anyhow::Result<()> {
     // 因此拉起完整栈：discovery + receiver + gateway。
     // 若本机已有 daemon 占用默认端口，则退避到备选端口。
     // 退避：CLI 常和常驻 daemon 同时存在，两边都要能起得来
-    let gateway_port = kitefile::pick_available_port(kitefile::GATEWAY_PORT_CANDIDATES)
-        .unwrap_or_else(|| os_pick_port(config.gateway_port));
+    let gateway_port =
+        kitefile::pick_available_port_on("127.0.0.1", kitefile::GATEWAY_PORT_CANDIDATES)
+            .unwrap_or_else(|| os_pick_port(config.gateway_port));
+    let lan_tls_port = kitefile::pick_available_port(kitefile::LAN_TLS_PORT_CANDIDATES)
+        .unwrap_or_else(|| os_pick_port(config.lan_tls_port));
     let transfer_port = kitefile::pick_available_port(kitefile::TRANSFER_PORT_CANDIDATES)
         .unwrap_or_else(|| os_pick_port(config.transfer_port));
-    if gateway_port != config.gateway_port || transfer_port != config.transfer_port {
+    if gateway_port != config.gateway_port
+        || lan_tls_port != config.lan_tls_port
+        || transfer_port != config.transfer_port
+    {
         warn!(
             gateway_port,
+            lan_tls_port,
             transfer_port, "default ports unavailable, fell back"
         );
     }
     config.gateway_port = gateway_port;
+    config.lan_tls_port = lan_tls_port;
     config.transfer_port = transfer_port;
 
     let self_id = format!("cli-{}", uuid::Uuid::new_v4().simple());
     let discovery = Arc::new(kitefile::DiscoveryService::new(
         config.device_name.clone(),
         self_id.clone(),
-        gateway_port,
+        lan_tls_port,
         transfer_port,
         None, // 一次性 CLI 发送，临时身份即可
     )?);
@@ -209,7 +224,7 @@ async fn send(ip: String, path: String) -> anyhow::Result<()> {
     // gateway 后台运行（主要用途：接收 /api/incoming-resp 回包）
     let gateway = kitefile::HttpGateway::new(discovery.clone(), transfer.clone(), Arc::new(config.clone()));
     tokio::spawn(async move {
-        if let Err(e) = gateway.run(gateway_port).await {
+        if let Err(e) = gateway.run().await {
             tracing::error!(error = %e, "gateway exited");
         }
     });
@@ -217,9 +232,10 @@ async fn send(ip: String, path: String) -> anyhow::Result<()> {
     // 回包地址必须是真实本机 IP（不能用 127.0.0.1，跨机时对端无法回包）
     let self_ip = discovery.self_ip().unwrap_or_else(|| "127.0.0.1".into());
 
-    // 对端端口**不能写死 7879**：它也可能因为默认端口被系统保留而退避过。
-    // 依次试候选 gateway 端口，从 /api/whoami 里读它真实在用的端口。
-    let (peer_gateway_port, peer_transfer_port) = probe_peer_ports(&ip).await?;
+    // 对端端口**不能写死**：它也可能因为默认端口被系统保留而退避过。
+    // 依次试候选 LAN TLS 端口，从 /api/whoami 里读它真实在用的端口。
+    let (peer_gateway_port, peer_transfer_port) =
+        probe_peer_ports(&ip, &config.receive_dir).await?;
     info!(
         peer = %ip,
         gateway_port = peer_gateway_port,
@@ -237,7 +253,8 @@ async fn send(ip: String, path: String) -> anyhow::Result<()> {
             self_id,
             config.device_name.clone(),
             self_ip,
-            gateway_port,
+            // 对端回包走本机的 LAN TLS 口（回环口对端不可达）
+            lan_tls_port,
             // CLI 一次只发一个文件，不涉及批次
             None,
         )

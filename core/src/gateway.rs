@@ -40,7 +40,7 @@
 //! （取不到时按非本机处理，会让本机 UI 全部 403）。
 
 use crate::discovery::DiscoveryService;
-use crate::httpc::http_post_json;
+use crate::httpc::http_post_json_tls;
 use crate::protocol::{HttpIncomingResponse, HttpOffer, IncomingEntry, WsEvent};
 use crate::transfer::{TransferEngine, TransferProgress};
 use crate::{EngineConfig, Result};
@@ -49,7 +49,7 @@ use axum::{
     extract::{
         connect_info::ConnectInfo,
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Request, State,
+        Extension, Path, Request, State,
     },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
@@ -57,6 +57,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use tower::Service;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -141,61 +142,167 @@ impl HttpGateway {
             .await;
     }
 
-    pub async fn run(self, port: u16) -> Result<()> {
+    /// 启动双监听（阶段 5 P1）：
+    ///
+    /// - `127.0.0.1:gateway_port` 明文——本机 UI / WS，语义与旧版完全一致
+    /// - `0.0.0.0:lan_tls_port` HTTPS——局域网跨机控制面；加载本机证书，
+    ///   请求客户端证书但暂不鉴权（P1 承诺：不改任何鉴权行为，只注入
+    ///   [`crate::tls::PeerFingerprint`] 供 P3 的 auth_guard 读取）
+    ///
+    /// whoami 按监听侧广告各自端口：本机扫回环口拿到回环端口，对端探 TLS 口
+    /// 拿到 TLS 端口——同一字段按连接来源自洽，Dart 侧 `daemonPort = p`
+    /// （记录的是"哪个候选口应答"）不受影响。
+    pub async fn run(self) -> Result<()> {
         self.bind_buses().await;
+        let config = self.state.config.clone();
 
-        let allow_remote_admin = self.state.config.allow_remote_admin;
+        // 身份先加载：拿不到证书就早失败，别把端口占了再退
+        let identity = crate::tls::NodeIdentity::load_or_create(&config.receive_dir)?;
+        let server_cfg = crate::tls::server_config(&identity)?;
 
-        let app = Router::new()
-            .route("/api/whoami", get(whoami))
-            .route("/api/devices", get(list_devices))
-            .route("/api/send", post(send_file))
-            .route("/api/transfers", get(list_transfers))
-            .route("/api/cancel/:file_id", post(cancel_transfer))
-            // 续传（A3.2）：本机 UI 入口 / 对端 daemon 互相触发
-            .route("/api/transfers/:file_id/resume", post(resume_transfer))
-            .route("/api/peer-resume/:file_id", post(peer_resume))
-            .route("/api/peer-resumed/:file_id", post(peer_resumed))
-            .route("/api/files", get(list_files))
-            .route("/api/files/:name", get(download_file))
-            .route("/api/incoming", post(incoming_offer).get(list_incoming))
-            .route("/api/incoming/:id/accept", post(accept_incoming))
-            .route("/api/incoming/:id/reject", post(reject_incoming))
-            .route("/api/incoming/batch-decide", post(batch_decide_incoming))
-            .route("/api/incoming-resp", post(incoming_resp))
-            .route("/api/verify/:file_id", post(verify_file))
-            .route("/api/config", get(get_config))
-            .route("/api/config/receive-dir", post(set_receive_dir))
-            .route("/api/config/device-name", post(set_device_name))
-            .route("/ws/progress", get(ws_progress))
-            .route("/", get(root_handler))
-            // route_layer 只对「已注册的路由」生效，404 / 405 的请求根本不会
-            // 走到 middleware——所以不存在"未分级路径被误放行"的口子。
-            //（换成 .layer() 则会对所有请求生效，包括 404，反而多一个面。）
-            .route_layer(middleware::from_fn(move |req: Request, next: Next| async move {
-                access_guard(req, next, allow_remote_admin).await
-            }))
-            .with_state(self.state);
-
-        let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        let lb_listener = tokio::net::TcpListener::bind(("127.0.0.1", config.gateway_port))
             .await
-            .map_err(|e| crate::CoreError::Gateway(e.to_string()))?;
+            .map_err(|e| {
+                crate::CoreError::Gateway(format!("绑定回环端口 {} 失败: {e}", config.gateway_port))
+            })?;
+        let lan_listener = tokio::net::TcpListener::bind(("0.0.0.0", config.lan_tls_port))
+            .await
+            .map_err(|e| {
+                crate::CoreError::Gateway(format!(
+                    "绑定 TLS 端口 {} 失败: {e}",
+                    config.lan_tls_port
+                ))
+            })?;
+
+        let allow_remote_admin = config.allow_remote_admin;
         if allow_remote_admin {
             warn!(
                 "remote admin ON: 局域网内任何设备都可调用本机的管理接口 \
                  （发文件 / 读接收目录 / 改配置）"
             );
         }
-        info!(port, "http gateway listening");
-        // 必须走 into_make_service_with_connect_info：否则 extensions 里取不到
-        // peer 地址，access_guard 会把所有请求都当成远程处理。
+
+        let lb_app = build_app(self.state.clone(), config.gateway_port);
+        let lan_app = build_app(self.state.clone(), config.lan_tls_port);
+        tokio::spawn(serve_tls_loop(lan_listener, server_cfg, lan_app));
+
+        info!(
+            gateway_port = config.gateway_port,
+            lan_tls_port = config.lan_tls_port,
+            identity_fp = %identity.fp(),
+            "http gateway listening"
+        );
+        // 回环口走原生 serve：ConnectInfo 由 into_make_service_with_connect_info 注入
         axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
+            lb_listener,
+            lb_app.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await
         .map_err(|e| crate::CoreError::Gateway(e.to_string()))?;
         Ok(())
+    }
+}
+
+/// 构建路由表。`advertised_gateway_port` 是**本 listener 应答给外界的
+/// gateway 端口**（回环口报回环端口、TLS 口报 TLS 端口），经 Extension
+/// 注入，只有 whoami 用它。
+fn build_app(state: AppState, advertised_gateway_port: u16) -> Router {
+    let allow_remote_admin = state.config.allow_remote_admin;
+    Router::new()
+        .route("/api/whoami", get(whoami))
+        .route("/api/devices", get(list_devices))
+        .route("/api/send", post(send_file))
+        .route("/api/transfers", get(list_transfers))
+        .route("/api/cancel/:file_id", post(cancel_transfer))
+        // 续传（A3.2）：本机 UI 入口 / 对端 daemon 互相触发
+        .route("/api/transfers/:file_id/resume", post(resume_transfer))
+        .route("/api/peer-resume/:file_id", post(peer_resume))
+        .route("/api/peer-resumed/:file_id", post(peer_resumed))
+        .route("/api/files", get(list_files))
+        .route("/api/files/:name", get(download_file))
+        .route("/api/incoming", post(incoming_offer).get(list_incoming))
+        .route("/api/incoming/:id/accept", post(accept_incoming))
+        .route("/api/incoming/:id/reject", post(reject_incoming))
+        .route("/api/incoming/batch-decide", post(batch_decide_incoming))
+        .route("/api/incoming-resp", post(incoming_resp))
+        .route("/api/verify/:file_id", post(verify_file))
+        .route("/api/config", get(get_config))
+        .route("/api/config/receive-dir", post(set_receive_dir))
+        .route("/api/config/device-name", post(set_device_name))
+        .route("/ws/progress", get(ws_progress))
+        .route("/", get(root_handler))
+        // route_layer 只对「已注册的路由」生效，404 / 405 的请求根本不会
+        // 走到 middleware——所以不存在"未分级路径被误放行"的口子。
+        //（换成 .layer() 则会对所有请求生效，包括 404，反而多一个面。）
+        .route_layer(middleware::from_fn(move |req: Request, next: Next| async move {
+            access_guard(req, next, allow_remote_admin).await
+        }))
+        .layer(axum::Extension(advertised_gateway_port))
+        .with_state(state)
+}
+
+/// TLS accept 循环：逐连接握手 → 注入 `ConnectInfo` + `PeerFingerprint`
+/// → 用 hyper 的 HTTP/1 连接执行同一个 axum Router。
+///
+/// （axum 0.7 的 `serve()` 只吃 `tokio::net::TcpListener`，不接受自定义
+/// 流类型，所以 TLS 侧必须自己接。）
+async fn serve_tls_loop(
+    listener: tokio::net::TcpListener,
+    server_cfg: Arc<rustls::ServerConfig>,
+    app: Router,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "lan tls accept failed");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            // 握手超时：防慢速客户端长期占坑
+            let tls =
+                match tokio::time::timeout(std::time::Duration::from_secs(10), acceptor.accept(tcp))
+                    .await
+                {
+                    Ok(Ok(s)) => s,
+                    _ => return,
+                };
+            // 对端证书指纹 → 每请求扩展。P1 只注入不拦截；P3 auth_guard 查表。
+            let peer_fp = tls
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|c| c.first())
+                .map(|c| crate::tls::fingerprint(c.as_ref()));
+            let io = hyper_util::rt::TokioIo::new(tls);
+            // 注意用 hyper 的 service_fn（hyper 1.x 有自己的 Service trait，
+            // tower 的 ServiceFn 不满足 serve_connection 的约束）
+            let svc = hyper::service::service_fn(
+                move |mut req: hyper::Request<hyper::body::Incoming>| {
+                    let mut app = app.clone();
+                    req.extensions_mut().insert(ConnectInfo(peer));
+                    req.extensions_mut()
+                        .insert(crate::tls::PeerFingerprint(peer_fp.clone()));
+                    async move {
+                        // Router::call 返回 Result<Response, Infallible>——
+                        // hyper 的 service 要求未来输出恰为 Result<Response, E>，
+                        // 这里剥掉内层 Result（Infallible 不可能失败）
+                        let resp = match app.call(req).await {
+                            Ok(r) => r,
+                            Err(never) => match never {},
+                        };
+                        Ok::<_, std::convert::Infallible>(resp)
+                    }
+                },
+            );
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .await;
+        });
     }
 }
 
@@ -314,12 +421,16 @@ async fn root_handler() -> impl IntoResponse {
     "kitefile gateway is running. See /api/* for endpoints."
 }
 
-async fn whoami(State(state): State<AppState>) -> Json<WhoAmI> {
+/// 广告端口来自 Extension（回环口报 7878、TLS 口报 7880，见 [`build_app`]）
+async fn whoami(
+    State(state): State<AppState>,
+    Extension(advertised_gateway_port): Extension<u16>,
+) -> Json<WhoAmI> {
     Json(WhoAmI {
         id: state.discovery.self_id().to_string(),
         name: state.discovery.self_name().to_string(),
         platform: crate::platform::platform_name().to_string(),
-        gateway_port: state.config.gateway_port,
+        gateway_port: advertised_gateway_port,
         transfer_port: state.config.transfer_port,
     })
 }
@@ -333,7 +444,9 @@ async fn send_file(
     Json(req): Json<SendRequest>,
 ) -> std::result::Result<(StatusCode, Json<SendResponse>), (StatusCode, String)> {
     let target_transfer_port = req.target_port.unwrap_or(state.config.transfer_port);
-    let target_gateway_port = req.target_gateway_port.unwrap_or(state.config.gateway_port);
+    // 目标是跨机设备：缺省按对端 LAN TLS 端口（UI 正常带设备表里的
+    // gateway_port——mDNS 广告的就是 LAN TLS 口——这里只是兜底）
+    let target_gateway_port = req.target_gateway_port.unwrap_or(state.config.lan_tls_port);
     let self_id = state.discovery.self_id().to_string();
     let self_name = state.discovery.self_name().to_string();
     let self_ip = state
@@ -354,7 +467,8 @@ async fn send_file(
             self_id,
             self_name,
             self_ip,
-            state.config.gateway_port,
+            // 对端回包走本机 LAN TLS 口（回环口对端不可达）
+            state.config.lan_tls_port,
             match (req.batch_id, req.batch_index, req.batch_total) {
                 (Some(batch_id), Some(index), Some(total)) => {
                     Some(crate::protocol::SendBatchInfo { batch_id, index, total })
@@ -664,11 +778,12 @@ async fn incoming_offer(
             transfer_port: config.transfer_port,
         };
         let resp_json = serde_json::to_string(&resp).unwrap_or_default();
-        if let Err(e) = http_post_json(
+        if let Err(e) = http_post_json_tls(
             &entry_for_spawn.from_ip,
             entry_for_spawn.from_gateway_port,
             "/api/incoming-resp",
             &resp_json,
+            &config.receive_dir,
         )
         .await
         {
