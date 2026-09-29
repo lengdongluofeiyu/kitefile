@@ -47,8 +47,8 @@ fn init_ffi_logging(receive_dir: &std::path::Path) {
         }
         impl std::io::Write for LogWriter {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                use std::io::Write as _;
-                // stdout：能被 adb logcat 抓到就多一条通道（抓不到不影响文件）
+                // stdout：能被 adb logcat 抓到就多一条通道（抓不到不影响文件）。
+                // Write trait 已因处在 impl 块内而在作用域中，无需再 use。
                 let _ = std::io::stdout().write_all(buf);
                 let mut f = std::fs::OpenOptions::new()
                     .create(true)

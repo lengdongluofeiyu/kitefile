@@ -44,14 +44,29 @@ pub struct NodeIdentity {
 impl NodeIdentity {
     /// 加载或创建持久化身份。
     ///
-    /// - 两个 PEM 文件都在且可解析 → 复用（指纹不变）
-    /// - 不存在 → 生成新证书并落盘；写盘失败返回 Err
-    ///   （静默退化成内存身份会让下次启动换指纹、对端 pin 全失效）
+    /// - 两个 PEM 都在、可解析、**且公私钥配对** → 复用（指纹不变）
+    /// - 不存在 / 损坏 / 公私钥错配 → 重新生成（错配文件自动愈合）
+    /// - 落盘失败 → 降级为内存身份 + warn（旧版此处静默忽略）
+    ///
+    /// **进程级串行化（真机事故）**：FFI 初始化会并发 spawn 接收与网关
+    /// 两个任务，首次启动生成时两边同时读到「文件不存在」→ 各自造密钥、
+    /// 交错写盘 → 落下「A 的证书 + B 的私钥」。PEM 都合法，但 rustls
+    /// `with_single_cert` 校验公私钥一致性直接报
+    /// `keys may not be consistent: KeyMismatch`，网关与接收**双双起不来**
+    /// （Android「内嵌守护进程未就绪」的根因，daemon.log 6/7 行实锤），
+    /// 且错配文件持久化后每次启动都复发。加锁后第二个任务必然读到
+    /// 完整一致的一对；读取路径的配对校验负责愈合已损坏的历史文件。
+    /// （仅进程内互斥：生产环境一个接收目录同时只有一个 daemon。）
     ///
     /// CN 优先取同目录 `.kitefile-identity` 里的 device_id（仅调试可读性，
     /// 安全性不依赖 CN——我们按整证书指纹 pin，不校验名字）。
     pub fn load_or_create(base_dir: &Path) -> Result<Arc<Self>> {
         install_crypto_provider();
+        // 中毒锁（前一个持锁者 panic）也继续用：io 错误不会 poison 语义化，
+        // 带着中毒状态接着跑好过拒绝服务
+        let _guard = load_serialize()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let cert_path = base_dir.join(CERT_FILE);
         let key_path = base_dir.join(KEY_FILE);
@@ -61,8 +76,15 @@ impl NodeIdentity {
                 PrivateKeyDer::from_pem_file(&key_path),
             ) {
                 (Ok(cert), Ok(key)) => {
-                    let fp = fingerprint(cert.as_ref());
-                    return Ok(Arc::new(Self { cert, key, fp }));
+                    if cert_key_pair_matches(&cert, &key) {
+                        let fp = fingerprint(cert.as_ref());
+                        return Ok(Arc::new(Self { cert, key, fp }));
+                    }
+                    // 错配（历史并发事故的残留）：落到下面重新生成覆盖
+                    tracing::warn!(
+                        path = %base_dir.display(),
+                        "证书与私钥不匹配（KeyMismatch），重新生成"
+                    );
                 }
                 _ => {
                     // 损坏 / 不可读：重新生成（写盘失败会走下面的内存降级）
@@ -443,6 +465,22 @@ impl ServerCertVerifier for PinnedServerCert {
 // helpers
 // ---------------------------------------------------------------------------
 
+/// 进程内串行化 [`NodeIdentity::load_or_create`]（见其文档：并发首启
+/// 交错写盘会产出 KeyMismatch 的错配文件——真机事故根因）。
+fn load_serialize() -> &'static std::sync::Mutex<()> {
+    static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &M
+}
+
+/// 证书与私钥是否构成有效配对：直接用 rustls 的一致性校验（错配即
+/// `keys may not be consistent: KeyMismatch`——与真机报错同源同语义）。
+fn cert_key_pair_matches(cert: &CertificateDer<'static>, key: &PrivateKeyDer<'static>) -> bool {
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key.clone_key())
+        .is_ok()
+}
+
 /// 从 `.kitefile-identity` 读 device_id 当证书 CN（读不到就回退，不报错）
 fn read_marker_device_id(base_dir: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(base_dir.join(".kitefile-identity")).ok()?;
@@ -686,5 +724,50 @@ mod tests {
         );
         let mut tls = client.connect(name, tcp).await.expect("已配对应放行");
         tokio::io::AsyncWriteExt::write_all(&mut tls, b"ok").await.unwrap();
+    }
+
+    /// 并发首启回归（真机 KeyMismatch 事故）：8 线程同时对同一空目录
+    /// `load_or_create`，必须全部拿到**同一份一致身份**——无锁时两个
+    /// 生成流程交错写盘会产出 cert_A + key_B，`server_config` 直接失败。
+    #[test]
+    fn concurrent_load_or_create_produces_consistent_pair() {
+        let dir = temp_dir("race");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let d = dir.clone();
+                std::thread::spawn(move || {
+                    let id = NodeIdentity::load_or_create(&d).unwrap();
+                    // 错配在这里现形：证书/私钥不配对 → with_single_cert 报错
+                    server_config(&id).expect("server_config 不得 KeyMismatch");
+                    id.fp().to_string()
+                })
+            })
+            .collect();
+        let results: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(
+            results.iter().all(|fp| *fp == results[0]),
+            "8 个线程必须加载到同一身份：{results:?}"
+        );
+    }
+
+    /// 历史错配文件（cert_A + key_B）必须被读取路径检出并重新生成
+    /// ——手机上已经落盘的事故文件靠这条路径自愈。
+    #[test]
+    fn mismatched_keypair_is_regenerated() {
+        let dir_a = temp_dir("mk-a");
+        let dir_b = temp_dir("mk-b");
+        let id_a = NodeIdentity::load_or_create(&dir_a).unwrap();
+        let fp_a = id_a.fp().to_string();
+        let id_b = NodeIdentity::load_or_create(&dir_b).unwrap();
+        let _ = id_b;
+        // 用 B 的私钥覆盖 A 的 → 制造 KeyMismatch 现场
+        std::fs::copy(dir_b.join(KEY_FILE), dir_a.join(KEY_FILE)).unwrap();
+
+        let healed = NodeIdentity::load_or_create(&dir_a).unwrap();
+        assert_ne!(healed.fp(), fp_a, "错配文件必须被重生成（指纹改变）");
+        server_config(&healed).expect("愈合后的身份必须能建服务端配置");
+        // 再读一次：落盘的新文件也要自洽
+        let again = NodeIdentity::load_or_create(&dir_a).unwrap();
+        server_config(&again).expect("再生后的文件必须自洽");
     }
 }
