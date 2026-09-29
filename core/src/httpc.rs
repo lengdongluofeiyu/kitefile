@@ -108,20 +108,57 @@ pub async fn http_get_tls(
     receive_dir: &Path,
     pinned_fp: Option<&str>,
 ) -> io::Result<String> {
-    let (mut stream, _server_fp) = tls_connect(
+    http_get_tls_with(
         host,
         port,
+        path,
         receive_dir,
         pinned_fp,
         timeouts::CONNECT_TIMEOUT,
+        timeouts::HTTP_RESPONSE_TIMEOUT,
     )
-    .await?;
+    .await
+}
+
+/// GET over TLS，可注入超时（局域网 whoami 扫描用短超时）。
+pub async fn http_get_tls_with(
+    host: &str,
+    port: u16,
+    path: &str,
+    receive_dir: &Path,
+    pinned_fp: Option<&str>,
+    connect_timeout: Duration,
+    response_timeout: Duration,
+) -> io::Result<String> {
+    let (mut stream, _server_fp) =
+        tls_connect(host, port, receive_dir, pinned_fp, connect_timeout).await?;
     let req = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(req.as_bytes()).await?;
     stream.flush().await?;
-    read_response(stream, timeouts::HTTP_RESPONSE_TIMEOUT).await
+    read_response(stream, response_timeout).await
+}
+
+/// GET over TLS，复用**已在内存**的身份（配对页 LAN 扫描：数百次探测
+/// 不能每次都读盘/自检证书）。
+pub async fn http_get_tls_identity(
+    host: &str,
+    port: u16,
+    path: &str,
+    identity: &crate::tls::NodeIdentity,
+    pinned_fp: Option<&str>,
+    connect_timeout: Duration,
+    response_timeout: Duration,
+) -> io::Result<String> {
+    let (mut stream, _server_fp) =
+        tls_connect_identity(host, port, identity, pinned_fp, connect_timeout).await?;
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await?;
+    stream.flush().await?;
+    read_response(stream, response_timeout).await
 }
 
 /// 建立 TLS 连接（含握手超时）。返回 (流, 服务端证书指纹)。
@@ -137,7 +174,18 @@ async fn tls_connect(
 ) -> io::Result<(tokio_rustls::client::TlsStream<TcpStream>, Option<String>)> {
     let identity = crate::tls::NodeIdentity::load_or_create(receive_dir)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("加载 TLS 身份失败: {e}")))?;
-    let client_cfg = crate::tls::client_config(&identity, pinned_fp)
+    tls_connect_identity(host, port, &identity, pinned_fp, connect_timeout).await
+}
+
+/// 用已加载的身份握手（扫描路径复用；语义与 [`tls_connect`] 一致）。
+async fn tls_connect_identity(
+    host: &str,
+    port: u16,
+    identity: &crate::tls::NodeIdentity,
+    pinned_fp: Option<&str>,
+    connect_timeout: Duration,
+) -> io::Result<(tokio_rustls::client::TlsStream<TcpStream>, Option<String>)> {
+    let client_cfg = crate::tls::client_config(identity, pinned_fp)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS 客户端配置失败: {e}")))?;
     let connector = tokio_rustls::TlsConnector::from(client_cfg);
 

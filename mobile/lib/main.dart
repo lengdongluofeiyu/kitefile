@@ -657,7 +657,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                             padding: EdgeInsets.symmetric(vertical: 16),
                             child: Center(
                               child: Text(
-                                '正在搜索附近可配对的设备…\n（要求对方也停在本页面）',
+                                '正在搜索附近可配对的设备…\n'
+                                '（要求对方也停在本页面）\n\n'
+                                '若长时间无结果：请确认两台设备在同一 Wi-Fi，'
+                                '且电脑端也打开了「添加设备」页。\n'
+                                'Windows 电脑需放行防火墙 7880 端口。',
                                 textAlign: TextAlign.center,
                                 style: TextStyle(color: Colors.grey),
                               ),

@@ -1711,6 +1711,61 @@ async fn whoami_sync_delivers_pair_flag_without_mdns() {
     let _ = std::fs::remove_dir_all(&dir_b);
 }
 
+/// P2 补强回归（真实反馈：手机配对页看不到电脑）：
+/// mDNS 完全静默时，B 的设备表**不能**只靠「已知设备 whoami 同步」。
+/// LAN whoami 主动扫描必须能把「组播丢了但 TCP+TLS 还通」的 A 拉进表，
+/// 且 pair 标志来自 A 的 whoami.pairing_enabled。
+#[tokio::test]
+async fn lan_whoami_scan_discovers_peer_without_mdns() {
+    let dir_a = temp_dir("lanscan-a");
+    let dir_b = temp_dir("lanscan-b");
+    let (_ea, da) = start_stack_isolated_full("lanscan-a", 18090, 18190, &dir_a, 2).await;
+    let (_eb, db) = start_stack_isolated_full("lanscan-b", 18091, 18191, &dir_b, 2).await;
+
+    // A 进入配对模式 → whoami.pairing_enabled = true
+    let (st, _) = http(18090, "POST", "/api/pair/mode", Some(r#"{"enabled":true}"#)).await;
+    assert_eq!(st, 200);
+
+    // B 表初始为空（模拟 mDNS 组播被丢、设备从未进入表）
+    assert!(
+        db.list_devices().is_empty(),
+        "扫描前 B 设备表应为空（无 mDNS）"
+    );
+
+    // 扫 A 的 LAN TLS 口（隔离栈 lan_port = tr_port + 1000 = 19190）
+    // 注意：discover_via_whoami_scan_with 是同步入口（内部 spawn），不要 await
+    db.discover_via_whoami_scan_with(&["127.0.0.1".into()], &[19190]);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let hit = db
+            .list_devices()
+            .into_iter()
+            .find(|d| d.gateway_port == 19190 || d.ip == "127.0.0.1");
+        if let Some(d) = hit {
+            assert_eq!(d.name, "iso-lanscan-a", "扫描结果应是 A 的身份");
+            assert!(
+                d.pair,
+                "扫描发现的设备必须带上 A 的 pairing_enabled=true（实际 pair={}）",
+                d.pair
+            );
+            assert_eq!(d.gateway_port, 19190, "应广告/同步到 A 的 LAN TLS 口");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "LAN whoami 扫描未在 5s 内发现 A（表={:?}）",
+            db.list_devices()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let _ = http(18090, "POST", "/api/pair/mode", Some(r#"{"enabled":false}"#)).await;
+    let _ = da; // 引擎保活到测试结束
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
 /// N2 回归：stream_count 必须由发送方带过去，接收方按它建槽。
 ///
 /// 这是唯一一条能在合入前抓住「静默数据损坏」的测试。

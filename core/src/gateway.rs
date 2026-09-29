@@ -614,6 +614,7 @@ impl HttpGateway {
                 let lan_app = build_app(self.state.clone(), config.lan_tls_port);
                 tokio::spawn(serve_tls_loop(lan_listener, server_cfg, lan_app));
                 lan_bound = Some(config.lan_tls_port);
+                ensure_windows_lan_firewall(config.lan_tls_port);
             }
             Err(e) => {
                 error!(
@@ -657,6 +658,57 @@ async fn bind_first(
     Err(last.unwrap_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no port candidates")
     }))
+}
+
+/// Windows 防火墙：局域网对端要能连上 LAN TLS 口，否则配对/传输全挂
+///（真实反馈：mDNS 可能仍通，但 whoami/pair/hello 全部超时）。
+/// 无管理员权限时 netsh 会失败——只记 warn，不阻断本机回环 UI。
+fn ensure_windows_lan_firewall(port: u16) {
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        let name = format!("KiteFile-LAN-TLS-{port}");
+        let exists = Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "show",
+                "rule",
+                &format!("name={name}"),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if exists {
+            return;
+        }
+        let status = Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={name}"),
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                &format!("localport={port}"),
+            ])
+            .status();
+        match status {
+            Ok(s) if s.success() => info!(port, "windows firewall rule ensured"),
+            Ok(s) => warn!(
+                port,
+                code = ?s.code(),
+                "windows firewall rule add failed（需管理员权限时请手动放行）"
+            ),
+            Err(e) => warn!(port, error = %e, "windows firewall netsh spawn failed"),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = port;
+    }
 }
 
 /// 构建路由表。`advertised_gateway_port` 是**本 listener 应答给外界的

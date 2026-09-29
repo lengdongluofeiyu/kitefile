@@ -7,10 +7,12 @@ use crate::protocol::SERVICE_TYPE;
 use crate::Result;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// 设备唯一标识
@@ -90,7 +92,14 @@ pub struct DiscoveryService {
     transfer_port: u16,
     /// 配对模式状态（P2）：驱动 mDNS `pair` TXT 与 P3 的配对接口门
     pairing: Arc<crate::pairing::PairingState>,
+    /// LAN whoami 扫描防重入（配对页 1s ticker + 切换配对模式可能叠跑）
+    scanning: Arc<AtomicBool>,
 }
+
+/// LAN whoami 扫描并发与单点超时：网段里大量主机会在 connect 段快速失败，
+/// 必须短超时 + 并发，否则 120s 配对窗口会被扫描本身吃掉。
+const SCAN_CONCURRENCY: usize = 32;
+const SCAN_PROBE_TIMEOUT: Duration = Duration::from_millis(450);
 
 impl DiscoveryService {
     /// 启动发现服务
@@ -123,6 +132,7 @@ impl DiscoveryService {
             gateway_port,
             transfer_port,
             pairing: Arc::new(crate::pairing::PairingState::new()),
+            scanning: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -144,6 +154,7 @@ impl DiscoveryService {
             gateway_port: 7878,
             transfer_port: 7879,
             pairing: Arc::new(crate::pairing::PairingState::new()),
+            scanning: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -213,26 +224,134 @@ impl DiscoveryService {
     /// TCP+TLS 产品命脉通道，能传文件这条路就通。同机双 daemon 的
     /// 传播测试（mdns_pair_propagation_test）证明 mDNS 逻辑本身无恙——
     /// 这里兜的是通道层。
+    ///
+    /// **P2 补强（手机配对页看不到电脑）**：whoami 同步只覆盖**表里已有**
+    /// 的设备；mDNS 完全没把对端推进设备表时，刷新再多次也只会对着空表。
+    /// 因此这里额外触发 [`Self::discover_via_whoami_scan`]：按本机网段
+    /// 主动探 LAN TLS whoami，把「组播丢了但 TCP 还通」的对端找回来。
     pub fn refresh_pair_flags(&self) {
+        // ① 已知设备 whoami 同步（不改变本机配对模式）
+        if let Some(dir) = Self::receive_dir_from(self.identity_path.as_deref()) {
+            let devices = Arc::clone(&self.devices);
+            let spawned = tokio::runtime::Handle::try_current().map(|h| {
+                h.spawn(async move {
+                    let snapshot: Vec<(DeviceId, Device)> = {
+                        let map = devices.read();
+                        map.iter().map(|(id, d)| (id.clone(), d.clone())).collect()
+                    };
+                    for (id, mut dev) in snapshot {
+                        sync_device_via_whoami(&mut dev, &dir).await;
+                        devices.write().insert(id, dev);
+                    }
+                    info!("pair flag refresh over known devices done");
+                })
+            });
+            if spawned.is_err() {
+                warn!("no runtime for pair flag refresh; will catch up via 60s probe");
+            }
+        }
+        // ② 局域网主动扫描：未知设备也拉进表（mDNS 静默时的发现兜底）
+        self.discover_via_whoami_scan();
+    }
+
+    /// 局域网 whoami 主动扫描：探测本机各网段上 LAN TLS 口的 `/api/whoami`，
+    /// 把应答设备 upsert 进表（含 `pair` = 对端 `pairing_enabled`）。
+    ///
+    /// **为什么必须有这条路**：配对页只展示本机 daemon 设备表；表的来源
+    /// 原先只有 mDNS。组播被 Android/路由器/防火墙丢掉时，双方都开了
+    /// 配对模式也「互相看不见」。whoami 是免配对、走 TCP+TLS 的产品
+    /// 命脉通道——能建连就能发现，不依赖 TTL 续期语义。
+    pub fn discover_via_whoami_scan(&self) {
+        let ips: Vec<String> = lan_scan_targets(&my_ipv4_nets())
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .collect();
+        // 本机实际 LAN TLS 口 + 候选口（对端可能因端口保留退避）
+        let mut ports = vec![self.gateway_port];
+        ports.extend(crate::LAN_TLS_PORT_CANDIDATES.iter().copied());
+        ports.dedup();
+        self.discover_via_whoami_scan_with(&ips, &ports);
+    }
+
+    /// 可注入探测目标的扫描入口（测试用；生产走 [`Self::discover_via_whoami_scan`]）。
+    pub fn discover_via_whoami_scan_with(&self, ips: &[String], ports: &[u16]) {
         let Some(dir) = Self::receive_dir_from(self.identity_path.as_deref()) else {
-            return; // 临时实例（CLI list 等）：无身份目录，跳过（60s 探活同样跳过）
+            return; // 临时实例（CLI list 等）：无身份目录，跳过
         };
+        if ips.is_empty() || ports.is_empty() {
+            return;
+        }
+        // 防重入：1s ticker 的 /api/pair/refresh 与切换配对模式可能叠跑
+        if self.scanning.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let devices = Arc::clone(&self.devices);
+        let self_id = self.self_id.clone();
+        let scanning = Arc::clone(&self.scanning);
+        let ips = ips.to_vec();
+        let ports = ports.to_vec();
         let spawned = tokio::runtime::Handle::try_current().map(|h| {
+            let scanning = Arc::clone(&scanning);
             h.spawn(async move {
-                let snapshot: Vec<(DeviceId, Device)> = {
-                    let map = devices.read();
-                    map.iter().map(|(id, d)| (id.clone(), d.clone())).collect()
+                // 复位标志：扫描结束 / 提前 return 都必须放开下一轮
+                let _clear = ClearFlag(&scanning);
+                let Ok(identity) = crate::tls::NodeIdentity::load_or_create(&dir) else {
+                    warn!("lan whoami scan: load identity failed, skip");
+                    return;
                 };
-                for (id, mut dev) in snapshot {
-                    sync_device_via_whoami(&mut dev, &dir).await;
-                    devices.write().insert(id, dev);
+                let sem = Arc::new(tokio::sync::Semaphore::new(SCAN_CONCURRENCY));
+                let mut handles = Vec::with_capacity(ips.len() * ports.len());
+                for ip in &ips {
+                    for &port in &ports {
+                        let ip = ip.clone();
+                        let sem = Arc::clone(&sem);
+                        let identity = Arc::clone(&identity);
+                        handles.push(tokio::spawn(async move {
+                            let Ok(_permit) = sem.acquire().await else {
+                                return None;
+                            };
+                            let fut = crate::httpc::http_get_tls_identity(
+                                &ip,
+                                port,
+                                "/api/whoami",
+                                &identity,
+                                None,
+                                SCAN_PROBE_TIMEOUT,
+                                SCAN_PROBE_TIMEOUT,
+                            );
+                            match tokio::time::timeout(SCAN_PROBE_TIMEOUT, fut).await {
+                                Ok(Ok(body)) => Some((ip, port, body)),
+                                _ => None,
+                            }
+                        }));
+                    }
                 }
-                info!("pair flag refresh over known devices done");
+                let mut hits = 0usize;
+                for h in handles {
+                    if let Ok(Some((ip, port, body))) = h.await {
+                        hits += 1;
+                        if let Some(dev) = device_from_whoami(&ip, port, &body, &self_id) {
+                            info!(
+                                %ip,
+                                port,
+                                id = %dev.id,
+                                pair = dev.pair,
+                                "lan whoami scan discovered device"
+                            );
+                            devices.write().insert(dev.id.clone(), dev);
+                        }
+                    }
+                }
+                info!(
+                    probes = ips.len() * ports.len(),
+                    hits,
+                    "lan whoami scan done"
+                );
             })
         });
         if spawned.is_err() {
-            warn!("no runtime for pair flag refresh; will catch up via 60s probe");
+            self.scanning.store(false, Ordering::SeqCst);
+            warn!("no runtime for lan whoami scan");
         }
     }
 
@@ -515,7 +634,12 @@ async fn sync_device_via_whoami(device: &mut Device, receive_dir: &Path) {
         Ok(Ok(b)) => b,
         _ => return,
     };
-    let Ok(j) = serde_json::from_str::<serde_json::Value>(&body) else {
+    merge_whoami_into_device(device, &body);
+}
+
+/// 把 whoami JSON 合并进已有 Device（探活同步与扫描共用）。
+fn merge_whoami_into_device(device: &mut Device, body: &str) {
+    let Ok(j) = serde_json::from_str::<serde_json::Value>(body) else {
         return;
     };
     if let Some(v) = j.get("name").and_then(|v| v.as_str()) {
@@ -543,6 +667,126 @@ async fn sync_device_via_whoami(device: &mut Device, receive_dir: &Path) {
     }
 }
 
+/// 从 whoami 应答构造设备条目（LAN 扫描 upsert 用）。
+/// `probed_port` 是探测用的端口，响应里缺 `gateway_port` 时兜底。
+fn device_from_whoami(ip: &str, probed_port: u16, body: &str, self_id: &str) -> Option<Device> {
+    let j: serde_json::Value = serde_json::from_str(body).ok()?;
+    let id = j.get("id").and_then(|v| v.as_str())?.to_string();
+    if id.is_empty() || id == self_id {
+        return None;
+    }
+    let name = j
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&id)
+        .to_string();
+    let platform = j
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let gateway_port = j
+        .get("gateway_port")
+        .and_then(|v| v.as_u64())
+        .filter(|&v| v > 0 && v <= u16::MAX as u64)
+        .map(|v| v as u16)
+        .unwrap_or(probed_port);
+    let transfer_port = j
+        .get("transfer_port")
+        .and_then(|v| v.as_u64())
+        .filter(|&v| v > 0 && v <= u16::MAX as u64)
+        .map(|v| v as u16)
+        .unwrap_or(7879);
+    let pair = j
+        .get("pairing_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Some(Device {
+        id,
+        name,
+        ip: ip.to_string(),
+        gateway_port,
+        transfer_port,
+        platform,
+        pair,
+    })
+}
+
+/// 扫描用目标 IP：各网段主机地址（去重、不含本机）。
+pub fn lan_scan_targets(nets: &[(Ipv4Addr, Ipv4Addr)]) -> Vec<Ipv4Addr> {
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    let mut seen = HashSet::new();
+    for (ip, mask) in nets {
+        for host in subnet_scan_hosts(*ip, *mask) {
+            if seen.insert(host) {
+                out.push(host);
+            }
+        }
+    }
+    out
+}
+
+/// 单网段扫描主机列表。
+///
+/// `/24` 及更细的掩码扫整段（去掉网络/广播/本机）；掩码更粗
+/// （如 `/16`）时只扫本机所在的 `/24`——企业网整段扫描会把配对窗口耗尽。
+fn subnet_scan_hosts(ip: Ipv4Addr, mask: Ipv4Addr) -> Vec<Ipv4Addr> {
+    let mask_bits = u32::from(mask).count_ones();
+    if mask_bits >= 24 {
+        let ip_u = u32::from(ip);
+        let network = ip_u & u32::from(mask);
+        let count = 1u32 << (32 - mask_bits);
+        let broadcast = network + count - 1;
+        (network + 1..broadcast)
+            .map(Ipv4Addr::from)
+            .filter(|h| *h != ip)
+            .collect()
+    } else {
+        let base = u32::from(ip) & 0xFFFF_FF00;
+        (1..255u32)
+            .map(|i| Ipv4Addr::from(base + i))
+            .filter(|h| *h != ip)
+            .collect()
+    }
+}
+
+/// mDNS 广告地址：优先主网卡 + 同网段地址，避免多网卡机器
+/// （VMware / Hyper-V）把虚拟地址一并广播，对端 pick_peer_address
+/// 选错网卡后连不上。
+fn lan_advertise_addrs() -> Vec<String> {
+    let nets = my_ipv4_nets();
+    let Some(primary) = primary_ipv4() else {
+        return my_ipv4_addrs();
+    };
+    let primary_mask = nets
+        .iter()
+        .find(|(ip, _)| *ip == primary)
+        .map(|(_, m)| *m)
+        .unwrap_or_else(|| Ipv4Addr::new(255, 255, 255, 0));
+    let mut out = vec![primary.to_string()];
+    for (ip, _) in &nets {
+        if *ip == primary {
+            continue;
+        }
+        if in_same_subnet(*ip, primary, primary_mask) {
+            out.push(ip.to_string());
+        }
+    }
+    if out.is_empty() {
+        out.push(primary.to_string());
+    }
+    out
+}
+
+/// 扫描任务结束时复位防重入标志（panic 也复位）。
+struct ClearFlag<'a>(&'a AtomicBool);
+impl Drop for ClearFlag<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// 构造 mDNS 服务注册信息（id 作实例名与主机名，name 等走 TXT 属性）
 fn build_service_info(
     self_id: &str,
@@ -551,9 +795,9 @@ fn build_service_info(
     transfer_port: u16,
     pair_active: bool,
 ) -> Result<ServiceInfo> {
-    // 取本机所有 IPv4 地址，作为可被发现的地址
-    let my_ips = my_ipv4_addrs();
-    if my_ips.is_empty() {
+    // 只广告可达 LAN 地址（主网卡 + 同网段），避免虚拟网卡把对端引偏
+    let host_ipv4 = lan_advertise_addrs();
+    if host_ipv4.is_empty() {
         return Err(crate::CoreError::Discovery(
             "no available IPv4 address".into(),
         ));
@@ -572,12 +816,12 @@ fn build_service_info(
     );
 
     let hostname = format!("{}.local.", self_id);
-    let host_ipv4: Vec<&str> = my_ips.iter().map(|s| s.as_str()).collect();
+    let host_refs: Vec<&str> = host_ipv4.iter().map(|s| s.as_str()).collect();
     ServiceInfo::new(
         SERVICE_TYPE,
         self_id,
         &hostname,
-        &host_ipv4[..],
+        &host_refs[..],
         transfer_port,
         properties,
     )
@@ -829,5 +1073,60 @@ mod tests {
             !svc.pairing_status().0,
             "120s 后必须自动退出配对模式（重启不复活的前提是内存态）"
         );
+    }
+
+    /// /24 网段：扫除网络/广播/本机外的全部主机。
+    #[test]
+    fn subnet_scan_hosts_covers_slash24_without_self() {
+        let hosts = subnet_scan_hosts(v4("192.168.31.230"), v4("255.255.255.0"));
+        assert_eq!(hosts.len(), 253, "254 - 本机 = 253");
+        assert!(!hosts.contains(&v4("192.168.31.230")), "不能扫自己");
+        assert!(!hosts.contains(&v4("192.168.31.0")), "不能扫网络地址");
+        assert!(!hosts.contains(&v4("192.168.31.255")), "不能扫广播地址");
+        assert!(hosts.contains(&v4("192.168.31.1")));
+    }
+
+    /// 大网段（/16）只扫本机所在 /24，避免配对窗口被扫描耗尽。
+    #[test]
+    fn subnet_scan_hosts_limits_large_masks_to_slash24() {
+        let hosts = subnet_scan_hosts(v4("10.124.68.246"), v4("255.255.0.0"));
+        assert_eq!(hosts.len(), 253);
+        assert!(hosts.iter().all(|h| u32::from(*h) & 0xFFFF_FF00 == 0x0A7C4400));
+        assert!(!hosts.contains(&v4("10.124.0.1")), "不能扫整个 /16");
+    }
+
+    #[test]
+    fn lan_scan_targets_dedupes_across_nets() {
+        let nets = vec![
+            (v4("192.168.31.230"), v4("255.255.255.0")),
+            (v4("192.168.31.230"), v4("255.255.255.0")),
+        ];
+        let targets = lan_scan_targets(&nets);
+        let unique: HashSet<_> = targets.iter().copied().collect();
+        assert_eq!(targets.len(), unique.len(), "重复网段必须去重");
+        assert_eq!(targets.len(), 253);
+    }
+
+    #[test]
+    fn device_from_whoami_parses_pair_and_ports() {
+        let body = r#"{
+            "id":"abc","name":"PC","platform":"windows",
+            "gateway_port":7880,"transfer_port":7879,
+            "pairing_enabled":true
+        }"#;
+        let d = device_from_whoami("192.168.31.10", 7880, body, "self-id").unwrap();
+        assert_eq!(d.id, "abc");
+        assert_eq!(d.gateway_port, 7880);
+        assert!(d.pair, "whoami.pairing_enabled 必须落到 device.pair");
+
+        // 响应缺 gateway_port 时用探测端口兜底
+        let body2 = r#"{"id":"x","name":"x","platform":"android","pairing_enabled":false}"#;
+        let d2 = device_from_whoami("10.0.0.2", 17880, body2, "self-id").unwrap();
+        assert_eq!(d2.gateway_port, 17880);
+        assert!(!d2.pair);
+
+        // 自己 / 空 id 不能入库
+        assert!(device_from_whoami("10.0.0.2", 7880, body, "abc").is_none());
+        assert!(device_from_whoami("10.0.0.2", 7880, r#"{"id":""}"#, "self").is_none());
     }
 }
