@@ -1510,6 +1510,16 @@ async fn test_pair_mode_toggle() {
         "whoami 应上报 pairing_enabled"
     );
 
+    // /api/pair/refresh：即时刷新对端标志，**不得**改变本机配对模式/倒计时
+    let (st, _) = http(18049, "POST", "/api/pair/refresh", Some("{}")).await;
+    assert_eq!(st, 200);
+    let v = http_json(18049, "GET", "/api/pair/mode", None).await;
+    assert_eq!(
+        v["enabled"].as_bool(),
+        Some(true),
+        "refresh 不得关闭配对模式"
+    );
+
     let (status, _) = http(
         18049,
         "POST",

@@ -456,6 +456,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     String? waitName;
     String? waitCode;
     var expired = false; // 倒计时到点后的结束态（等「重试」重新开启）
+    var refreshTick = 0; // 搜索期每 15s 触发一次 pair 标志同步（/api/pair/refresh）
     Timer? ticker;
     var stopped = false;
     Future<void> shutdown() async {
@@ -521,12 +522,28 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             } catch (_) {/* daemon TTL 同时也会关 */}
           } else {
             await pull();
+            // 每 15s 主动同步一次对端 pair 标志：对端可能比本机晚开启
+            // 配对模式，其组播公告可能丢（防火墙/组播过滤）——whoami
+            // 是产品命脉通道，不依赖 TTL 续期语义
+            refreshTick += 1;
+            if (refreshTick >= 15) {
+              refreshTick = 0;
+              try {
+                await httpPost('$_httpBase/api/pair/refresh', body: '{}');
+              } catch (_) {/* 下一 tick 再试 */}
+              await pull();
+            }
           }
           if (ctx.mounted) setDialogState(() {});
         });
 
         final pairable = devices
             .where((d) => d.pair && !peers.any((p) => p['device_id'] == d.id))
+            .toList();
+        // 已发现但对方未开启配对模式：列出来置灰——让用户能区分
+        //「没发现」和「发现了但对方没开」，而不是对着空白猜
+        final notReady = devices
+            .where((d) => !d.pair && !peers.any((p) => p['device_id'] == d.id))
             .toList();
         final pairedCount =
             devices.where((d) => peers.any((p) => p['device_id'] == d.id)).length;
@@ -635,7 +652,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                           style: TextStyle(fontSize: 12, color: Colors.grey),
                         ),
                         const SizedBox(height: 8),
-                        if (pairable.isEmpty)
+                        if (pairable.isEmpty && notReady.isEmpty)
                           const Padding(
                             padding: EdgeInsets.symmetric(vertical: 16),
                             child: Center(
@@ -646,7 +663,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                               ),
                             ),
                           )
-                        else
+                        else ...[
+                          for (final d in notReady)
+                            ListTile(
+                              dense: true,
+                              enabled: false,
+                              contentPadding: EdgeInsets.zero,
+                              title: Text(d.name,
+                                  style: const TextStyle(color: Colors.grey)),
+                              subtitle: Text(
+                                  '${d.platform} · ${d.ip} · 对方未开启配对模式',
+                                  style: const TextStyle(
+                                      fontSize: 12, color: Colors.grey)),
+                              trailing: const Icon(Icons.lock_outline,
+                                  size: 18, color: Colors.grey),
+                            ),
                           for (final d in pairable)
                             ListTile(
                               dense: true,
@@ -686,6 +717,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                                 child: const Text('配对'),
                               ),
                             ),
+                        ],
                         if (pairedCount > 0) ...[
                           const SizedBox(height: 8),
                           Text('本机已配对 $pairedCount 台设备',

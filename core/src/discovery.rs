@@ -200,8 +200,12 @@ impl DiscoveryService {
         identity_path.and_then(|p| p.parent()).map(|p| p.to_path_buf())
     }
 
-    /// 切换配对模式后的**即时**同步：不等 60s 探活周期，主动向已知设备
-    /// 各拉一次 whoami，把对方的 `pairing_enabled` 合并进本机设备表。
+    /// 即时同步已知设备的 pair 标志：主动向表内每个设备拉一次 whoami，
+    /// 把对方的 `pairing_enabled` 合并进本机设备表。**不改变**本机配对模式
+    /// 状态与倒计时。
+    ///
+    /// 公开给 `/api/pair/refresh`：添加设备页搜索期间定期触发，兜住
+    /// 「对端比本机晚开启配对模式」的同步窗口（切换时只刷当时表内的设备）。
     ///
     /// 为什么不能只靠 mDNS：pair=1 靠 unsolicited 组播公告传播，而
     /// Android 未持 MulticastLock 时系统直接丢组播、防火墙也可能拦
@@ -209,7 +213,7 @@ impl DiscoveryService {
     /// TCP+TLS 产品命脉通道，能传文件这条路就通。同机双 daemon 的
     /// 传播测试（mdns_pair_propagation_test）证明 mDNS 逻辑本身无恙——
     /// 这里兜的是通道层。
-    fn spawn_pair_flag_refresh(&self) {
+    pub fn refresh_pair_flags(&self) {
         let Some(dir) = Self::receive_dir_from(self.identity_path.as_deref()) else {
             return; // 临时实例（CLI list 等）：无身份目录，跳过（60s 探活同样跳过）
         };
@@ -253,7 +257,7 @@ impl DiscoveryService {
             warn!(error = %e, "pairing mode mDNS re-register failed");
         }
         // 即时向已知设备同步 pair 标志（mDNS 公告可能被组播过滤/防火墙丢弃）
-        self.spawn_pair_flag_refresh();
+        self.refresh_pair_flags();
 
         if on {
             let this = Arc::clone(&self);
@@ -347,7 +351,29 @@ impl DiscoveryService {
                                 pair,
                             };
                             info!(?device, "resolved device");
-                            self.devices.write().insert(id, device);
+                            // 发现即同步：mDNS 带 pair=1 则直接入库；为 false 时
+                            // 主动拉一次 whoami——对端可能刚开启配对模式，其
+                            // unsolicited 组播公告可能被过滤/防火墙丢弃（真实反馈：
+                            // 手机配对页看不到电脑）。不等 60s 探活周期。
+                            let need_sync = !device.pair;
+                            self.devices.write().insert(id.clone(), device);
+                            if need_sync {
+                                let devices = Arc::clone(&self.devices);
+                                let dir = Self::receive_dir_from(self.identity_path.as_deref());
+                                if let Some(dir) = dir {
+                                    if let Ok(h) = tokio::runtime::Handle::try_current() {
+                                        h.spawn(async move {
+                                            let Some(mut d) =
+                                                devices.read().get(&id).cloned()
+                                            else {
+                                                return; // 已被移除
+                                            };
+                                            sync_device_via_whoami(&mut d, &dir).await;
+                                            devices.write().insert(id, d);
+                                        });
+                                    }
+                                }
+                            }
                         }
                         ServiceEvent::ServiceRemoved(_ty, fullname) => {
                             let id = fullname.split('.').next().unwrap_or("").to_string();

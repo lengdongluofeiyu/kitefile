@@ -165,6 +165,14 @@ async fn set_pair_mode(
     Ok(Json(pair_mode_status(&state)))
 }
 
+/// 立即刷新已知设备的 pair 标志（whoami 通道）。**不改变**本机配对模式
+/// 状态与倒计时——供添加设备页在搜索期间定期调用，兜住「对端比本机晚
+/// 开启配对模式」的同步窗口。
+async fn refresh_pair_flags(State(state): State<AppState>) -> Json<serde_json::Value> {
+    state.discovery.refresh_pair_flags();
+    Json(serde_json::json!({ "ok": true }))
+}
+
 // ---------------------------------------------------------------------------
 // 配对协议（P3，设计 §6）
 //
@@ -675,6 +683,8 @@ fn build_app(state: AppState, advertised_gateway_port: u16) -> Router {
         .route("/api/incoming-resp", post(incoming_resp))
         .route("/api/verify/:file_id", post(verify_file))
         .route("/api/pair/mode", get(get_pair_mode).post(set_pair_mode))
+        // 即时刷新已知设备的 pair 标志（不动本机倒计时）——添加设备页搜索期调用
+        .route("/api/pair/refresh", post(refresh_pair_flags))
         // 配对协议（P3）：hello/confirm 走局域网 TLS（Remote），
         // start/decide/pending 是本机 UI 入口（LocalOnly）
         .route("/api/pair/hello", post(pair_hello))
@@ -823,6 +833,7 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
         // ---- 仅本机：会控制本机的操作 ----
         (Method::POST, "/api/pair/mode", LocalOnly),
         (Method::GET, "/api/pair/mode", LocalOnly),
+        (Method::POST, "/api/pair/refresh", LocalOnly),
         (Method::POST, "/api/pair/start", LocalOnly),
         (Method::POST, "/api/pair/decide", LocalOnly),
         (Method::GET, "/api/pair/pending", LocalOnly),
