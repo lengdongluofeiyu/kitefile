@@ -293,7 +293,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  /// whoami 探测代数：后发起的覆盖先发起的，防止慢失败扫描把在线状态打掉
+  int _whoamiEpoch = 0;
+
   Future<void> _fetchWhoAmI() async {
+    final epoch = ++_whoamiEpoch;
     // 扫描序列：当前已知端口优先，随后全部候选（whoamiScanPorts）。
     // daemon 可能因端口保留退避到备选，只认默认端口会「看起来没启动」。
     for (final p in whoamiScanPorts(_daemonPort, daemonScanPorts)) {
@@ -301,7 +305,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         final r = await httpGet('http://$_daemonHost:$p/api/whoami')
             .timeout(const Duration(milliseconds: 800));
         final me = WhoAmI.fromJson(jsonDecode(r) as Map<String, dynamic>);
-        if (!mounted) return;
+        if (!mounted || epoch != _whoamiEpoch) return;
         setState(() {
           _daemonPort = p;
           _me = me;
@@ -316,9 +320,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         // 该端口没响应，试下一个
       }
     }
-    // 在线徽标唯一真值（A3.6）：所有候选都失败必须掉线，且不静默吞
+    if (!mounted || epoch != _whoamiEpoch) return;
+    // 已在线时先复测已知端口，避免单次瞬时失败闪黄
+    if (_daemonOnline && daemonScanPorts.isNotEmpty) {
+      try {
+        final r = await httpGet('http://$_daemonHost:$_daemonPort/api/whoami')
+            .timeout(const Duration(milliseconds: 600));
+        if (r.isNotEmpty && mounted && epoch == _whoamiEpoch) {
+          setState(() => _daemonOnline = true);
+          return;
+        }
+      } catch (_) {/* 复测仍失败 */}
+    }
+    if (!mounted || epoch != _whoamiEpoch) return;
+    // 在线徽标唯一真值（A3.6）：确认不可达后才掉线
     debugPrint('[kitefile] whoami unreachable on all candidates (host=$_daemonHost)');
-    if (mounted) setState(() => _daemonOnline = false);
+    setState(() => _daemonOnline = false);
   }
 
   Future<void> _refreshDevices() async {

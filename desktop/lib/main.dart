@@ -538,7 +538,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
     });
     // 启动期 1s 快速探测只为尽早 ready；超时后由上面的周期轮询继续兜底。
     _startupPollTimer = Timer.periodic(const Duration(seconds: 1), (t) async {
-      if (t.tick > 10) {
+      if (t.tick > 15) {
         t.cancel();
         return;
       }
@@ -555,15 +555,20 @@ class _HomePageState extends State<HomePage> with WindowListener {
     _refreshDevices();
   }
 
+  /// whoami 探测代数：后发起的探测覆盖先发起的，防止慢失败扫描
+  /// 把已成功的「在线」状态覆盖成离线（徽标黄一下再变绿的根因）。
+  int _whoamiEpoch = 0;
+
   Future<void> _fetchWhoAmI() async {
+    final epoch = ++_whoamiEpoch;
     // 扫描序列：当前已知端口优先，随后全部候选（whoamiScanPorts）。
     // daemon 若因端口保留退避到 17878 等备选，只认默认端口会永远发现不了。
     for (final p in whoamiScanPorts(daemonPort, daemonScanPorts)) {
       try {
         final r = await httpGet('http://127.0.0.1:$p/api/whoami')
-            .timeout(const Duration(seconds: 1));
+            .timeout(const Duration(milliseconds: 1500));
         final me = WhoAmI.fromJson(jsonDecode(r) as Map<String, dynamic>);
-        if (!mounted) return;
+        if (!mounted || epoch != _whoamiEpoch) return; // 已被更新的探测取代
         setState(() {
           daemonPort = p;
           _me = me;
@@ -579,8 +584,23 @@ class _HomePageState extends State<HomePage> with WindowListener {
         debugPrint('[kitefile] whoami @$p failed: $e');
       }
     }
-    // 在线徽标唯一真值（A3.6）：全部候选都失败必须掉线
-    if (mounted) setState(() => _daemonOnline = false);
+    if (!mounted || epoch != _whoamiEpoch) return;
+
+    // 全部候选失败。若徽标仍是在线，先立刻复测已知端口一次：
+    // 单次瞬时超时/并发抖动不应把徽标打成黄灯。
+    if (_daemonOnline && daemonScanPorts.isNotEmpty) {
+      try {
+        final r = await httpGet('http://127.0.0.1:$daemonPort/api/whoami')
+            .timeout(const Duration(milliseconds: 800));
+        if (r.isNotEmpty && mounted && epoch == _whoamiEpoch) {
+          setState(() => _daemonOnline = true);
+          return;
+        }
+      } catch (_) {/* 复测仍失败 → 继续掉线 */}
+    }
+    if (!mounted || epoch != _whoamiEpoch) return;
+    // 在线徽标唯一真值（A3.6）：确认不可达后才掉线
+    setState(() => _daemonOnline = false);
   }
 
   Future<void> _refreshDevices() async {
