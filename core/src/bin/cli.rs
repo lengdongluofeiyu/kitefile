@@ -10,15 +10,49 @@
 //! **开着意味着局域网内任何人都能让本机外传文件并读取接收目录**，
 //! 只在可信网络里临时开。
 
+// Windows release：编译成 GUI 子系统，桌面端 Process.start 拉起时不会弹终端。
+// Debug 保持 console，方便开发期直接看 stdout。
+// 注意：`windows_subsystem` 是 crate 级属性，必须放在文件最顶。
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("kitefile=info".parse()?))
-        .init();
+    // Release Windows 无控制台：tracing 改写 daemon.log，否则磁盘上无线索
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        let dir = kitefile::platform::default_receive_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("daemon.log");
+        let filter = EnvFilter::from_default_env()
+            .add_directive("kitefile=info".parse().unwrap_or_else(|_| "info".parse().unwrap()));
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .init();
+            }
+            Err(_) => {
+                tracing_subscriber::fmt().with_env_filter(filter).init();
+            }
+        }
+    }
+    #[cfg(not(all(windows, not(debug_assertions))))]
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::from_default_env().add_directive("kitefile=info".parse()?),
+            )
+            .init();
+    }
 
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
