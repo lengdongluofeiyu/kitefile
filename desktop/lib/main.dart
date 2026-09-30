@@ -2504,44 +2504,62 @@ class _HomePageState extends State<HomePage> with WindowListener {
     final sendHist =
         all.where((p) => _isTransferTerminal(p) && !p.incoming).toList();
 
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('传输中 (${active.length})',
-                style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 8),
-            if (active.isEmpty)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 8),
-                child: Text('暂无进行中的传输任务'),
-              )
-            else
-              Column(
-                children: active.map(_transferTile).toList(),
-              ),
-            const SizedBox(height: 4),
-            _collapsibleTransferList(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('传输中 (${active.length})',
+                    style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 8),
+                if (active.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 8),
+                    child: Text('暂无进行中的传输任务'),
+                  )
+                else
+                  Column(
+                    children: active.map((p) => _transferTile(p)).toList(),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: _collapsibleTransferList(
               title: '接收记录',
               count: recvHist.length,
               open: _recvOpen,
               onToggle: () => setState(() => _recvOpen = !_recvOpen),
               items: recvHist,
               emptyText: '暂无接收记录',
+              history: true,
             ),
-            _collapsibleTransferList(
+          ),
+        ),
+        const SizedBox(height: 16),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: _collapsibleTransferList(
               title: '发送记录',
               count: sendHist.length,
               open: _sendOpen,
               onToggle: () => setState(() => _sendOpen = !_sendOpen),
               items: sendHist,
               emptyText: '暂无发送记录',
+              history: true,
             ),
-          ],
+          ),
         ),
-      ),
+      ],
     );
   }
 
@@ -2552,6 +2570,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
     required VoidCallback onToggle,
     required List<TransferProgress> items,
     required String emptyText,
+    bool history = false,
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -2591,19 +2610,22 @@ class _HomePageState extends State<HomePage> with WindowListener {
             )
           else
             Column(
-              children: items.map(_transferTile).toList(),
+              children:
+                  items.map((p) => _transferTile(p, history: history)).toList(),
             ),
         ],
       ],
     );
   }
 
-  Widget _transferTile(TransferProgress p) {
+  /// 传输条目；`history=true` 时终态记录带 打开文件/文件夹/删除。
+  Widget _transferTile(TransferProgress p, {bool history = false}) {
     final pct = p.fileSize > 0 ? p.bytesTransferred / p.fileSize : 0.0;
-    // 角标与副文案来自共享层（§3.5 唯一源，工作流 C）
     final statusText = statusBadgeLabel(p);
     final statusColor = statusBadgeColor(p);
     final subtitle = transferSubtitle(p);
+    final isTerminal = _isTransferTerminal(p);
+    final path = p.filePath;
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
@@ -2636,7 +2658,6 @@ class _HomePageState extends State<HomePage> with WindowListener {
             subtitle,
             style: const TextStyle(fontSize: 12, color: Colors.grey),
           ),
-          // 已中断（§3.5）：继续传输 / 取消
           if (p.status == TransferStatus.interrupted)
             Row(
               children: [
@@ -2659,41 +2680,120 @@ class _HomePageState extends State<HomePage> with WindowListener {
                 ),
               ],
             ),
-          // 接收完成的条目：显示保存路径 + 打开文件 / 所在文件夹
-          if (p.status == TransferStatus.completed &&
-              p.incoming &&
-              p.filePath != null) ...[
-            const SizedBox(height: 4),
-            Text('已保存: ${p.filePath}',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontSize: 11, color: Colors.grey)),
-            Row(
-              children: [
-                TextButton.icon(
-                  style: TextButton.styleFrom(
-                    visualDensity: VisualDensity.compact,
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
+          // 历史记录操作：打开文件 / 所在文件夹 / 删除
+          if (history && isTerminal) ...[
+            if (path != null && path.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text('路径: $path',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 11, color: Colors.grey)),
+              Row(
+                children: [
+                  TextButton.icon(
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                    ),
+                    icon: const Icon(Icons.open_in_new, size: 14),
+                    label: const Text('打开文件'),
+                    onPressed: () => openFile(path),
                   ),
-                  icon: const Icon(Icons.open_in_new, size: 14),
-                  label: const Text('打开文件'),
-                  onPressed: () => openFile(p.filePath!),
-                ),
-                TextButton.icon(
-                  style: TextButton.styleFrom(
-                    visualDensity: VisualDensity.compact,
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                  TextButton.icon(
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                    ),
+                    icon: const Icon(Icons.folder_open, size: 14),
+                    label: const Text('所在文件夹'),
+                    onPressed: () => revealInFileManager(path),
                   ),
-                  icon: const Icon(Icons.folder_open, size: 14),
-                  label: const Text('所在文件夹'),
-                  onPressed: () => revealInFileManager(p.filePath!),
+                ],
+              ),
+            ],
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton.icon(
+                style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  foregroundColor: Colors.red[700],
                 ),
-              ],
+                icon: const Icon(Icons.delete_outline, size: 16),
+                label: const Text('删除记录'),
+                onPressed: () => _confirmDeleteTransferRecord(p),
+              ),
             ),
           ],
         ],
       ),
     );
+  }
+
+  /// 删除传输记录；接收记录可选同时删除本地文件。
+  Future<void> _confirmDeleteTransferRecord(TransferProgress p) async {
+    var deleteLocal = false;
+    final canDeleteLocal = p.incoming && p.filePath != null && p.filePath!.isNotEmpty;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text('删除记录'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('将从列表移除「${p.fileName}」。'),
+              if (canDeleteLocal) ...[
+                const SizedBox(height: 8),
+                CheckboxListTile(
+                  value: deleteLocal,
+                  onChanged: (v) => setDialogState(() => deleteLocal = v ?? false),
+                  title: const Text('同时删除本地文件'),
+                  subtitle: Text(p.filePath ?? '', maxLines: 2),
+                  contentPadding: EdgeInsets.zero,
+                  controlAffinity: ListTileControlAffinity.leading,
+                ),
+              ],
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: Colors.red[700]),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('删除'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (ok != true || !mounted) return;
+    setState(() => _progress.remove(p.fileId));
+    if (deleteLocal && p.filePath != null && p.filePath!.isNotEmpty) {
+      try {
+        final f = File(p.filePath!);
+        if (await f.exists()) {
+          await f.delete();
+        }
+        // 同步 daemon 接收目录（若文件名可识别）
+        final name = f.uri.pathSegments.isNotEmpty ? f.uri.pathSegments.last : '';
+        if (name.isNotEmpty) {
+          try {
+            await httpDelete(
+                '$kDaemonHttp/api/files/${Uri.encodeComponent(name)}');
+          } catch (_) {/* 本地已删则忽略 daemon 侧失败 */}
+        }
+        _showTopToast('已删除本地文件');
+      } catch (e) {
+        _showTopToast('删除本地文件失败: $e', error: true);
+      }
+    } else {
+      _showTopToast('已删除记录');
+    }
   }
 
   /// 「继续传输」：只重发未完成段（A3.2）。本机是发送方或接收方均由 daemon 路由。

@@ -936,7 +936,7 @@ fn build_app(state: AppState, advertised_gateway_port: u16) -> Router {
         .route("/api/peer-resume/:file_id", post(peer_resume))
         .route("/api/peer-resumed/:file_id", post(peer_resumed))
         .route("/api/files", get(list_files))
-        .route("/api/files/:name", get(download_file))
+        .route("/api/files/:name", get(download_file).delete(delete_file))
         .route("/api/incoming", post(incoming_offer).get(list_incoming))
         .route("/api/incoming/:id/accept", post(accept_incoming))
         .route("/api/incoming/:id/reject", post(reject_incoming))
@@ -1117,6 +1117,7 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
         (Method::POST, "/api/transfers/:file_id/resume", LocalOnly),
         (Method::GET, "/api/files", LocalOnly),
         (Method::GET, "/api/files/:name", LocalOnly),
+        (Method::DELETE, "/api/files/:name", LocalOnly),
         (Method::GET, "/api/incoming", LocalOnly),
         (Method::POST, "/api/incoming/:id/accept", LocalOnly),
         (Method::POST, "/api/incoming/:id/reject", LocalOnly),
@@ -1406,6 +1407,26 @@ async fn list_files(State(state): State<AppState>) -> Json<Vec<String>> {
         }
     }
     Json(names)
+}
+
+/// DELETE /api/files/:name — 删除接收目录中的文件（历史记录「同时删除本地文件」）
+async fn delete_file(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // 防目录穿越：文件名不得含路径分隔
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err((StatusCode::BAD_REQUEST, "非法文件名".into()));
+    }
+    let path = state.transfer.storage.receive_dir().join(&name);
+    if !path.is_file() {
+        return Err((StatusCode::NOT_FOUND, "文件不存在".into()));
+    }
+    tokio::fs::remove_file(&path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    info!(%name, "received file deleted");
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ============ 配置（接收目录等） ============
