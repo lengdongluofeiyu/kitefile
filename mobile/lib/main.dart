@@ -33,6 +33,20 @@ Future<String?> openFileNative(String path) async {
   }
 }
 
+/// 打开文件夹（DocumentsUI / 系统文件管理器）
+Future<String?> openFolderNative(String path) async {
+  try {
+    await _nativeChannel.invokeMethod('openFolder', path);
+    return null;
+  } on PlatformException catch (e) {
+    debugPrint('[openFolder] failed: ${e.code} ${e.message}');
+    return e.message ?? e.code;
+  } on MissingPluginException {
+    debugPrint('[openFolder] native method not available');
+    return '当前平台不支持打开文件夹';
+  }
+}
+
 /// KiteFile 移动端（Android / iOS）
 ///
 /// 架构：
@@ -1986,16 +2000,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(fontSize: 11, color: Colors.grey)),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  TextButton.icon(
-                    style: TextButton.styleFrom(
-                      visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(horizontal: 6),
-                    ),
-                    icon: const Icon(Icons.open_in_new, size: 16),
-                    label: const Text('打开文件'),
+            ],
+            const SizedBox(height: 2),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                if (path != null && path.isNotEmpty) ...[
+                  IconButton(
+                    tooltip: '打开文件',
+                    visualDensity: VisualDensity.compact,
+                    iconSize: 18,
+                    icon: const Icon(Icons.open_in_new),
                     onPressed: () async {
                       final err = await openFileNative(path);
                       if (err != null && mounted) {
@@ -2003,30 +2018,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       }
                     },
                   ),
-                  TextButton.icon(
-                    style: TextButton.styleFrom(
-                      visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(horizontal: 6),
-                    ),
-                    icon: const Icon(Icons.folder_open, size: 16),
-                    label: const Text('文件夹'),
+                  IconButton(
+                    tooltip: '打开文件夹',
+                    visualDensity: VisualDensity.compact,
+                    iconSize: 18,
+                    icon: const Icon(Icons.folder_open),
                     onPressed: () => _openFolderForPath(path),
                   ),
                 ],
-              ),
-            ],
-            Align(
-              alignment: Alignment.centerRight,
-              child: TextButton.icon(
-                style: TextButton.styleFrom(
+                IconButton(
+                  tooltip: '删除记录',
                   visualDensity: VisualDensity.compact,
-                  padding: const EdgeInsets.symmetric(horizontal: 6),
-                  foregroundColor: Colors.red[700],
+                  iconSize: 18,
+                  color: Colors.red[700],
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: () => _confirmDeleteTransferRecord(p),
                 ),
-                icon: const Icon(Icons.delete_outline, size: 16),
-                label: const Text('删除记录'),
-                onPressed: () => _confirmDeleteTransferRecord(p),
-              ),
+              ],
             ),
           ],
         ],
@@ -2034,10 +2042,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  /// 尝试打开文件所在目录；失败则提示路径（Android 目录打开能力有限）。
+  /// 打开文件所在目录（原生 DocumentsUI / 文件管理器）。
   Future<void> _openFolderForPath(String path) async {
     final dir = File(path).parent.path;
-    final err = await openFileNative(dir);
+    final err = await openFolderNative(dir);
     if (err != null && mounted) {
       _showTopToast('无法打开文件夹，请手动前往:\n$dir');
     }
@@ -2088,6 +2096,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ),
     );
     if (ok != true || !mounted) return;
+    try {
+      await httpDelete('$_httpBase/api/transfers/${p.fileId}/history');
+    } catch (_) {/* 本地内存仍移除 */}
     setState(() => _progress.remove(p.fileId));
     if (deleteLocal && p.filePath != null && p.filePath!.isNotEmpty) {
       try {

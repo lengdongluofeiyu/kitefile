@@ -181,6 +181,31 @@ fn is_terminal(s: &TransferStatus) -> bool {
     )
 }
 
+/// 历史文件最多保留条数（防无限膨胀）
+const TRANSFER_HISTORY_CAP: usize = 500;
+
+fn history_file_path(receive_dir: &std::path::Path) -> std::path::PathBuf {
+    receive_dir.join("transfer_history.json")
+}
+
+fn load_transfer_history(path: &std::path::Path) -> Vec<TransferProgress> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<TransferProgress>>(&bytes).unwrap_or_default()
+}
+
+fn save_transfer_history(path: &std::path::Path, items: &[TransferProgress]) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // 原子写：先写临时文件再 rename，避免半截 JSON
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, serde_json::to_vec(items).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 /// 推送一条进度帧。
 ///
 /// - **InProgress**：高频。用 `try_send`，通道满就直接丢。
@@ -495,6 +520,8 @@ pub struct TransferEngine {
     progress_bus: TokioMutex<Option<Arc<broadcast::Sender<TransferProgress>>>>,
     /// 全量进度快照：file_id → 最近一条进度（GET /api/transfers 用）
     progress_cache: Arc<Mutex<ProgressCache>>,
+    /// 终态传输历史（持久化到 receive_dir/transfer_history.json）
+    history: Arc<Mutex<Vec<TransferProgress>>>,
     /// 接收方速率统计：file_id → (上次采样时刻, 上次 bytes, 上次速度)
     recv_speed_state: TokioMutex<HashMap<String, (Instant, u64, u64)>>,
     /// 已接受的 incoming：file_id → (发送方 IP, 发送方 gateway 端口)
@@ -541,13 +568,16 @@ impl TransferEngine {
             outgoing_offers: Arc::new(TokioMutex::new(HashMap::new())),
             send_sessions: Arc::new(TokioMutex::new(HashMap::new())),
             incoming: Arc::new(IncomingManager::new()),
-            storage: Arc::new(StorageManager::new(receive_dir)),
+            storage: Arc::new(StorageManager::new(receive_dir.clone())),
             prefix_to_file_id: TokioMutex::new(HashMap::new()),
             recv_interrupted: Arc::new(Mutex::new(HashMap::new())),
             recv_active_conn: Arc::new(Mutex::new(HashMap::new())),
             recv_conn_seq: AtomicU64::new(1),
             progress_bus: TokioMutex::new(None),
             progress_cache: Arc::new(Mutex::new(ProgressCache::new(PROGRESS_CACHE_CAP))),
+            history: Arc::new(Mutex::new(load_transfer_history(
+                &receive_dir.join("transfer_history.json"),
+            ))),
             recv_speed_state: TokioMutex::new(HashMap::new()),
             incoming_endpoints: TokioMutex::new(HashMap::new()),
             outgoing_endpoints: TokioMutex::new(HashMap::new()),
@@ -610,15 +640,52 @@ impl TransferEngine {
         }
     }
 
-    /// 发布一条进度：写入全量快照 + 广播给订阅方
+    /// 发布一条进度：写入全量快照 + 广播给订阅方；终态同步写入持久化历史
     pub async fn publish_progress(&self, p: TransferProgress) {
         self.progress_cache.lock().insert(p.clone());
+        if is_terminal(&p.status) {
+            let path = history_file_path(&self.receive_dir);
+            let mut hist = self.history.lock();
+            if let Some(slot) = hist.iter_mut().find(|x| x.file_id == p.file_id) {
+                *slot = p.clone();
+            } else {
+                // 新记录追加到末尾；超出上限从最旧一端裁剪
+                hist.push(p.clone());
+                while hist.len() > TRANSFER_HISTORY_CAP {
+                    hist.remove(0);
+                }
+            }
+            save_transfer_history(&path, &hist);
+        }
         self.broadcast_progress(p).await;
     }
 
-    /// 当前所有传输的最近进度（GET /api/transfers 数据源）
+    /// 当前所有传输的最近进度：内存快照 ∪ 持久化历史（重启后仍可见）
     pub fn list_transfers(&self) -> Vec<TransferProgress> {
-        self.progress_cache.lock().snapshot()
+        let mem = self.progress_cache.lock().snapshot();
+        let hist = self.history.lock().clone();
+        let mem_ids: std::collections::HashSet<String> =
+            mem.iter().map(|p| p.file_id.clone()).collect();
+        let mut all = mem;
+        for h in hist {
+            if !mem_ids.contains(&h.file_id) {
+                all.push(h);
+            }
+        }
+        all
+    }
+
+    /// 从持久化历史删除一条记录（UI「删除记录」）
+    pub fn remove_history(&self, file_id: &str) -> bool {
+        let path = history_file_path(&self.receive_dir);
+        let mut hist = self.history.lock();
+        let before = hist.len();
+        hist.retain(|p| p.file_id != file_id);
+        let removed = hist.len() != before;
+        if removed {
+            save_transfer_history(&path, &hist);
+        }
+        removed
     }
 
     /// 取消一个传输（file_id 可能是本机作为发送方或接收方的任务）
@@ -1561,7 +1628,7 @@ impl TransferEngine {
                 status: TransferStatus::Canceled,
                 error: Some("canceled".into()),
                 incoming: false,
-                file_path: None,
+                file_path: Some(snap.file_path.to_string_lossy().into_owned()),
                 retry_note: None,
             },
         )
@@ -1585,7 +1652,7 @@ impl TransferEngine {
                 status: TransferStatus::Interrupted,
                 error: Some(error.to_string()),
                 incoming: false,
-                file_path: None,
+                file_path: Some(snap.file_path.to_string_lossy().into_owned()),
                 retry_note: None,
             },
         )
@@ -1833,7 +1900,8 @@ impl TransferEngine {
                         status: TransferStatus::Completed,
                         error: None,
                         incoming: false,
-                        file_path: None,
+                        // 发送方源文件路径：历史记录可打开文件/文件夹
+                        file_path: Some(snap.file_path.to_string_lossy().into_owned()),
                         retry_note: None,
                     },
                 )

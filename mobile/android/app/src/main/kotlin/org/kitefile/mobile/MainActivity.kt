@@ -105,6 +105,15 @@ class MainActivity : FlutterActivity() {
                         }
                         openFile(path, result)
                     }
+                    // 打开文件夹（DocumentsUI / 系统文件管理器）
+                    "openFolder" -> {
+                        val path = call.arguments as? String
+                        if (path.isNullOrEmpty()) {
+                            result.error("BAD_ARGS", "path required", null)
+                            return@setMethodCallHandler
+                        }
+                        openFolder(path, result)
+                    }
                     // 系统文件选择器（ACTION_OPEN_DOCUMENT，多选）。
                     // 返回 [{name, size, path}]，path = /proc/self/fd/N 直读原始文件。
                     "pickFiles" -> {
@@ -226,6 +235,80 @@ class MainActivity : FlutterActivity() {
             result.error("NO_APP", "没有应用可以打开此文件类型", null)
         } catch (e: Exception) {
             result.error("OPEN_FAILED", e.message, null)
+        }
+    }
+
+    /// 打开目录：DocumentsUI → FileProvider 目录 → 常见文件管理器
+    private fun openFolder(path: String, result: MethodChannel.Result) {
+        try {
+            val file = File(path)
+            val dir = if (file.isDirectory) file else file.parentFile
+            if (dir == null || !dir.isDirectory) {
+                result.error("NOT_FOUND", "directory not found: $path", null)
+                return
+            }
+            val abs = dir.absolutePath
+            val docId = when {
+                abs.startsWith("/storage/emulated/0/") ->
+                    "primary:" + abs.removePrefix("/storage/emulated/0/")
+                abs == "/storage/emulated/0" -> "primary:"
+                else -> abs
+            }
+
+            // 1) DocumentsUI（系统文件管理器）
+            try {
+                val documentsUri = Uri.parse(
+                    "content://com.android.externalstorage.documents/document/$docId"
+                )
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    data = documentsUri
+                }
+                startActivity(intent)
+                result.success(true)
+                return
+            } catch (_: Exception) {
+            }
+
+            // 2) FileProvider 目录 URI
+            try {
+                val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", dir)
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    data = uri
+                }
+                startActivity(intent)
+                result.success(true)
+                return
+            } catch (_: Exception) {
+            }
+
+            // 3) 常见文件管理器
+            val managers = listOf(
+                "com.android.documentsui",
+                "com.google.android.documentsui",
+                "com.android.fileexplorer",
+                "com.coloros.filemanager",
+                "com.estrongs.android.pop",
+                "com.miui.globalpackageinstaller",
+            )
+            for (pkg in managers) {
+                try {
+                    val pmIntent = packageManager.getLaunchIntentForPackage(pkg)
+                    if (pmIntent != null) {
+                        pmIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(pmIntent)
+                        result.success(true)
+                        return
+                    }
+                } catch (_: Exception) {
+                }
+            }
+            result.error("NO_APP", "未找到可用的文件管理器: $dir", null)
+        } catch (e: Exception) {
+            result.error("OPEN_FOLDER_FAILED", e.message, null)
         }
     }
 }

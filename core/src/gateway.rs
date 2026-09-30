@@ -53,7 +53,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use tower::Service;
@@ -930,6 +930,10 @@ fn build_app(state: AppState, advertised_gateway_port: u16) -> Router {
         .route("/api/devices", get(list_devices))
         .route("/api/send", post(send_file))
         .route("/api/transfers", get(list_transfers))
+        .route(
+            "/api/transfers/:file_id/history",
+            delete(delete_transfer_history),
+        )
         .route("/api/cancel/:file_id", post(cancel_transfer))
         // 续传（A3.2）：本机 UI 入口 / 对端 daemon 互相触发
         .route("/api/transfers/:file_id/resume", post(resume_transfer))
@@ -1112,6 +1116,7 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
         (Method::GET, "/api/peers", LocalOnly),
         (Method::POST, "/api/peers/:device_id/rename", LocalOnly),
         (Method::DELETE, "/api/peers/:device_id", LocalOnly),
+        (Method::DELETE, "/api/transfers/:file_id/history", LocalOnly),
         (Method::POST, "/api/send", LocalOnly),
         (Method::GET, "/api/transfers", LocalOnly),
         (Method::POST, "/api/transfers/:file_id/resume", LocalOnly),
@@ -1310,10 +1315,19 @@ struct TransfersList {
 }
 
 async fn list_transfers(State(state): State<AppState>) -> Json<TransfersList> {
-    // 全量快照由 engine 维护（每次 publish_progress 更新）
+    // 全量快照由 engine 维护（每次 publish_progress 更新）；含持久化历史
     Json(TransfersList {
         transfers: state.transfer.list_transfers(),
     })
+}
+
+/// DELETE /api/transfers/:file_id/history —— 从持久化历史删除记录
+async fn delete_transfer_history(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+) -> Json<serde_json::Value> {
+    let removed = state.transfer.remove_history(&file_id);
+    Json(serde_json::json!({ "ok": removed }))
 }
 
 async fn cancel_transfer(

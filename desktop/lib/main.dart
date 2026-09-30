@@ -2767,6 +2767,10 @@ class _HomePageState extends State<HomePage> with WindowListener {
       ),
     );
     if (ok != true || !mounted) return;
+    // 先删 daemon 持久化历史，再从 UI 移除
+    try {
+      await httpDelete('$kDaemonHttp/api/transfers/${p.fileId}/history');
+    } catch (_) {/* 本地内存仍移除 */}
     setState(() => _progress.remove(p.fileId));
     if (deleteLocal && p.filePath != null && p.filePath!.isNotEmpty) {
       try {
