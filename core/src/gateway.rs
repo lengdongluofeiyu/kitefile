@@ -322,7 +322,7 @@ async fn pair_hello(
         })
         .map_err(|_| (StatusCode::CONFLICT, "已有配对请求待处理".into()))?;
 
-    let code = crate::pairing::confirm_code(&fp, state.identity().fp());
+    let code = crate::pairing::confirm_code(&fp, state.identity().fp(), &session);
     let _ = state.ws_event_bus.send(WsEvent::PairRequest {
         session: session.clone(),
         name: req.name.clone(),
@@ -371,7 +371,11 @@ async fn pair_start(
         StatusCode::BAD_GATEWAY,
         "对方未出示服务端证书".into(),
     ))?;
-    let code = crate::pairing::confirm_code(state.identity().fp(), &fp_b);
+    let code = crate::pairing::confirm_code(
+        state.identity().fp(),
+        &fp_b,
+        &hello.pairing_session,
+    );
 
     state.discovery.pairing().set_out_pending(
         crate::pairing::OutPending {
@@ -499,7 +503,7 @@ async fn get_pair_pending(State(state): State<AppState>) -> Json<PairPendingResp
     let Some(p) = state.discovery.pairing().in_pending() else {
         return Json(PairPendingResponse { pending: None });
     };
-    let code = crate::pairing::confirm_code(&p.peer_fp, state.identity().fp());
+    let code = crate::pairing::confirm_code(&p.peer_fp, state.identity().fp(), &p.session);
     Json(PairPendingResponse {
         pending: Some(PairPendingView {
             session: p.session,
@@ -524,7 +528,7 @@ async fn pair_submit_code(
     if p.session != req.session {
         return Err((StatusCode::NOT_FOUND, "配对会话不匹配".into()));
     }
-    let expect = crate::pairing::confirm_code(&p.peer_fp, state.identity().fp());
+    let expect = crate::pairing::confirm_code(&p.peer_fp, state.identity().fp(), &p.session);
     let got = req.code.trim();
     if got != expect {
         return Err((
@@ -620,7 +624,7 @@ async fn pair_verify_forward(
             "无此配对会话或已过期（请重新发起配对）".into(),
         ));
     };
-    let expect = crate::pairing::confirm_code(state.identity().fp(), &p.peer_fp);
+    let expect = crate::pairing::confirm_code(state.identity().fp(), &p.peer_fp, &p.session);
     let got = req.code.trim();
     if got != expect {
         return Err((

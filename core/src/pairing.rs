@@ -27,17 +27,21 @@ pub const PAIR_SESSION_TTL: Duration = Duration::from_secs(60);
 /// 同一 IP 的 hello 限频窗口（原 N12：刷配对弹窗）
 pub const HELLO_RATE_WINDOW: Duration = Duration::from_secs(10);
 
-/// 联合确认码（设计 §6.2）：两台设备各自用 {自己指纹, 对端指纹} 独立算出
-/// **同一串 6 位数字**，用户在两屏比对。与计算顺序无关（指纹按字典序排）。
+/// 联合确认码（设计 §6.2）：两台设备各自用 {自己指纹, 对端指纹, 会话 id}
+/// 独立算出**同一串 6 位数字**。与计算顺序无关（指纹按字典序排）。
+///
+/// 混入 `session`：同一对设备每次配对会话的码都不同（UUID 每次随机），
+/// 避免「永远 409072」这种由固定指纹哈希导致的可预测码。
 ///
 /// 中间人必破：任一侧看到的证书变了，输入就不同 → 码不一致。
-pub fn confirm_code(fp_a: &str, fp_b: &str) -> String {
+pub fn confirm_code(fp_a: &str, fp_b: &str, session: &str) -> String {
     use sha2::{Digest, Sha256};
     let (lo, hi) = if fp_a <= fp_b { (fp_a, fp_b) } else { (fp_b, fp_a) };
     let mut h = Sha256::new();
-    h.update(b"kitefile-pair-v1");
+    h.update(b"kitefile-pair-v2"); // v2：加入 session
     h.update(lo.as_bytes());
     h.update(hi.as_bytes());
+    h.update(session.as_bytes());
     let d = h.finalize();
     let n = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
     format!("{:06}", n % 1_000_000)
@@ -336,27 +340,41 @@ mod tests {
     #[test]
     fn confirm_code_symmetric_and_formatted() {
         // 与顺序无关（设计 §6.2：指纹按字典序）
-        let a = confirm_code("fp-a", "fp-b");
-        let b = confirm_code("fp-b", "fp-a");
+        let a = confirm_code("fp-a", "fp-b", "s1");
+        let b = confirm_code("fp-b", "fp-a", "s1");
         assert_eq!(a, b, "确认码必须与计算顺序无关");
         assert_eq!(a.len(), 6, "6 位十进制");
         assert!(a.chars().all(|c| c.is_ascii_digit()), "纯数字：{a}");
 
         // 稳定金值：算法或盐一改这里必红（防止两端悄悄算出不同的码）
-        assert_eq!(confirm_code("aa", "bb"), confirm_code("aa", "bb"));
         let golden = confirm_code(
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
             "0000000000000000000000000000000000000000000000000000000000000000",
+            "session-abc",
         );
-        // 期望值由同一算法固化；若刻意升级算法，需两端同时发版并更新此值
-        assert_eq!(golden, confirm_code(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-        ));
+        assert_eq!(
+            golden,
+            confirm_code(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                "session-abc",
+            )
+        );
         assert_ne!(
-            confirm_code("fp-a", "fp-b"),
-            confirm_code("fp-a", "fp-c"),
+            confirm_code("fp-a", "fp-b", "s1"),
+            confirm_code("fp-a", "fp-c", "s1"),
             "不同对端必须出不同码"
+        );
+        // 同一对设备、不同会话 → 码必须不同（可预测性消除）
+        assert_ne!(
+            confirm_code("fp-a", "fp-b", "session-1"),
+            confirm_code("fp-a", "fp-b", "session-2"),
+            "不同配对会话必须出不同码，避免永远 409072"
+        );
+        // 同一对设备、同一会话 → 稳定
+        assert_eq!(
+            confirm_code("fp-a", "fp-b", "session-1"),
+            confirm_code("fp-a", "fp-b", "session-1")
         );
     }
 

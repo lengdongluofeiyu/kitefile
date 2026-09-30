@@ -539,19 +539,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
 
     var closed = false;
+    Timer? pendingPoll;
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => StatefulBuilder(builder: (ctx, setDialogState) {
-        // 轮询 pending：门禁状态变化 / 会话过期 / 对方取消
-        Future.delayed(const Duration(seconds: 1), () async {
-          if (closed || !ctx.mounted) return;
+        // 周期轮询：对方提交码后即使界面无 rebuild 也能刷到 code_verified
+        pendingPoll ??= Timer.periodic(const Duration(seconds: 1), (t) async {
+          if (closed || !ctx.mounted) {
+            t.cancel();
+            return;
+          }
           try {
             final r = await httpGet('$_httpBase/api/pair/pending');
             final j2 = jsonDecode(r) as Map<String, dynamic>;
             final pend = j2['pending'] as Map<String, dynamic>?;
             if (pend == null || pend['session'] != session) {
               closed = true;
+              t.cancel();
               if (ctx.mounted) Navigator.pop(ctx);
               if (mounted) {
                 _showTopToast('配对会话已结束或对方已取消', error: true);
@@ -643,6 +648,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         );
       }),
     );
+    pendingPoll?.cancel();
     closed = true;
   }
 
