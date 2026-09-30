@@ -601,6 +601,53 @@ class _HomePageState extends State<HomePage> with WindowListener {
     return d.name;
   }
 
+  /// 顶部置顶提示（弹窗遮挡时也可见）；error=true 用红底。
+  void _showTopToast(String message, {bool error = false}) {
+    if (!mounted) return;
+    final overlay = Overlay.maybeOf(context, rootOverlay: true);
+    if (overlay == null) return;
+    final entry = OverlayEntry(
+      builder: (ctx) {
+        final top = MediaQuery.of(ctx).padding.top + 8;
+        return Positioned(
+          top: top,
+          left: 16,
+          right: 16,
+          child: Material(
+            elevation: 12,
+            borderRadius: BorderRadius.circular(10),
+            color: error ? const Color(0xFFB71C1C) : const Color(0xFF1B5E20),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+              child: Row(
+                children: [
+                  Icon(
+                    error ? Icons.error_outline : Icons.check_circle_outline,
+                    color: Colors.white,
+                    size: 20,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      message,
+                      style: const TextStyle(color: Colors.white, fontSize: 13),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    overlay.insert(entry);
+    Future.delayed(const Duration(seconds: 4), () {
+      try {
+        entry.remove();
+      } catch (_) {}
+    });
+  }
+
   /// 仅改本机显示名（POST /api/peers/:id/rename）
   Future<void> _renamePeer(
       String deviceId, String currentName, {VoidCallback? onDone}) async {
@@ -642,14 +689,11 @@ class _HomePageState extends State<HomePage> with WindowListener {
       await _refreshDevices();
       onDone?.call();
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('已重命名为「$name」（仅本机可见）')),
-        );
+        _showTopToast('已重命名为「$name」（仅本机可见）');
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('重命名失败: $e')));
+        _showTopToast('重命名失败: $e', error: true);
       }
     }
   }
@@ -686,13 +730,11 @@ class _HomePageState extends State<HomePage> with WindowListener {
       await _refreshDevices();
       onDone?.call();
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('已删除「$name」')));
+        _showTopToast('已删除「$name」');
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('删除失败: $e')));
+        _showTopToast('删除失败: $e', error: true);
       }
     }
   }
@@ -800,16 +842,13 @@ class _HomePageState extends State<HomePage> with WindowListener {
         );
         await _refreshDevices();
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(accept ? '已与 $name 配对' : '已拒绝 $name 的配对请求'),
-            ),
-          );
+          _showTopToast(
+              accept ? '已与 $name 配对' : '已拒绝 $name 的配对请求',
+              error: !accept);
         }
       } catch (e) {
         if (mounted) {
-          ScaffoldMessenger.of(context)
-              .showSnackBar(SnackBar(content: Text('配对失败: $e')));
+          _showTopToast('配对失败: $e', error: true);
         }
       }
     }
@@ -829,9 +868,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
               closed = true;
               if (ctx.mounted) Navigator.pop(ctx);
               if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('配对会话已结束或对方已取消')),
-                );
+                _showTopToast('配对会话已结束或对方已取消', error: true);
               }
               return;
             }
@@ -935,9 +972,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
       ttl = (jsonDecode(r) as Map<String, dynamic>)['seconds_left'] as int? ?? 120;
     } catch (e) {
       if (mounted) {
-        debugPrint('[kitefile] 开启配对模式失败: $e ($kDaemonHttp/api/pair/mode)');
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('开启配对模式失败: $e')));
+        _showTopToast('开启配对模式失败: $e', error: true);
       }
       return;
     }
@@ -964,6 +999,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
     String? waitId;
     String? waitName;
     String? waitCode; // pair/start 返回的本机侧确认码（与对方屏上应一致）
+    String? waitSession; // pairing_session：提交码/取消必须用它，不能用 device_id
     var codeOk = false; // 发起方已输入正确确认码并已转发给对方
     var codeSubmitting = false;
     final codeCtrl = TextEditingController();
@@ -973,8 +1009,9 @@ class _HomePageState extends State<HomePage> with WindowListener {
     var stopped = false;
     StateSetter? waitSetState;
     Future<void> cancelSession() async {
-      final sid = waitId;
+      final sid = waitSession;
       waitId = null;
+      waitSession = null;
       codeOk = false;
       codeSubmitting = false;
       codeCtrl.clear();
@@ -1020,8 +1057,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
                 await _refreshDevices();
                 if (ctx.mounted) Navigator.pop(ctx);
                 if (mounted) {
-                  ScaffoldMessenger.of(context)
-                      .showSnackBar(SnackBar(content: Text('已与 $name 配对')));
+                  _showTopToast('已与 $name 配对');
                 }
                 return;
               }
@@ -1032,13 +1068,11 @@ class _HomePageState extends State<HomePage> with WindowListener {
                 final j = jsonDecode(r) as Map<String, dynamic>;
                 if (j['active'] != true && waitId != null) {
                   waitId = null;
+                  waitSession = null;
                   codeOk = false;
                   if (ctx.mounted) {
                     setDialogState(() {});
-                    ScaffoldMessenger.of(ctx).showSnackBar(
-                      const SnackBar(
-                          content: Text('配对会话已过期，请重新发起配对')),
-                    );
+                    _showTopToast('配对会话已过期，请重新发起配对', error: true);
                   }
                 }
               } catch (_) {}
@@ -1164,28 +1198,30 @@ class _HomePageState extends State<HomePage> with WindowListener {
                                       .replaceAll(RegExp(r'\s'), '');
                                   if (input.length != 6) {
                                     if (ctx.mounted) {
-                                      ScaffoldMessenger.of(ctx).showSnackBar(
-                                        const SnackBar(
-                                            content: Text(
-                                                '请输入对方屏幕上的 6 位数字')),
-                                      );
+                                      _showTopToast(
+                                          '请输入对方屏幕上的 6 位数字',
+                                          error: true);
                                     }
                                     return;
                                   }
                                   if (input != waitCode) {
                                     if (ctx.mounted) {
-                                      ScaffoldMessenger.of(ctx).showSnackBar(
-                                        const SnackBar(
-                                          content: Text(
-                                              '确认码不一致：请核对对方屏幕上的数字，可能有人在中间拦截'),
-                                        ),
-                                      );
+                                      _showTopToast(
+                                          '确认码不一致：请核对对方屏幕上的数字，可能有人在中间拦截',
+                                          error: true);
                                     }
                                     return;
                                   }
                                   setDialogState(() => codeSubmitting = true);
                                   try {
-                                    final sid = waitId;
+                                    final sid = waitSession;
+                                    if (sid == null || sid.isEmpty) {
+                                      setDialogState(
+                                          () => codeSubmitting = false);
+                                      _showTopToast('配对会话已丢失，请重新发起配对',
+                                          error: true);
+                                      return;
+                                    }
                                     final r = await httpPost(
                                       '$kDaemonHttp/api/pair/verify-forward',
                                       body: jsonEncode(
@@ -1198,6 +1234,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
                                         codeOk = true;
                                         codeSubmitting = false;
                                       });
+                                      _showTopToast('确认码已提交，等待对方确认');
                                     } else {
                                       setDialogState(
                                           () => codeSubmitting = false);
@@ -1206,11 +1243,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
                                     setDialogState(
                                         () => codeSubmitting = false);
                                     if (ctx.mounted) {
-                                      ScaffoldMessenger.of(ctx).showSnackBar(
-                                        SnackBar(
-                                            content:
-                                                Text('提交确认码失败: $e')),
-                                      );
+                                      _showTopToast('提交确认码失败: $e', error: true);
                                     }
                                   }
                                 },
@@ -1305,9 +1338,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
                                 });
                               } catch (e) {
                                 if (ctx.mounted) {
-                                  ScaffoldMessenger.of(ctx).showSnackBar(
-                                    SnackBar(content: Text('重试失败: $e')),
-                                  );
+                                  _showTopToast('重试失败: $e', error: true);
                                 }
                               }
                             },
@@ -1369,6 +1400,8 @@ class _HomePageState extends State<HomePage> with WindowListener {
                                                 as Map<String, dynamic>;
                                             setDialogState(() {
                                               waitId = d.id;
+                                              waitSession = j['pairing_session']
+                                                  as String?;
                                               waitName = _peerDisplayName(d);
                                               waitCode =
                                                   j['code'] as String? ?? '';
@@ -1377,10 +1410,9 @@ class _HomePageState extends State<HomePage> with WindowListener {
                                             });
                                           } catch (e) {
                                             if (ctx.mounted) {
-                                              ScaffoldMessenger.of(ctx)
-                                                  .showSnackBar(SnackBar(
-                                                      content: Text(
-                                                          '重新配对失败: $e ($kDaemonHttp)')));
+                                              _showTopToast(
+                                                  '重新配对失败: $e ($kDaemonHttp)',
+                                                  error: true);
                                             }
                                           }
                                         },
@@ -1460,6 +1492,8 @@ class _HomePageState extends State<HomePage> with WindowListener {
                                         as Map<String, dynamic>;
                                     setDialogState(() {
                                       waitId = d.id;
+                                      waitSession =
+                                          j['pairing_session'] as String?;
                                       waitName = _peerDisplayName(d);
                                       waitCode = j['code'] as String? ?? '';
                                       codeOk = false;
@@ -1467,11 +1501,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
                                     });
                                   } catch (e) {
                                     if (ctx.mounted) {
-                                      ScaffoldMessenger.of(ctx).showSnackBar(
-                                        SnackBar(
-                                            content: Text(
-                                                '发起配对失败: $e ($kDaemonHttp)')),
-                                      );
+                                      _showTopToast('发起配对失败: $e ($kDaemonHttp)', error: true);
                                     }
                                   }
                                 },
@@ -1609,14 +1639,10 @@ class _HomePageState extends State<HomePage> with WindowListener {
       await httpPost('$kDaemonHttp/api/incoming/batch-decide',
           body: jsonEncode({'batch_id': batchId, 'accept': true}));
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('已接受整批，等待对方开始传输…')),
-      );
+      _showTopToast('已接受整批，等待对方开始传输…');
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('接受失败: $e')),
-      );
+      _showTopToast('接受失败: $e', error: true);
     }
   }
 
@@ -1627,9 +1653,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
           body: jsonEncode({'batch_id': batchId, 'accept': false}));
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('拒绝失败: $e')),
-      );
+      _showTopToast('拒绝失败: $e', error: true);
     }
   }
 
@@ -1710,23 +1734,17 @@ class _HomePageState extends State<HomePage> with WindowListener {
   void _onIncomingTimeout(String incomingId) {
     setState(() => _pendingIncoming.remove(incomingId));
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('传输请求已超时（60 秒未接受）')),
-    );
+    _showTopToast('传输请求已超时（60 秒未接受）', error: true);
   }
 
   Future<void> _acceptIncoming(String id, {bool quiet = false}) async {
     try {
       await httpPost('$kDaemonHttp/api/incoming/$id/accept', body: '');
       if (quiet || !mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('已接受，等待对方开始传输…')),
-      );
+      _showTopToast('已接受，等待对方开始传输…');
     } catch (e) {
       if (quiet || !mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('接受失败: $e')),
-      );
+      _showTopToast('接受失败: $e', error: true);
     }
   }
 
@@ -1735,9 +1753,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
       await httpPost('$kDaemonHttp/api/incoming/$id/reject', body: '');
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('拒绝失败: $e')),
-      );
+      _showTopToast('拒绝失败: $e', error: true);
     }
   }
 
@@ -1862,9 +1878,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
                           });
                         } catch (e) {
                           if (ctx.mounted) {
-                            ScaffoldMessenger.of(ctx).showSnackBar(
-                              SnackBar(content: Text('切换配对模式失败: $e')),
-                            );
+                            _showTopToast('切换配对模式失败: $e', error: true);
                           }
                         }
                       },
@@ -1958,9 +1972,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
                                 await _refreshDevices();
                               } catch (e) {
                                 if (ctx.mounted) {
-                                  ScaffoldMessenger.of(ctx).showSnackBar(
-                                    SnackBar(content: Text('重命名失败: $e')),
-                                  );
+                                  _showTopToast('重命名失败: $e', error: true);
                                 }
                               }
                             },
@@ -2011,9 +2023,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
                                 await _refreshDevices();
                               } catch (e) {
                                 if (ctx.mounted) {
-                                  ScaffoldMessenger.of(ctx).showSnackBar(
-                                    SnackBar(content: Text('删除失败: $e')),
-                                  );
+                                  _showTopToast('删除失败: $e', error: true);
                                 }
                               }
                             },
@@ -2052,15 +2062,11 @@ class _HomePageState extends State<HomePage> with WindowListener {
                           // 不刷新的话「本机信息」会一直显示旧名字。
                           await _fetchWhoAmI();
                           if (ctx.mounted) {
-                            ScaffoldMessenger.of(ctx).showSnackBar(
-                              SnackBar(content: Text('设备名称已更新：$name')),
-                            );
+                            _showTopToast('设备名称已更新：$name');
                           }
                         } catch (e) {
                           if (ctx.mounted) {
-                            ScaffoldMessenger.of(ctx).showSnackBar(
-                              SnackBar(content: Text('设置失败: $e')),
-                            );
+                            _showTopToast('设置失败: $e', error: true);
                           }
                         }
                       },
@@ -2104,15 +2110,11 @@ class _HomePageState extends State<HomePage> with WindowListener {
                           (jsonDecode(r) as Map<String, dynamic>)['receive_dir'] as String?;
                       setDialogState(() => currentDir = nd ?? dir);
                       if (ctx.mounted) {
-                        ScaffoldMessenger.of(ctx).showSnackBar(
-                          SnackBar(content: Text('保存位置已更新：$dir')),
-                        );
+                        _showTopToast('保存位置已更新：$dir');
                       }
                     } catch (e) {
                       if (ctx.mounted) {
-                        ScaffoldMessenger.of(ctx).showSnackBar(
-                          SnackBar(content: Text('设置失败: $e')),
-                        );
+                        _showTopToast('设置失败: $e', error: true);
                       }
                     }
                   },
@@ -2157,14 +2159,10 @@ class _HomePageState extends State<HomePage> with WindowListener {
       final r = await httpPost('$kDaemonHttp/api/send', body: jsonEncode(body));
       final fileId = (jsonDecode(r) as Map<String, dynamic>)['file_id'] as String;
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('已发起传输: $fileId')),
-      );
+      _showTopToast('已发起传输: $fileId');
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('发起失败: $e')),
-      );
+      _showTopToast('发起失败: $e', error: true);
     }
   }
 
@@ -2604,9 +2602,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
     // 2. 过滤出有真实路径的文件
     final picks = result.files.where((f) => f.path != null).toList();
     if (picks.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('无法获取所选文件的路径')),
-      );
+      _showTopToast('无法获取所选文件的路径', error: true);
       return;
     }
 
