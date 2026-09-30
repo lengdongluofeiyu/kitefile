@@ -1288,9 +1288,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           }
         },
         onDone: () {
-          // WS 断开（进程退出/网络断）：立刻掉线真值 + 复核 whoami + 重连
+          // WS 断开 ≠ daemon 死了。徽标真值只由 whoami 定；
+          // 直接置离线会在 whoami 仍通时造成「已连接→黄→已连接」抖动。
           debugPrint('[kitefile] ws closed');
-          if (mounted) setState(() => _daemonOnline = false);
           _ws = null;
           _fetchWhoAmI();
           if (mounted) {
@@ -1301,7 +1301,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         },
         onError: (Object e) {
           debugPrint('[kitefile] ws error: $e');
-          if (mounted) setState(() => _daemonOnline = false);
+          _fetchWhoAmI();
         },
       );
     } catch (e) {

@@ -180,6 +180,8 @@ class DaemonManager {
   Process? _process;
   bool _spawned = false;
   bool _isReady = false;
+  /// 单飞：并发调用 ensureRunning 只拉起一次，避免双 daemon 抢端口
+  Future<void>? _ensureFuture;
 
   /// 是否由本进程启动了 daemon（用于判断关闭时是否需要 kill）
   bool get spawnedByUs => _spawned;
@@ -187,8 +189,12 @@ class DaemonManager {
   /// daemon 是否已就绪
   bool get isReady => _isReady;
 
-  /// 确保 daemon 在运行。返回 true 表示已就绪（可能本次启动需要等待几秒）。
-  Future<void> ensureRunning() async {
+  /// 确保 daemon 在运行。并发调用共享同一 Future，绝不重复 spawn。
+  Future<void> ensureRunning() {
+    return _ensureFuture ??= _ensureRunningImpl();
+  }
+
+  Future<void> _ensureRunningImpl() async {
     // 1. 先检查是否已经有 daemon 在跑
     if (await _isAlive()) {
       _isReady = true;
@@ -246,6 +252,8 @@ class DaemonManager {
       _spawned = false;
       _isReady = false;
     }
+    // 允许 stop 之后再次 ensureRunning（单飞 Future 作废）
+    _ensureFuture = null;
   }
 
   /// 检查 daemon 是否响应。
@@ -765,9 +773,10 @@ class _HomePageState extends State<HomePage> with WindowListener {
           }
         },
         onDone: () {
-          // daemon 退出 / WS 断开：立刻掉线真值 + 复核 whoami + 重连
+          // WS 断开 ≠ daemon 死了。徽标真值只由 whoami 轮询定；
+          // 这里只清 WS 句柄并复核 + 重连。若在此直接置离线，会出现
+          // 「已连接 → 黄灯 → 又变已连接」抖动（whoami 仍通时被 WS 误伤）。
           debugPrint('[kitefile] ws closed');
-          if (mounted) setState(() => _daemonOnline = false);
           _ws = null;
           _fetchWhoAmI();
           Future.delayed(const Duration(seconds: 5), () {
@@ -775,8 +784,9 @@ class _HomePageState extends State<HomePage> with WindowListener {
           });
         },
         onError: (Object e) {
+          // 同上：不改徽标，只复核 whoami 真值
           debugPrint('[kitefile] ws error: $e');
-          if (mounted) setState(() => _daemonOnline = false);
+          _fetchWhoAmI();
         },
       );
     } catch (e) {
