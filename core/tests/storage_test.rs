@@ -175,7 +175,43 @@ async fn test_abort_keeps_part_file() {
 
     let slot = mgr.abort("file-uuid-7890").await.unwrap();
     assert!(mgr.list_in_progress().await.is_empty());
-    assert!(slot.temp_path.exists(), "abort 必须保留 .part");
+    assert!(slot.temp_path.exists(), "abort 必须保留 .part（中断/失败排查）");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_abort_and_remove_temp_deletes_part_file() {
+    let dir = temp_recv_dir("abort-del");
+    let mgr = StorageManager::new(dir.clone());
+
+    mgr.create_slot(
+        "file-uuid-cancel".into(),
+        "cancel-me.bin".into(),
+        8,
+        1,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    mgr.write_at("file-uuid-cancel", 0, b"AAAA").await.unwrap();
+
+    let slot = mgr.abort_and_remove_temp("file-uuid-cancel").await.unwrap();
+    assert!(mgr.list_in_progress().await.is_empty());
+    assert!(
+        !slot.temp_path.exists(),
+        "确定取消必须删除 .part，实际仍存在: {}",
+        slot.temp_path.display()
+    );
+    // 接收目录里不应残留该任务的 .part
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains("cancel-me") && n.ends_with(".part"))
+        .collect();
+    assert!(leftovers.is_empty(), "目录内不应残留 .part: {leftovers:?}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

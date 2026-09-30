@@ -21,7 +21,9 @@ void main() {
     expect(find.text('KiteFile'), findsOneWidget);
     expect(find.text('本机 / 守护进程'), findsOneWidget);
     expect(find.text('设备列表 (0)'), findsOneWidget);
-    expect(find.text('传输进度 (0)'), findsOneWidget);
+    expect(find.text('传输中 (0)'), findsOneWidget);
+    expect(find.text('接收记录 (0)'), findsOneWidget);
+    expect(find.text('发送记录 (0)'), findsOneWidget);
 
     // 销毁页面（触发 dispose：取消周期定时器、移除生命周期观察者），
     // 再推进假时间让启动轮询的在途延迟落地——其 while 条件依赖 mounted，

@@ -4,7 +4,7 @@
 //! - 每个传输任务在 receive_dir 下创建 `<file_name>.<id8>.part` 临时文件（预分配大小）
 //! - N 条 TCP 流各写一段连续字节区间（`stream_layout`），流内顺序写、无 ACK
 //! - 全部流完成 + 校验通过后，原子重命名为最终文件名
-//! - 中止（abort）时保留 .part 文件
+//! - 中止（abort，中断/失败排查）时保留 .part；**确定取消**时删除 .part
 //!
 //! TODO: 保留 .part **不等于**支持断点续传。槽位与流完成位图只存在于
 //! 内存，进程重启即丢失。要真正续传，得先把槽位元数据落盘（含分段布局、
@@ -391,11 +391,39 @@ impl StorageManager {
 
     /// 中止接收：移除槽位（不再接受该文件的流），**保留 .part 文件**。
     ///
-    /// 注意这里只移除内存里的槽位，不删磁盘文件。保留下来是为了事后排查
-    /// 传输失败的原因（落盘内容、偏移都对不对）。
-    /// 它不是断点续传的基础——位图随槽位一起没了，重启后无从续起，见文件头 TODO。
+    /// 用于中断（可续传）与不可重试失败的排查现场——不是断点续传的基础，
+    /// 位图随槽位一起没了，重启后无从续起，见文件头 TODO。
     pub async fn abort(&self, file_id: &str) -> Option<ReceiveSlot> {
         self.slots.lock().await.remove(file_id)
+    }
+
+    /// **确定取消**时中止接收并删除 `.part` 临时文件。
+    ///
+    /// 与 [`Self::abort`] 的区别：取消是用户明确放弃，临时文件没有留存价值，
+    /// 必须主动清掉，避免接收目录被半成品占满。中断/失败仍走 abort 保留现场。
+    pub async fn abort_and_remove_temp(&self, file_id: &str) -> Option<ReceiveSlot> {
+        let slot = self.slots.lock().await.remove(file_id);
+        if let Some(s) = &slot {
+            match tokio::fs::remove_file(&s.temp_path).await {
+                Ok(()) => {
+                    info!(
+                        %file_id,
+                        path = %s.temp_path.display(),
+                        "removed canceled transfer temp file"
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(
+                        %file_id,
+                        path = %s.temp_path.display(),
+                        error = %e,
+                        "remove canceled transfer temp file failed"
+                    );
+                }
+            }
+        }
+        slot
     }
 
     pub async fn list_in_progress(&self) -> Vec<ReceiveSlot> {

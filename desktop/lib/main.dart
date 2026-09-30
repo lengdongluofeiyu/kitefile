@@ -330,6 +330,9 @@ class _HomePageState extends State<HomePage> with WindowListener {
   List<Map<String, dynamic>> _peers = [];
   final Map<String, TransferProgress> _progress = {};
   final Map<String, IncomingEntry> _pendingIncoming = {};
+  /// 首页传输记录折叠态：接收/发送列表默认收起，完成的任务不占进度区
+  bool _recvOpen = false;
+  bool _sendOpen = false;
   /// 攒批—决策—迟到沿用状态机（工作流 C：共享实现，双端仅此一份）
   late final BatchDecider _batchDecider;
   /// 已经为该 fileId 弹过完成提示，避免重复弹窗
@@ -993,9 +996,19 @@ class _HomePageState extends State<HomePage> with WindowListener {
             .where((d) =>
                 !d.pair && !peers.any((p) => p['device_id'] == d.id))
             .toList();
-        final pairedCount = devices
+        // 配对页也展示**已配对**设备：对方开启配对模式时可「重新配对」
+        //（应对单方删除设备后的信任重建）。离线的已配对设备仅展示状态。
+        final pairedOnMap = devices
             .where((d) => peers.any((p) => p['device_id'] == d.id))
-            .length;
+            .toList();
+        final offlinePaired = peers
+            .where((p) => !devices.any((d) => d.id == p['device_id']))
+            .toList();
+        final pairedCount = pairedOnMap.length + offlinePaired.length;
+        final anyVisible = pairable.isNotEmpty ||
+            notReady.isNotEmpty ||
+            pairedOnMap.isNotEmpty ||
+            offlinePaired.isNotEmpty;
 
         return AlertDialog(
           title: const Row(
@@ -1166,7 +1179,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
                           style: TextStyle(fontSize: 12, color: Colors.grey),
                         ),
                         const SizedBox(height: 12),
-                        if (pairable.isEmpty && notReady.isEmpty)
+                        if (!anyVisible)
                           const Padding(
                             padding: EdgeInsets.symmetric(vertical: 16),
                             child: Center(
@@ -1182,6 +1195,92 @@ class _HomePageState extends State<HomePage> with WindowListener {
                             ),
                           )
                         else ...[
+                          if (pairedOnMap.isNotEmpty) ...[
+                            Text('已配对设备',
+                                style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    color: Colors.grey[800])),
+                            for (final d in pairedOnMap)
+                              ListTile(
+                                dense: true,
+                                contentPadding: EdgeInsets.zero,
+                                title: Text(_peerDisplayName(d)),
+                                subtitle: Text(
+                                  '${d.platform} · ${d.ip} · 已配对',
+                                  style: const TextStyle(fontSize: 12),
+                                ),
+                                trailing: d.pair
+                                    ? FilledButton.tonal(
+                                        onPressed: () async {
+                                          try {
+                                            final r = await httpPost(
+                                              '$kDaemonHttp/api/pair/start',
+                                              body: jsonEncode({
+                                                'device_id': d.id,
+                                                'name': d.name,
+                                                'platform': d.platform,
+                                                'ip': d.ip,
+                                                'gateway_port': d.gatewayPort,
+                                              }),
+                                            );
+                                            final j = jsonDecode(r)
+                                                as Map<String, dynamic>;
+                                            setDialogState(() {
+                                              waitId = d.id;
+                                              waitName = _peerDisplayName(d);
+                                              waitCode =
+                                                  j['code'] as String? ?? '';
+                                              codeOk = false;
+                                              codeCtrl.clear();
+                                            });
+                                          } catch (e) {
+                                            if (ctx.mounted) {
+                                              ScaffoldMessenger.of(ctx)
+                                                  .showSnackBar(SnackBar(
+                                                      content: Text(
+                                                          '重新配对失败: $e ($kDaemonHttp)')));
+                                            }
+                                          }
+                                        },
+                                        child: const Text('重新配对'),
+                                      )
+                                    : const Icon(Icons.lock_outline,
+                                        size: 18, color: Colors.grey),
+                              ),
+                            if (pairedOnMap.any((d) => !d.pair))
+                              Padding(
+                                padding: const EdgeInsets.only(
+                                    left: 12, bottom: 4),
+                                child: Text(
+                                  '对方未开启配对模式时无法重新配对；请对方也打开本页面。',
+                                  style: TextStyle(
+                                      fontSize: 11, color: Colors.grey[600]),
+                                ),
+                              ),
+                            const Divider(height: 12),
+                          ],
+                          if (offlinePaired.isNotEmpty) ...[
+                            Text('离线已配对',
+                                style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    color: Colors.grey[800])),
+                            for (final p in offlinePaired)
+                              ListTile(
+                                dense: true,
+                                contentPadding: EdgeInsets.zero,
+                                leading: const Icon(Icons.cloud_off,
+                                    size: 18, color: Colors.grey),
+                                title: Text(
+                                    (p['name_hint'] as String?) ?? '未知设备'),
+                                subtitle: Text(
+                                  '${p['platform'] ?? ''} · 离线 · 已配对',
+                                  style: const TextStyle(fontSize: 12),
+                                ),
+                              ),
+                            const Divider(height: 12),
+                          ],
                           for (final d in notReady)
                             ListTile(
                               dense: true,
@@ -1229,7 +1328,8 @@ class _HomePageState extends State<HomePage> with WindowListener {
                                     if (ctx.mounted) {
                                       ScaffoldMessenger.of(ctx).showSnackBar(
                                         SnackBar(
-                                            content: Text('发起配对失败: $e ($kDaemonHttp)')),
+                                            content: Text(
+                                                '发起配对失败: $e ($kDaemonHttp)')),
                                       );
                                     }
                                   }
@@ -2102,29 +2202,125 @@ class _HomePageState extends State<HomePage> with WindowListener {
     );
   }
 
+  /// 传输进行中（占用进度区）：pending / inProgress / interrupted（可续传）
+  static bool _isTransferActive(TransferProgress p) =>
+      p.status == TransferStatus.pending ||
+      p.status == TransferStatus.inProgress ||
+      p.status == TransferStatus.interrupted;
+
+  /// 传输终态（进入接收/发送记录，不占进度区）
+  static bool _isTransferTerminal(TransferProgress p) => !_isTransferActive(p);
+
   Widget _transfersSection() {
-    final items = _progress.values.toList()
-      ..sort((a, b) => a.status == TransferStatus.inProgress ? -1 : 1);
+    final all = _progress.values.toList()
+      ..sort((a, b) {
+        if (a.status == TransferStatus.inProgress &&
+            b.status != TransferStatus.inProgress) {
+          return -1;
+        }
+        if (b.status == TransferStatus.inProgress &&
+            a.status != TransferStatus.inProgress) {
+          return 1;
+        }
+        return 0;
+      });
+    final active = all.where(_isTransferActive).toList();
+    final recvHist =
+        all.where((p) => _isTransferTerminal(p) && p.incoming).toList();
+    final sendHist =
+        all.where((p) => _isTransferTerminal(p) && !p.incoming).toList();
+
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('传输进度 (${items.length})', style: Theme.of(context).textTheme.titleMedium),
+            Text('传输中 (${active.length})',
+                style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
-            if (items.isEmpty)
+            if (active.isEmpty)
               const Padding(
                 padding: EdgeInsets.symmetric(vertical: 8),
-                child: Text('暂无传输任务'),
+                child: Text('暂无进行中的传输任务'),
               )
             else
               Column(
-                children: items.map(_transferTile).toList(),
+                children: active.map(_transferTile).toList(),
               ),
+            const SizedBox(height: 4),
+            _collapsibleTransferList(
+              title: '接收记录',
+              count: recvHist.length,
+              open: _recvOpen,
+              onToggle: () => setState(() => _recvOpen = !_recvOpen),
+              items: recvHist,
+              emptyText: '暂无接收记录',
+            ),
+            _collapsibleTransferList(
+              title: '发送记录',
+              count: sendHist.length,
+              open: _sendOpen,
+              onToggle: () => setState(() => _sendOpen = !_sendOpen),
+              items: sendHist,
+              emptyText: '暂无发送记录',
+            ),
           ],
         ),
       ),
+    );
+  }
+
+  Widget _collapsibleTransferList({
+    required String title,
+    required int count,
+    required bool open,
+    required VoidCallback onToggle,
+    required List<TransferProgress> items,
+    required String emptyText,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          onTap: onToggle,
+          borderRadius: BorderRadius.circular(4),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Row(
+              children: [
+                Icon(
+                  open ? Icons.expand_less : Icons.expand_more,
+                  size: 20,
+                  color: Colors.grey[700],
+                ),
+                const SizedBox(width: 4),
+                Text('$title ($count)',
+                    style: Theme.of(context)
+                        .textTheme
+                        .titleSmall
+                        ?.copyWith(fontWeight: FontWeight.w600)),
+                const Spacer(),
+                if (count > 0 && !open)
+                  Text('点击查看',
+                      style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ],
+            ),
+          ),
+        ),
+        if (open) ...[
+          if (items.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(left: 24, bottom: 4),
+              child: Text(emptyText,
+                  style: const TextStyle(color: Colors.grey, fontSize: 12)),
+            )
+          else
+            Column(
+              children: items.map(_transferTile).toList(),
+            ),
+        ],
+      ],
     );
   }
 

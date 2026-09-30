@@ -282,15 +282,14 @@ async fn pair_hello(
     let fp = fp_opt
         .0
         .ok_or((StatusCode::UNAUTHORIZED, "配对需要出示客户端证书".into()))?;
-    // 已配对拒绝覆盖（Q3）：fp 命中，或自称的 device_id 已在表里（重装需先解除）
-    if state.peers.contains_fp(&fp) {
-        return Err((StatusCode::CONFLICT, "该设备证书已配对".into()));
-    }
-    if state.peers.get(&req.device_id).is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            "该设备已配对；若对方重装过，请先在设备管理中解除配对".into(),
-        ));
+    // 已配对：配对模式开启时允许**重新配对**（应对单方删除设备后重建信任；
+    // 确认码 + 用户点确认仍是门禁）。模式关闭时仍拒绝覆盖（Q3）。
+    if state.peers.contains_fp(&fp) || state.peers.get(&req.device_id).is_some() {
+        info!(
+            %ip,
+            name = %req.name,
+            "re-pair requested for already-paired device (pairing mode on)"
+        );
     }
     let session = uuid::Uuid::new_v4().simple().to_string();
     pairing

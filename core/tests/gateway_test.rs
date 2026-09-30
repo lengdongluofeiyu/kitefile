@@ -1796,6 +1796,76 @@ async fn lan_whoami_scan_discovers_peer_without_mdns() {
     let _ = std::fs::remove_dir_all(&dir_b);
 }
 
+/// 重新配对：双方都已在 peers 表且都开着配对模式时，
+/// hello 不得 409，必须能走完确认码流程（单方删除后的信任重建）。
+#[tokio::test]
+async fn test_repair_allows_hello_when_both_paired() {
+    let dir_a = temp_dir("repa-a");
+    let dir_b = temp_dir("repa-b");
+    let _a = start_stack_isolated("repa-a", 18084, 18184, &dir_a, 2).await;
+    let _b = start_stack_isolated("repa-b", 18085, 18185, &dir_b, 2).await;
+
+    let start_body = r#"{"device_id":"peer-b","name":"B机","platform":"windows","ip":"127.0.0.1","gateway_port":19185}"#;
+
+    let (st, _) = http(18084, "POST", "/api/pair/mode", Some(r#"{"enabled":true}"#)).await;
+    assert_eq!(st, 200);
+    let (st, _) = http(18085, "POST", "/api/pair/mode", Some(r#"{"enabled":true}"#)).await;
+    assert_eq!(st, 200);
+
+    let (st, body) = http(18084, "POST", "/api/pair/start", Some(start_body)).await;
+    assert_eq!(st, 200, "first pair: {}", String::from_utf8_lossy(&body));
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let session = v["pairing_session"].as_str().unwrap().to_string();
+    let (st, _) = http(
+        18085,
+        "POST",
+        "/api/pair/decide",
+        Some(&format!(r#"{{"session":"{session}","accept":true}}"#)),
+    )
+    .await;
+    assert_eq!(st, 200);
+
+    let (st, _) = http(18084, "POST", "/api/pair/mode", Some(r#"{"enabled":true}"#)).await;
+    assert_eq!(st, 200);
+    let (st, _) = http(18085, "POST", "/api/pair/mode", Some(r#"{"enabled":true}"#)).await;
+    assert_eq!(st, 200);
+
+    // hello 同 IP 限频 10s（HELLO_RATE_WINDOW）：重配对前等窗口过期
+    tokio::time::sleep(Duration::from_secs(11)).await;
+
+    let (st, body) = http(18084, "POST", "/api/pair/start", Some(start_body)).await;
+    assert_eq!(
+        st, 200,
+        "re-pair hello/start 在双方已配对且配对模式开启时必须成功: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let session2 = v["pairing_session"].as_str().unwrap().to_string();
+    let (st, resp) = http(
+        18085,
+        "POST",
+        "/api/pair/decide",
+        Some(&format!(r#"{{"session":"{session2}","accept":true}}"#)),
+    )
+    .await;
+    assert_eq!(st, 200, "re-pair decide: {}", String::from_utf8_lossy(&resp));
+
+    let a_peers = http_json(18084, "GET", "/api/peers", None).await;
+    assert!(
+        a_peers
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["device_id"] == "peer-b"),
+        "重新配对后 A 仍应持有 B: {a_peers}"
+    );
+
+    let _ = http(18084, "POST", "/api/pair/mode", Some(r#"{"enabled":false}"#)).await;
+    let _ = http(18085, "POST", "/api/pair/mode", Some(r#"{"enabled":false}"#)).await;
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
 /// N2 回归：stream_count 必须由发送方带过去，接收方按它建槽。
 ///
 /// 这是唯一一条能在合入前抓住「静默数据损坏」的测试。

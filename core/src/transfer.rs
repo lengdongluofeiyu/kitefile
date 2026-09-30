@@ -640,7 +640,7 @@ impl TransferEngine {
             found = true;
         }
 
-        // 发送方取消 → 通知接收方联动取消。
+        // 发送方取消 → 通知接收方联动取消（接收方 cancel 路径会删 .part）。
         if let Some((target_ip, target_gateway_port)) =
             self.outgoing_endpoints.lock().await.remove(file_id)
         {
@@ -700,7 +700,7 @@ impl TransferEngine {
             found = true;
         }
 
-        // ---- 接收方视角：移除接收槽位、清理映射、推 Canceled ----
+        // ---- 接收方视角：移除接收槽位、删除 .part、清理映射、推 Canceled ----
         let slot = self
             .storage
             .list_in_progress()
@@ -708,7 +708,8 @@ impl TransferEngine {
             .into_iter()
             .find(|s| s.file_id == file_id);
         if let Some(slot) = slot {
-            self.storage.abort(file_id).await;
+            // 确定取消 → 主动删临时文件（中断/失败仍走 abort 保留 .part 排查）
+            self.storage.abort_and_remove_temp(file_id).await;
             let prefix = file_id_prefix_u64(file_id);
             self.prefix_to_file_id.lock().await.remove(&prefix);
             self.incoming.remove_by_file_id(file_id);
