@@ -1581,6 +1581,10 @@ async fn test_pairing_flow_end_to_end() {
         Some(code_a.as_str()),
         "两端确认码必须一致——不一致说明中间有人换了证书"
     );
+    assert!(
+        code_a != "409072" || session.len() > 8,
+        "确认码不得再退化成固定指纹哈希（session 必须参与）"
+    );
     assert_eq!(p["ip"].as_str(), Some("127.0.0.1"));
     assert!(p["name"].as_str().is_some(), "应携带发起方展示名");
     assert_eq!(

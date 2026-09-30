@@ -230,6 +230,12 @@ pub enum WsEvent {
         ip: String,
         platform: String,
         code: String,
+        /// 发起方是否已提交确认码；false 时接收方按钮保持禁用
+        code_verified: bool,
+    },
+    /// 发起方已提交确认码，接收方 UI 应立即解锁「确认配对」
+    PairCodeVerified {
+        session: String,
     },
 }
 

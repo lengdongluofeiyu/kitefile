@@ -62,6 +62,9 @@ pub struct InPending {
     /// A 的 LAN TLS 端口（confirm 目标端口，来自 hello body）
     pub peer_gateway_port: u16,
     pub created: Instant,
+    /// 本会话确认码：hello 时算一次写入，展示 / 提交校验都用这一份，
+    /// 避免「弹窗显示的码」和「submit-code 校验的码」因重算不一致。
+    pub code: String,
     /// 发起方是否已提交正确的确认码。为 false 时 B 的「确认配对」必须禁用——
     /// 交互定案：发起方输入对方屏上的码是配对门禁之一，接收方不得抢先确认。
     pub code_verified: bool,
@@ -400,6 +403,7 @@ mod tests {
             peer_ip: "10.0.0.1".into(),
             peer_gateway_port: 7880,
             created: Instant::now(),
+            code: format!("code-{sid}"),
             code_verified: false,
         };
         p.begin_in_pending(mk("s1")).unwrap();

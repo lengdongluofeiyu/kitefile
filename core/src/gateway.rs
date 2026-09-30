@@ -307,6 +307,9 @@ async fn pair_hello(
         );
     }
     let session = uuid::Uuid::new_v4().simple().to_string();
+    // 确认码：指纹 + 会话 id 联合哈希。session 每次 hello 都是新 UUID，
+    // 同一对设备不同配对轮次必须出不同码（避免「永远 409072」）。
+    let code = crate::pairing::confirm_code(&fp, state.identity().fp(), &session);
     pairing
         .begin_in_pending(crate::pairing::InPending {
             session: session.clone(),
@@ -317,20 +320,21 @@ async fn pair_hello(
             peer_ip: ip.clone(),
             peer_gateway_port: req.gateway_port,
             created: tokio::time::Instant::now(),
+            code: code.clone(),
             // 门禁：发起方尚未输入确认码前，B 的「确认配对」必须禁用
             code_verified: false,
         })
         .map_err(|_| (StatusCode::CONFLICT, "已有配对请求待处理".into()))?;
 
-    let code = crate::pairing::confirm_code(&fp, state.identity().fp(), &session);
     let _ = state.ws_event_bus.send(WsEvent::PairRequest {
         session: session.clone(),
         name: req.name.clone(),
         ip: ip.clone(),
         platform: req.platform.clone(),
         code: code.clone(),
+        code_verified: false,
     });
-    info!(%ip, name = %req.name, "pairing hello accepted, awaiting confirm");
+    info!(%ip, name = %req.name, %session, code = %code, "pairing hello accepted, awaiting confirm");
     Ok(Json(PairHelloResponse {
         pairing_session: session,
     }))
@@ -503,14 +507,14 @@ async fn get_pair_pending(State(state): State<AppState>) -> Json<PairPendingResp
     let Some(p) = state.discovery.pairing().in_pending() else {
         return Json(PairPendingResponse { pending: None });
     };
-    let code = crate::pairing::confirm_code(&p.peer_fp, state.identity().fp(), &p.session);
     Json(PairPendingResponse {
         pending: Some(PairPendingView {
             session: p.session,
             name: p.peer_name,
             ip: p.peer_ip,
             platform: p.peer_platform,
-            code,
+            // hello 时已写入 pending 的码，展示与校验同一份
+            code: p.code,
             code_verified: p.code_verified,
         }),
     })
@@ -528,9 +532,8 @@ async fn pair_submit_code(
     if p.session != req.session {
         return Err((StatusCode::NOT_FOUND, "配对会话不匹配".into()));
     }
-    let expect = crate::pairing::confirm_code(&p.peer_fp, state.identity().fp(), &p.session);
     let got = req.code.trim();
-    if got != expect {
+    if got != p.code {
         return Err((
             StatusCode::BAD_REQUEST,
             "确认码不一致：请核对对方屏幕上的数字".into(),
@@ -539,6 +542,10 @@ async fn pair_submit_code(
     if !pairing.mark_code_verified(&req.session) {
         return Err((StatusCode::NOT_FOUND, "配对会话不存在或已过期".into()));
     }
+    // 立即推给接收方 UI：不能只靠 1s 轮询，否则弹窗会长时间停在「等待对方输入」
+    let _ = state.ws_event_bus.send(WsEvent::PairCodeVerified {
+        session: req.session.clone(),
+    });
     info!(session = %req.session, "pairing code submitted and verified");
     Ok(Json(serde_json::json!({ "ok": true })))
 }

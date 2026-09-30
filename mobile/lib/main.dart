@@ -103,6 +103,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 配对请求弹窗是否打开（WS 之外轮询 pending 时避免重复弹窗）
   bool _pairDialogOpen = false;
   Timer? _pairPendingPoll;
+  /// session → 打开中的配对弹窗刷新回调（WS 推送 code_verified 时立即解锁）
+  final Map<String, VoidCallback> _pairDialogUpdaters = {};
   /// 待决定的传入请求（incoming_id → entry）
   final Map<String, IncomingEntry> _incoming = {};
   /// 攒批—决策—迟到沿用状态机（工作流 C：共享实现，双端仅此一份）
@@ -540,11 +542,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     var closed = false;
     Timer? pendingPoll;
+    StateSetter? dialogSetState;
+    void unlockFromWs() {
+      if (closed) return;
+      final fn = dialogSetState;
+      if (fn == null) return;
+      fn(() {
+        codeVerified = true;
+      });
+    }
+
+    _pairDialogUpdaters[session] = unlockFromWs;
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => StatefulBuilder(builder: (ctx, setDialogState) {
-        // 周期轮询：对方提交码后即使界面无 rebuild 也能刷到 code_verified
+        dialogSetState = setDialogState;
+        // 周期轮询兜底；主路径是 WS pair_code_verified 即时解锁
         pendingPoll ??= Timer.periodic(const Duration(seconds: 1), (t) async {
           if (closed || !ctx.mounted) {
             t.cancel();
@@ -650,6 +664,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
     pendingPoll?.cancel();
     closed = true;
+    _pairDialogUpdaters.remove(session);
   }
 
   /// 添加设备（P2 入口改版）：打开即开启配对模式，页内完成
@@ -1247,8 +1262,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 }
                 break;
               case 'pair_request':
-                // 对端发来配对请求（P3）→ 确认码弹窗
-                _showPairRequestDialog(j);
+                // 对端发来配对请求（P3）→ 确认码弹窗（防叠开）
+                if (!_pairDialogOpen && mounted) {
+                  _pairDialogOpen = true;
+                  unawaited(_showPairRequestDialog(j).whenComplete(() {
+                    _pairDialogOpen = false;
+                    if (mounted) setState(() {});
+                  }));
+                }
+                break;
+              case 'pair_code_verified':
+                // 发起方已提交确认码 → 打开中的弹窗立即解锁「确认配对」
+                final sid = j['session'] as String?;
+                if (sid != null) _pairDialogUpdaters[sid]?.call();
                 break;
               default:
                 final p = TransferProgress.fromJson(j);
