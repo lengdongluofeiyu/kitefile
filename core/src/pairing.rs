@@ -458,6 +458,26 @@ impl PeersStore {
         self.map.read().get(device_id).cloned()
     }
 
+    /// 仅改本机显示名（`name_hint`），不动指纹 / 信任关系。
+    /// 重命名只在当前设备可见，不通知对端、不对端同步。
+    pub fn rename(&self, device_id: &str, new_name: &str) -> bool {
+        let name = new_name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let mut map = self.map.write();
+        let Some(rec) = map.get_mut(device_id) else {
+            return false;
+        };
+        if rec.name_hint == name {
+            return true; // 无变化也算成功
+        }
+        rec.name_hint = name.to_string();
+        drop(map);
+        self.persist();
+        true
+    }
+
     /// 按指纹查（鉴权热路径）：命中返回 device_id
     pub fn find_by_fp(&self, fp: &str) -> Option<String> {
         self.map
@@ -569,6 +589,29 @@ mod peers_tests {
         assert!(!store.remove("dev-a"));
         assert!(!store.contains_fp("fp-aaa"));
         assert_eq!(PeersStore::load(&path).list().len(), 1);
+    }
+
+    #[test]
+    fn rename_is_local_only_and_persists() {
+        let dir = temp_dir("rename");
+        let path = dir.join("peers.json");
+        let store = PeersStore::load(&path);
+        store.insert("dev-a", rec("fp-aaa"));
+
+        assert!(store.rename("dev-a", "  客厅电脑  "));
+        assert_eq!(store.get("dev-a").map(|r| r.name_hint), Some("客厅电脑".into()));
+        // 指纹不变 = 信任不变，仅显示名变
+        assert_eq!(store.get("dev-a").map(|r| r.fp_sha256), Some("fp-aaa".into()));
+        assert!(store.contains_fp("fp-aaa"));
+
+        // 落盘后重启仍保留本机名
+        let re = PeersStore::load(&path);
+        assert_eq!(re.get("dev-a").map(|r| r.name_hint), Some("客厅电脑".into()));
+
+        // 空名 / 不存在的设备 → false
+        assert!(!store.rename("dev-a", "   "));
+        assert!(!store.rename("nope", "x"));
+        assert_eq!(store.get("dev-a").map(|r| r.name_hint), Some("客厅电脑".into()));
     }
 
     #[test]

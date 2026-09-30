@@ -1611,6 +1611,36 @@ async fn test_pairing_flow_end_to_end() {
     let v = http_json(18083, "GET", "/api/pair/pending", None).await;
     assert!(v["pending"].is_null(), "确认后 pending 应清空: {v}");
 
+    // 7b) 本机重命名：只改 name_hint，指纹/信任不变
+    let (st, resp) = http(
+        18082,
+        "POST",
+        "/api/peers/peer-b/rename",
+        Some(r#"{"name":"  我的电脑  "}"#),
+    )
+    .await;
+    assert_eq!(st, 200, "rename: {}", String::from_utf8_lossy(&resp));
+    let a_peers = http_json(18082, "GET", "/api/peers", None).await;
+    let rec = a_peers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["device_id"] == "peer-b")
+        .expect("rename 后 A 仍应有 B");
+    assert_eq!(rec["name_hint"].as_str(), Some("我的电脑"), "应显示本机改的名字");
+    assert!(
+        rec["fp_sha256"].as_str().is_some(),
+        "改名不得动指纹（信任不变）"
+    );
+    // B 侧名字不受影响
+    let b_peers = http_json(18083, "GET", "/api/peers", None).await;
+    let b_rec = b_peers.as_array().unwrap().first().unwrap();
+    assert_ne!(
+        b_rec["name_hint"].as_str(),
+        Some("我的电脑"),
+        "重命名仅本机可见，不得同步到对端"
+    );
+
     // 8) 解除配对：首删 200、再删 404
     let (st, _) = http(18082, "DELETE", "/api/peers/peer-b", None).await;
     assert_eq!(st, 200);

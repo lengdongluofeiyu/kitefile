@@ -223,6 +223,12 @@ pub struct PairDecideRequest {
     pub accept: bool,
 }
 
+/// POST /api/peers/:device_id/rename：仅改本机显示名
+#[derive(Debug, Deserialize)]
+pub struct PeerRenameRequest {
+    pub name: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PairDecideResponse {
     pub ok: bool,
@@ -515,6 +521,24 @@ async fn delete_peer(
     }
 }
 
+/// 仅改本机显示名（不通知对端、不改指纹/信任）。
+async fn rename_peer(
+    State(state): State<AppState>,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+    Json(req): Json<PeerRenameRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "名称不能为空".into()));
+    }
+    if state.peers.rename(&device_id, name) {
+        info!(%device_id, name, "peer renamed (local only)");
+        Ok(Json(serde_json::json!({ "ok": true, "name_hint": name })))
+    } else {
+        Err((StatusCode::NOT_FOUND, "该设备不在配对列表中".into()))
+    }
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -749,6 +773,7 @@ fn build_app(state: AppState, advertised_gateway_port: u16) -> Router {
             "/api/peers/:device_id",
             axum::routing::delete(delete_peer),
         )
+        .route("/api/peers/:device_id/rename", post(rename_peer))
         .route("/api/config", get(get_config))
         .route("/api/config/receive-dir", post(set_receive_dir))
         .route("/api/config/device-name", post(set_device_name))
@@ -890,6 +915,7 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
         (Method::POST, "/api/pair/decide", LocalOnly),
         (Method::GET, "/api/pair/pending", LocalOnly),
         (Method::GET, "/api/peers", LocalOnly),
+        (Method::POST, "/api/peers/:device_id/rename", LocalOnly),
         (Method::DELETE, "/api/peers/:device_id", LocalOnly),
         (Method::POST, "/api/send", LocalOnly),
         (Method::GET, "/api/transfers", LocalOnly),

@@ -316,6 +316,114 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  /// 已配对设备优先显示本机改过的 `name_hint`；未改名则回落 mDNS 名。
+  /// 重命名仅本机可见（不通知对端）。
+  String _peerDisplayName(Device d) {
+    for (final p in _peers) {
+      if (p['device_id'] == d.id) {
+        final hint = (p['name_hint'] as String?)?.trim();
+        if (hint != null && hint.isNotEmpty) return hint;
+      }
+    }
+    return d.name;
+  }
+
+  /// 仅改本机显示名（POST /api/peers/:id/rename）
+  Future<void> _renamePeer(
+      String deviceId, String currentName, {VoidCallback? onDone}) async {
+    final ctrl = TextEditingController(text: currentName);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('重命名设备'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          maxLength: 32,
+          decoration: const InputDecoration(
+            border: OutlineInputBorder(),
+            isDense: true,
+            hintText: '仅在本机显示，对方不受影响',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    final name = ctrl.text.trim();
+    ctrl.dispose();
+    if (ok != true || name.isEmpty) return;
+    try {
+      await httpPost(
+        '$_httpBase/api/peers/$deviceId/rename',
+        body: jsonEncode({'name': name}),
+      );
+      await _refreshDevices();
+      onDone?.call();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('已重命名为「$name」（仅本机可见）')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('重命名失败: $e')));
+      }
+    }
+  }
+
+  /// 删除已配对设备（双向信任撤销；对方设备列表不会自动同步删除）
+  Future<void> _deletePeer(String deviceId, String name,
+      {VoidCallback? onDone}) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除设备'),
+        content: Text(
+          '将解除与「$name」的配对，双向传输信任立即失效。\n'
+          '若以后要重新配对，两台设备都需再次打开「添加设备」。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除设备'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await httpDelete('$_httpBase/api/peers/$deviceId');
+      await _refreshDevices();
+      onDone?.call();
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('已删除「$name」')));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('删除失败: $e')));
+      }
+    }
+  }
+
   /// 对端配对请求弹窗：两屏比对确认码，确认 → POST /api/pair/decide
   Future<void> _showPairRequestDialog(Map<String, dynamic> j) async {
     final session = j['session'] as String? ?? '';
@@ -389,7 +497,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ),
             const SizedBox(height: 8),
             const Text(
-              '两台设备显示的数字必须一致；不一致请取消，可能有人在中间拦截。',
+              '请把此确认码念给对方，或让对方看清；由对方在发起配对的设备上输入。'
+              '输入一致后，再由你点「确认配对」。',
               style: TextStyle(fontSize: 12, color: Colors.orange),
             ),
           ],
@@ -454,7 +563,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     String? waitId;
     String? waitName;
-    String? waitCode;
+    String? waitCode; // pair/start 返回的本机侧确认码（与对方屏上应一致）
+    var codeOk = false; // 发起方已输入正确确认码
+    final codeCtrl = TextEditingController();
     var expired = false; // 倒计时到点后的结束态（等「重试」重新开启）
     var refreshTick = 0; // 搜索期每 15s 触发一次 pair 标志同步（/api/pair/refresh）
     Timer? ticker;
@@ -462,6 +573,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     Future<void> shutdown() async {
       stopped = true;
       ticker?.cancel();
+      codeCtrl.dispose();
       try {
         await httpPost('$_httpBase/api/pair/mode',
             body: jsonEncode({'enabled': false}));
@@ -562,31 +674,95 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 ? Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Text('等待 ${waitName ?? '对方'} 确认…'),
+                      Text(codeOk
+                          ? '等待 ${waitName ?? '对方'} 确认…'
+                          : '正在与 ${waitName ?? '对方'} 配对'),
                       const SizedBox(height: 12),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 20, vertical: 10),
-                        decoration: BoxDecoration(
-                          color: Theme.of(ctx).colorScheme.primaryContainer,
-                          borderRadius: BorderRadius.circular(8),
+                      if (!codeOk) ...[
+                        const Text(
+                          '请看清对方屏幕上的 6 位确认码，输入到本机：',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 12, color: Colors.grey),
                         ),
-                        child: Text(
-                          waitCode ?? '',
+                        const SizedBox(height: 8),
+                        TextField(
+                          controller: codeCtrl,
+                          autofocus: true,
+                          textAlign: TextAlign.center,
+                          keyboardType: TextInputType.number,
+                          maxLength: 6,
                           style: const TextStyle(
-                              fontSize: 36,
-                              fontWeight: FontWeight.bold,
-                              letterSpacing: 6),
+                            fontSize: 28,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 8,
+                          ),
+                          decoration: const InputDecoration(
+                            counterText: '',
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                            hintText: '••••••',
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 8),
-                      const Text(
-                        '请与对方屏幕核对确认码，一致后由对方点「确认配对」；60 秒未确认将过期。',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(fontSize: 12, color: Colors.grey),
-                      ),
+                        const SizedBox(height: 8),
+                        TextButton.icon(
+                          icon: const Icon(Icons.check, size: 18),
+                          label: const Text('输入完成 · 校验'),
+                          onPressed: () async {
+                            final input =
+                                codeCtrl.text.replaceAll(RegExp(r'\s'), '');
+                            if (input.length != 6) {
+                              if (ctx.mounted) {
+                                ScaffoldMessenger.of(ctx).showSnackBar(
+                                  const SnackBar(
+                                      content: Text('请输入对方屏幕上的 6 位数字')),
+                                );
+                              }
+                              return;
+                            }
+                            if (input != waitCode) {
+                              if (ctx.mounted) {
+                                ScaffoldMessenger.of(ctx).showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                        '确认码不一致：请核对对方屏幕上的数字，可能有人在中间拦截'),
+                                  ),
+                                );
+                              }
+                              return;
+                            }
+                            setDialogState(() => codeOk = true);
+                          },
+                        ),
+                        const Text(
+                          '码必须与对方屏幕一致；不一致请取消重来。'
+                          '输入正确后仍需由对方点「确认配对」。',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 11, color: Colors.orange),
+                        ),
+                      ] else ...[
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 20, vertical: 10),
+                          decoration: BoxDecoration(
+                            color: Theme.of(ctx).colorScheme.primaryContainer,
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: const Icon(Icons.hourglass_top, size: 36),
+                        ),
+                        const SizedBox(height: 8),
+                        const Text(
+                          '确认码正确。请对方在其屏幕上点「确认配对」；'
+                          '60 秒未确认将过期。',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 12, color: Colors.grey),
+                        ),
+                      ],
                       TextButton(
-                        onPressed: () => setDialogState(() => waitId = null),
+                        onPressed: () => setDialogState(() {
+                          waitId = null;
+                          codeOk = false;
+                          codeCtrl.clear();
+                        }),
                         child: const Text('返回设备列表'),
                       ),
                     ],
@@ -648,7 +824,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                         ),
                       ] else ...[
                         const Text(
-                          '两台设备都打开此页面即可互相发现；出现设备后点「配对」，两屏核对同一串确认码。',
+                          '两台设备都打开此页面即可互相发现；出现设备后点「配对」，'
+                          '在对方屏幕看清确认码后输入到本机，再由对方点「确认配对」。',
                           style: TextStyle(fontSize: 12, color: Colors.grey),
                         ),
                         const SizedBox(height: 8),
@@ -706,8 +883,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                                         as Map<String, dynamic>;
                                     setDialogState(() {
                                       waitId = d.id;
-                                      waitName = d.name;
+                                      waitName = _peerDisplayName(d);
                                       waitCode = j['code'] as String? ?? '';
+                                      codeOk = false;
+                                      codeCtrl.clear();
                                     });
                                   } catch (e) {
                                     if (ctx.mounted) {
@@ -1158,13 +1337,54 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             else
               Column(
                 children: paired.map((d) {
+                  final display = _peerDisplayName(d);
                   return ListTile(
                     contentPadding: EdgeInsets.zero,
-                    title: Text(d.name),
+                    title: Text(display),
                     subtitle: Text(
                         '${d.platform} · ${d.ip}:${d.transferPort} · 已配对',
                         style: const TextStyle(fontSize: 12)),
-                    trailing: const Icon(Icons.send),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.send, size: 20),
+                          tooltip: '发送文件',
+                          onPressed: () => _showSendDialog(d),
+                        ),
+                        PopupMenuButton<String>(
+                          tooltip: '设备操作',
+                          icon: const Icon(Icons.more_vert, size: 20),
+                          onSelected: (v) async {
+                            if (v == 'rename') {
+                              await _renamePeer(d.id, display);
+                            } else if (v == 'delete') {
+                              await _deletePeer(d.id, display);
+                            }
+                          },
+                          itemBuilder: (_) => const [
+                            PopupMenuItem(
+                              value: 'rename',
+                              child: ListTile(
+                                leading: Icon(Icons.edit_outlined),
+                                title: Text('重命名'),
+                                subtitle: Text('仅本机可见'),
+                                contentPadding: EdgeInsets.zero,
+                              ),
+                            ),
+                            PopupMenuItem(
+                              value: 'delete',
+                              child: ListTile(
+                                leading: Icon(Icons.delete_outline),
+                                title: Text('删除设备'),
+                                subtitle: Text('解除配对与信任'),
+                                contentPadding: EdgeInsets.zero,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
                     onTap: () => _showSendDialog(d),
                   );
                 }).toList(),
@@ -1470,30 +1690,124 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       ),
                       title: Text(p['name_hint'] as String? ?? '未知设备'),
                       subtitle: Text(
-                        '${p['platform'] ?? ''} · 已配对',
+                        '${p['platform'] ?? ''} · 已配对 · 重命名仅本机可见',
                         style: const TextStyle(fontSize: 12),
                       ),
-                      trailing: IconButton(
-                        icon: const Icon(Icons.delete_outline, size: 20),
-                        tooltip: '解除配对',
-                        onPressed: () async {
-                          try {
-                            await httpDelete(
-                                '$_httpBase/api/peers/${p['device_id']}');
-                            final r = await httpGet('$_httpBase/api/peers');
-                            setDialogState(() {
-                              peers = (jsonDecode(r) as List)
-                                  .cast<Map<String, dynamic>>();
-                            });
-                            await _refreshDevices();
-                          } catch (e) {
-                            if (ctx.mounted) {
-                              ScaffoldMessenger.of(ctx).showSnackBar(
-                                SnackBar(content: Text('解除配对失败: $e')),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.edit_outlined, size: 20),
+                            tooltip: '重命名（仅本机）',
+                            onPressed: () async {
+                              final id = p['device_id'] as String? ?? '';
+                              final cur = p['name_hint'] as String? ?? '';
+                              if (id.isEmpty) return;
+                              final ctrl = TextEditingController(text: cur);
+                              final ok = await showDialog<bool>(
+                                context: ctx,
+                                builder: (c) => AlertDialog(
+                                  title: const Text('重命名设备'),
+                                  content: TextField(
+                                    controller: ctrl,
+                                    autofocus: true,
+                                    maxLength: 32,
+                                    decoration: const InputDecoration(
+                                      border: OutlineInputBorder(),
+                                      isDense: true,
+                                      hintText: '仅在本机显示，对方不受影响',
+                                    ),
+                                  ),
+                                  actions: [
+                                    TextButton(
+                                      onPressed: () =>
+                                          Navigator.pop(c, false),
+                                      child: const Text('取消'),
+                                    ),
+                                    FilledButton(
+                                      onPressed: () => Navigator.pop(c, true),
+                                      child: const Text('保存'),
+                                    ),
+                                  ],
+                                ),
                               );
-                            }
-                          }
-                        },
+                              final name = ctrl.text.trim();
+                              ctrl.dispose();
+                              if (ok != true || name.isEmpty) return;
+                              try {
+                                await httpPost(
+                                  '$_httpBase/api/peers/$id/rename',
+                                  body: jsonEncode({'name': name}),
+                                );
+                                final r = await httpGet('$_httpBase/api/peers');
+                                setDialogState(() {
+                                  peers = (jsonDecode(r) as List)
+                                      .cast<Map<String, dynamic>>();
+                                });
+                                await _refreshDevices();
+                              } catch (e) {
+                                if (ctx.mounted) {
+                                  ScaffoldMessenger.of(ctx).showSnackBar(
+                                    SnackBar(content: Text('重命名失败: $e')),
+                                  );
+                                }
+                              }
+                            },
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.delete_outline, size: 20),
+                            tooltip: '删除设备',
+                            onPressed: () async {
+                              final id = p['device_id'] as String? ?? '';
+                              final name =
+                                  p['name_hint'] as String? ?? '未知设备';
+                              if (id.isEmpty) return;
+                              final ok = await showDialog<bool>(
+                                context: ctx,
+                                builder: (c) => AlertDialog(
+                                  title: const Text('删除设备'),
+                                  content: Text(
+                                    '将解除与「$name」的配对，双向传输信任立即失效。',
+                                  ),
+                                  actions: [
+                                    TextButton(
+                                      onPressed: () =>
+                                          Navigator.pop(c, false),
+                                      child: const Text('取消'),
+                                    ),
+                                    FilledButton(
+                                      style: FilledButton.styleFrom(
+                                        backgroundColor: Theme.of(c)
+                                            .colorScheme
+                                            .error,
+                                      ),
+                                      onPressed: () => Navigator.pop(c, true),
+                                      child: const Text('删除设备'),
+                                    ),
+                                  ],
+                                ),
+                              );
+                              if (ok != true) return;
+                              try {
+                                await httpDelete(
+                                    '$_httpBase/api/peers/$id');
+                                final r =
+                                    await httpGet('$_httpBase/api/peers');
+                                setDialogState(() {
+                                  peers = (jsonDecode(r) as List)
+                                      .cast<Map<String, dynamic>>();
+                                });
+                                await _refreshDevices();
+                              } catch (e) {
+                                if (ctx.mounted) {
+                                  ScaffoldMessenger.of(ctx).showSnackBar(
+                                    SnackBar(content: Text('删除失败: $e')),
+                                  );
+                                }
+                              }
+                            },
+                          ),
+                        ],
                       ),
                     ),
                 ],
