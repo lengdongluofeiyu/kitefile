@@ -1510,6 +1510,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _sendFile(Device target, String path,
       {String? fileName, SendBatch? batch}) async {
+    if (!target.online && !_isDeviceOnline(target.id)) {
+      if (mounted) {
+        _showTopToast('对方设备离线，无法发送文件', error: true);
+      }
+      return;
+    }
     try {
       // 显式判空而非用 Dart 3.8 的 null-aware element（key: ?value）：
       // 后者需要较新的 Flutter/Dart，旧版工具链会编译失败。这里保持最大兼容性。
@@ -1636,12 +1642,47 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  /// 主列表：已配对设备全量（含离线）；在线优先排序。
+  List<_PairedDevice> _pairedDeviceRows() {
+    final byId = <String, Device>{for (final d in _devices) d.id: d};
+    final rows = <_PairedDevice>[];
+    for (final p in _peers) {
+      final id = p['device_id'] as String? ?? '';
+      if (id.isEmpty) continue;
+      final dev = byId[id];
+      final hint = (p['name_hint'] as String?)?.trim();
+      final name = (hint != null && hint.isNotEmpty)
+          ? hint
+          : (dev != null && dev.name.isNotEmpty ? dev.name : '未知设备');
+      rows.add(_PairedDevice(
+        id: id,
+        name: name,
+        platform: (p['platform'] as String?) ?? dev?.platform ?? '',
+        ip: dev?.ip ?? '',
+        transferPort: dev?.transferPort ?? 0,
+        gatewayPort: dev?.gatewayPort ?? 0,
+        online: p['online'] == true || dev != null,
+      ));
+    }
+    rows.sort((a, b) {
+      if (a.online != b.online) return a.online ? -1 : 1;
+      return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    });
+    return rows;
+  }
+
+  bool _isDeviceOnline(String id) {
+    if (_devices.any((d) => d.id == id)) return true;
+    for (final p in _peers) {
+      if (p['device_id'] == id && p['online'] == true) return true;
+    }
+    return false;
+  }
+
   Widget _devicesSection() {
-    // 主列表只显示**已配对**设备；新设备的发现与配对统一走「添加设备」
-    //（P2 入口改版：配对模式的开关/倒计时/确认码都在添加设备页内）
-    final paired = _devices
-        .where((d) => _peers.any((p) => p['device_id'] == d.id))
-        .toList();
+    // 主列表：已配对设备全量；在线可发送，离线标出且禁止发送
+    final paired = _pairedDeviceRows();
+    final onlineCount = paired.where((r) => r.online).length;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(12),
@@ -1651,7 +1692,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             Row(
               children: [
                 Expanded(
-                  child: Text('设备列表 (${paired.length})',
+                  child: Text(
+                      '设备列表 (${paired.length} · 在线 $onlineCount)',
                       style: Theme.of(context).textTheme.titleMedium),
                 ),
                 FilledButton.tonalIcon(
@@ -1671,30 +1713,53 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               )
             else
               Column(
-                children: paired.map((d) {
-                  final display = _peerDisplayName(d);
+                children: paired.map((r) {
+                  final on = r.online;
                   return ListTile(
                     contentPadding: EdgeInsets.zero,
-                    title: Text(display),
+                    enabled: on,
+                    leading: Icon(
+                      on ? Icons.circle : Icons.circle_outlined,
+                      size: 14,
+                      color: on ? Colors.green : Colors.grey,
+                    ),
+                    title: Text(
+                      r.name,
+                      style: TextStyle(
+                        color: on ? null : Colors.grey[700],
+                        fontSize: 14,
+                      ),
+                    ),
                     subtitle: Text(
-                        '${d.platform} · ${d.ip}:${d.transferPort} · 已配对',
-                        style: const TextStyle(fontSize: 12)),
+                      on
+                          ? '${r.platform} · ${r.ip}:${r.transferPort} · 在线'
+                          : '${r.platform} · 离线 · 无法发送',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: on ? null : Colors.grey,
+                      ),
+                    ),
                     trailing: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         IconButton(
-                          icon: const Icon(Icons.send, size: 20),
-                          tooltip: '发送文件',
-                          onPressed: () => _showSendDialog(d),
+                          icon: Icon(
+                            Icons.send,
+                            size: 20,
+                            color: on ? null : Colors.grey[400],
+                          ),
+                          tooltip: on ? '发送文件' : '对方离线，无法发送',
+                          onPressed:
+                              on ? () => _showSendDialog(r.toDevice()) : null,
                         ),
                         PopupMenuButton<String>(
                           tooltip: '设备操作',
                           icon: const Icon(Icons.more_vert, size: 20),
                           onSelected: (v) async {
                             if (v == 'rename') {
-                              await _renamePeer(d.id, display);
+                              await _renamePeer(r.id, r.name);
                             } else if (v == 'delete') {
-                              await _deletePeer(d.id, display);
+                              await _deletePeer(r.id, r.name);
                             }
                           },
                           itemBuilder: (_) => const [
@@ -1720,7 +1785,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                         ),
                       ],
                     ),
-                    onTap: () => _showSendDialog(d),
+                    onTap: on ? () => _showSendDialog(r.toDevice()) : null,
                   );
                 }).toList(),
               ),
@@ -2373,6 +2438,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// Android：原生 ACTION_OPEN_DOCUMENT + fd 直读（/proc/self/fd/N），
   /// 不经过 file_picker 的缓存拷贝——选 2GB 视频不再卡死 UI。
   void _showSendDialog(Device d) {
+    if (!d.online && !_isDeviceOnline(d.id)) {
+      _showTopToast('对方设备离线，无法发送文件', error: true);
+      return;
+    }
     _pickAndSend(d);
   }
 
@@ -2426,6 +2495,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _pickAndSend(Device d) async {
+    if (!d.online && !_isDeviceOnline(d.id)) {
+      _showTopToast('对方设备离线，无法发送文件', error: true);
+      return;
+    }
     // 1. 选文件（Android 原生 fd 方案，其他平台 file_picker）
     final picks = await _pickFiles();
     if (!mounted) return;
@@ -2501,6 +2574,37 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 }
 
 // ============ 工具函数 ============
+
+/// 已配对设备展示行：peers（全量配对）+ discovery（在线时有 IP/端口）
+class _PairedDevice {
+  final String id;
+  final String name;
+  final String platform;
+  final String ip;
+  final int transferPort;
+  final int gatewayPort;
+  final bool online;
+  const _PairedDevice({
+    required this.id,
+    required this.name,
+    required this.platform,
+    required this.ip,
+    required this.transferPort,
+    required this.gatewayPort,
+    required this.online,
+  });
+
+  Device toDevice() => Device(
+        id: id,
+        name: name,
+        ip: ip,
+        transferPort: transferPort,
+        gatewayPort: gatewayPort,
+        platform: platform,
+        pair: true,
+        online: online,
+      );
+}
 
 /// 选中文件的轻量模型（原生选择器 / file_picker 统一）
 @immutable

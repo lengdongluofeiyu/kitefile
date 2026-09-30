@@ -44,6 +44,8 @@ class Device {
   /// 对端是否处于配对模式（mDNS TXT `pair=1`；旧版对端不发 → false）。
   /// 展示规则（设计 §5.4）：已配对 ∨（未配对 ∧ pair）。
   final bool pair;
+  /// 设备是否在线（发现表存活 / peers.online）。默认 false；离线不得发送。
+  final bool online;
   const Device({
     required this.id,
     required this.name,
@@ -52,6 +54,7 @@ class Device {
     required this.gatewayPort,
     required this.platform,
     this.pair = false,
+    this.online = false,
   });
 
   factory Device.fromJson(Map<String, dynamic> j) => Device(
@@ -62,6 +65,7 @@ class Device {
         gatewayPort: jsonInt(j['gateway_port'], 7878),
         platform: jsonStr(j['platform']),
         pair: j['pair'] == true,
+        online: j['online'] == true,
       );
 }
 
