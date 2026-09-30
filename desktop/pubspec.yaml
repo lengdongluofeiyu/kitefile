@@ -21,6 +21,8 @@ dependencies:
   tray_manager: ^0.5.3
   # 系统通知（Windows toast）：窗口隐藏时来文件提醒用户
   local_notifier: ^0.1.6
+  # Windows 隐藏窗口拉起 daemon（CREATE_NO_WINDOW，避免启动闪终端）
+  ffi: ^2.1.0
 
 dev_dependencies:
   flutter_test:

@@ -1,7 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+// hide Size：与 Flutter material 的 Size 冲突
+import 'dart:ffi' hide Size;
 import 'dart:io';
 
+import 'package:ffi/ffi.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -165,16 +168,91 @@ Future<void> bringAppToForeground() async {
   }
 }
 
+/// Windows CREATE_NO_WINDOW：子进程不分配控制台窗口。
+/// GUI 拉起 console 子系统程序（kitefile-cli / netsh）时若不带此标志，
+/// 会闪一下终端（真实反馈：桌面端启动总闪终端）。
+const int _kCreateNoWindow = 0x08000000;
+const int _kDetachedProcess = 0x00000008;
+
+typedef _CreateProcessWNative = Int32 Function(
+  Pointer<Utf16> lpApplicationName,
+  Pointer<Utf16> lpCommandLine,
+  Pointer<Void> lpProcessAttributes,
+  Pointer<Void> lpThreadAttributes,
+  Int32 bInheritHandles,
+  Uint32 dwCreationFlags,
+  Pointer<Void> lpEnvironment,
+  Pointer<Utf16> lpCurrentDirectory,
+  Pointer<Void> lpStartupInfo,
+  Pointer<Void> lpProcessInformation,
+);
+
+typedef _CreateProcessWDart = int Function(
+  Pointer<Utf16> lpApplicationName,
+  Pointer<Utf16> lpCommandLine,
+  Pointer<Void> lpProcessAttributes,
+  Pointer<Void> lpThreadAttributes,
+  int bInheritHandles,
+  int dwCreationFlags,
+  Pointer<Void> lpEnvironment,
+  Pointer<Utf16> lpCurrentDirectory,
+  Pointer<Void> lpStartupInfo,
+  Pointer<Void> lpProcessInformation,
+);
+
+/// 用 CreateProcessW + CREATE_NO_WINDOW 隐藏启动进程，返回 PID。
+/// 失败返回 null。仅 Windows 调用。
+int? _createProcessHidden(String exePath, String args) {
+  final kernel32 = DynamicLibrary.open('kernel32.dll');
+  final createProcess = kernel32.lookupFunction<_CreateProcessWNative,
+      _CreateProcessWDart>('CreateProcessW');
+
+  // x64：STARTUPINFOW=104 字节，PROCESS_INFORMATION=24 字节
+  const startupInfoSize = 104;
+  const processInfoSize = 24;
+  final startupInfo = calloc<Uint8>(startupInfoSize);
+  final processInfo = calloc<Uint8>(processInfoSize);
+  try {
+    // STARTUPINFOW.cb
+    startupInfo.cast<Uint32>().value = startupInfoSize;
+
+    final cmdline = ' "$exePath" $args'.toNativeUtf16();
+    try {
+      final ok = createProcess(
+        nullptr,
+        cmdline,
+        nullptr,
+        nullptr,
+        0,
+        _kCreateNoWindow | _kDetachedProcess,
+        nullptr,
+        nullptr,
+        startupInfo.cast(),
+        processInfo.cast(),
+      );
+      if (ok == 0) return null;
+      // PROCESS_INFORMATION：hProcess(0) hThread(8) dwProcessId(16) dwThreadId(20)
+      // 偏移 16 字节 = 4 个 Uint32
+      return (processInfo.cast<Uint32>() + 4).value;
+    } finally {
+      calloc.free(cmdline);
+    }
+  } finally {
+    calloc.free(startupInfo);
+    calloc.free(processInfo);
+  }
+}
+
 /// 守护进程管理器
 ///
 /// 职责：
 /// - 启动时逐个探测 `kGatewayPortCandidates` 上 /api/whoami 是否响应
 ///   - 已响应：说明已有 daemon（用户手动启过 / 上次未退出），直接复用
 ///   - 未响应：spawn 一个 kitefile-cli.exe daemon 子进程
-/// - 子进程用 detached 模式：UI 崩溃不会拖死 daemon，正在传的文件不会断
+/// - 子进程用 detached + CREATE_NO_WINDOW：不弹终端；UI 崩溃不会拖死 daemon
 /// - 「完全退出」时才 kill 子进程；「最小化到托盘」只藏窗口，daemon 继续跑
 class DaemonManager {
-  Process? _process;
+  int? _daemonPid;
   bool _spawned = false;
   bool _isReady = false;
 
@@ -200,17 +278,29 @@ class DaemonManager {
     }
 
     try {
-      _process = await Process.start(
-        exePath,
-        const ['daemon'],
-        mode: ProcessStartMode.detached,
-        // 守护进程有自己的日志输出，UI 端不接管 stdout/stderr
-        runInShell: false,
-      );
+      if (Platform.isWindows) {
+        // 隐藏控制台启动，避免终端窗口闪烁
+        final pid = _createProcessHidden(exePath, 'daemon');
+        if (pid == null) {
+          debugPrint('[DaemonManager] CreateProcessW failed for $exePath');
+          return;
+        }
+        _daemonPid = pid;
+        debugPrint('[DaemonManager] spawned daemon PID=$pid from $exePath (hidden)');
+      } else {
+        final process = await Process.start(
+          exePath,
+          const ['daemon'],
+          mode: ProcessStartMode.detached,
+          runInShell: false,
+        );
+        _daemonPid = process.pid;
+        process.stdout.listen((_) {});
+        process.stderr.listen((_) {});
+        debugPrint(
+            '[DaemonManager] spawned daemon PID=${process.pid} from $exePath');
+      }
       _spawned = true;
-      _process!.stdout.listen((_) {}); // 消费 stdout 防止管道阻塞
-      _process!.stderr.listen((_) {});
-      debugPrint('[DaemonManager] spawned daemon PID=${_process!.pid} from $exePath');
     } catch (e) {
       debugPrint('[DaemonManager] spawn failed: $e');
       return;
@@ -230,14 +320,15 @@ class DaemonManager {
 
   /// 关闭 daemon（应用退出时调用）
   Future<void> stop() async {
-    if (_process != null && _spawned) {
+    final pid = _daemonPid;
+    if (pid != null && _spawned) {
       try {
-        _process!.kill(ProcessSignal.sigterm);
-        debugPrint('[DaemonManager] killed daemon PID=${_process!.pid}');
+        Process.killPid(pid, ProcessSignal.sigterm);
+        debugPrint('[DaemonManager] killed daemon PID=$pid');
       } catch (e) {
         debugPrint('[DaemonManager] kill failed: $e');
       }
-      _process = null;
+      _daemonPid = null;
       _spawned = false;
       _isReady = false;
     }

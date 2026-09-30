@@ -861,12 +861,23 @@ async fn bind_first(
 /// Windows 防火墙：局域网对端要能连上 LAN TLS 口，否则配对/传输全挂
 ///（真实反馈：mDNS 可能仍通，但 whoami/pair/hello 全部超时）。
 /// 无管理员权限时 netsh 会失败——只记 warn，不阻断本机回环 UI。
+///
+/// **必须 CREATE_NO_WINDOW**：桌面端 GUI 拉起 daemon 后 netsh 若弹控制台，
+/// 用户会看到终端窗口闪一下（真实反馈：启动总闪终端）。
+#[cfg(windows)]
+fn hidden_command(program: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = std::process::Command::new(program);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 fn ensure_windows_lan_firewall(port: u16) {
     #[cfg(windows)]
     {
-        use std::process::Command;
         let name = format!("KiteFile-LAN-TLS-{port}");
-        let exists = Command::new("netsh")
+        let exists = hidden_command("netsh")
             .args([
                 "advfirewall",
                 "firewall",
@@ -880,7 +891,7 @@ fn ensure_windows_lan_firewall(port: u16) {
         if exists {
             return;
         }
-        let status = Command::new("netsh")
+        let status = hidden_command("netsh")
             .args([
                 "advfirewall",
                 "firewall",
