@@ -535,6 +535,8 @@ class _HomePageState extends State<HomePage> with WindowListener {
     _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       _refreshDevices();
       _fetchWhoAmI();
+      // 周期对齐：daemon 重启/历史落盘后 UI 也要能刷出来
+      _refreshTransfers();
     });
     // 启动期 1s 快速探测只为尽早 ready；超时后由上面的周期轮询继续兜底。
     _startupPollTimer = Timer.periodic(const Duration(seconds: 1), (t) async {
@@ -551,8 +553,28 @@ class _HomePageState extends State<HomePage> with WindowListener {
     await _fetchWhoAmI();
     if (_daemonOnline) {
       _startupPollTimer?.cancel();
+      // 重启后必须拉一次全量：历史在 daemon 的 transfer_history.json，
+      // 只靠 WS 进度帧看不到已落盘的终态记录
+      await _refreshTransfers();
     }
     _refreshDevices();
+  }
+
+  /// 传输全量快照：daemon 缓存/历史是权威状态（重启后 UI 靠它恢复记录）
+  Future<void> _refreshTransfers() async {
+    try {
+      final r = await httpGet('$kDaemonHttp/api/transfers');
+      final list = (jsonDecode(r) as Map<String, dynamic>)['transfers'] as List?;
+      if (list == null || !mounted) return;
+      setState(() {
+        for (final t in list) {
+          final p = TransferProgress.fromJson(t as Map<String, dynamic>);
+          if (p.fileId.isNotEmpty) _progress[p.fileId] = p;
+        }
+      });
+    } catch (e) {
+      debugPrint('[kitefile] transfers snapshot failed: $e');
+    }
   }
 
   /// whoami 探测代数：后发起的探测覆盖先发起的，防止慢失败扫描
@@ -578,6 +600,8 @@ class _HomePageState extends State<HomePage> with WindowListener {
         if (_ws == null && !_wsConnecting) {
           _connectWs();
         }
+        // 连上后对齐一次历史/进度快照
+        unawaited(_refreshTransfers());
         return;
       } catch (e) {
         // 该端口没响应/非 daemon 服务，试下一个（不静默：debug 可见）
