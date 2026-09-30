@@ -93,9 +93,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   List<Device> _devices = [];
   /// 已配对设备（GET /api/peers；设备列表展示规则与发送入口依赖它）
   List<Map<String, dynamic>> _peers = [];
-  List<String> _receivedFiles = [];
-  /// 当前接收目录（设置页展示；用于“已接收文件”打开按钮）
-  String? _receiveDir;
   final Map<String, TransferProgress> _progress = {};
   /// 首页传输记录折叠态：接收/发送列表默认收起，完成的任务不再占用进度区
   bool _recvOpen = false;
@@ -167,7 +164,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         _fetchWhoAmI();
         if (_ws == null) _connectWs();
         _refreshDevices();
-        _refreshReceivedFiles();
         _refreshTransfers();
         break;
       case AppLifecycleState.detached:
@@ -214,13 +210,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // 之后的周期 whoami 会继续发现晚启动的 daemon（与桌面端一致）。
     _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       _refreshDevices();
-      _refreshReceivedFiles();
       _fetchWhoAmI();
     });
     if (_daemonOnline) {
-      _refreshReceiveDir();
       _refreshDevices();
-      _refreshReceivedFiles();
       _refreshTransfers();
       // WS 首连由 _fetchWhoAmI 成功分支触发（带防抖），这里无需重复调用
     }
@@ -239,22 +232,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
     // 最后一次机会
     if (mounted && !_daemonOnline) await _fetchWhoAmI();
-  }
-
-  Future<void> _refreshReceiveDir() async {
-    try {
-      final r = await httpGet('$_httpBase/api/config');
-      final dir = (jsonDecode(r) as Map<String, dynamic>)['receive_dir'] as String?;
-      if (mounted) setState(() => _receiveDir = dir);
-    } catch (_) {}
-  }
-
-  Future<void> _refreshReceivedFiles() async {
-    try {
-      final r = await httpGet('$_httpBase/api/files');
-      final list = (jsonDecode(r) as List).cast<String>();
-      if (mounted) setState(() => _receivedFiles = list);
-    } catch (_) {}
   }
 
   /// 传输全量快照：daemon 缓存是权威状态（WS 断连期间的终态帧会丢，
@@ -1599,8 +1576,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           _devicesSection(),
           const SizedBox(height: 12),
           _transfersSection(),
-          const SizedBox(height: 12),
-          _receivedSection(),
         ],
       ),
     );
@@ -2139,143 +2114,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  /// 已接收文件列表（本机 daemon 的接收目录）
-  Widget _receivedSection() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('已接收文件 (${_receivedFiles.length})',
-                style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 6),
-            if (_receivedFiles.isEmpty)
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 6),
-                child: Text('暂无已接收文件',
-                    style: TextStyle(color: Colors.grey, fontSize: 13)),
-              )
-            else
-              Column(
-                children: _receivedFiles.map((name) {
-                  final canOpen = _receiveDir != null;
-                  final path = canOpen ? '$_receiveDir/$name' : null;
-                  return ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    dense: true,
-                    leading: const Icon(Icons.insert_drive_file, size: 20),
-                    title: Text(name,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 13)),
-                    subtitle: Text(
-                      _receiveDir ?? '接收目录',
-                      style: const TextStyle(fontSize: 11),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    trailing: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        if (canOpen && path != null) ...[
-                          IconButton(
-                            icon: const Icon(Icons.open_in_new, size: 18),
-                            tooltip: '打开文件',
-                            onPressed: () async {
-                              final err = await openFileNative(path);
-                              if (err != null && mounted) {
-                                _showTopToast('打开失败: $err', error: true);
-                              }
-                            },
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.folder_open, size: 18),
-                            tooltip: '所在文件夹',
-                            onPressed: () => _openFolderForPath(path),
-                          ),
-                        ],
-                        IconButton(
-                          icon: Icon(Icons.delete_outline,
-                              size: 18, color: Colors.red[400]),
-                          tooltip: '删除',
-                          onPressed: () =>
-                              _confirmDeleteReceivedFile(name, path),
-                        ),
-                      ],
-                    ),
-                  );
-                }).toList(),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// 删除已接收文件；可选是否删除本地磁盘文件。
-  Future<void> _confirmDeleteReceivedFile(String name, String? path) async {
-    var deleteLocal = path != null && path.isNotEmpty;
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDialogState) => AlertDialog(
-          title: const Text('删除文件'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('将删除「$name」。'),
-              if (path != null) ...[
-                const SizedBox(height: 8),
-                CheckboxListTile(
-                  value: deleteLocal,
-                  onChanged: (v) =>
-                      setDialogState(() => deleteLocal = v ?? false),
-                  title: const Text('同时删除本地文件'),
-                  subtitle:
-                      Text(path, maxLines: 2, style: const TextStyle(fontSize: 12)),
-                  contentPadding: EdgeInsets.zero,
-                  controlAffinity: ListTileControlAffinity.leading,
-                ),
-              ],
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              style: FilledButton.styleFrom(backgroundColor: Colors.red[700]),
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('删除'),
-            ),
-          ],
-        ),
-      ),
-    );
-    if (ok != true || !mounted) return;
-    if (deleteLocal && path != null && path.isNotEmpty) {
-      try {
-        final f = File(path);
-        if (await f.exists()) await f.delete();
-      } catch (e) {
-        _showTopToast('删除本地文件失败: $e', error: true);
-      }
-    }
-    // 同步 daemon 接收目录列表（若提供删除接口）
-    try {
-      if (path != null && path.isNotEmpty) {
-        final uri = Uri.encodeComponent(name);
-        await httpDelete('$_httpBase/api/files/$uri');
-      }
-    } catch (_) {
-      // 无删除接口时忽略：至少已删本地/移出列表
-    }
-    await _refreshReceivedFiles();
-    if (mounted) _showTopToast('已删除「$name」');
-  }
-
   /// 设置弹窗：配对 + 守护进程地址 + 设备名称 + 接收文件保存位置
   Future<void> _showSettingsDialog() async {
     String? currentDir;
@@ -2626,7 +2464,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         body: jsonEncode({'receive_dir': dir}),
       );
       final nd = (jsonDecode(r) as Map<String, dynamic>)['receive_dir'] as String? ?? dir;
-      _refreshReceiveDir();
       onUpdated(nd);
       if (ctx.mounted) {
         _showTopToast('保存位置已更新：$nd');

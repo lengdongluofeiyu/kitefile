@@ -2680,7 +2680,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
                 ),
               ],
             ),
-          // 历史记录操作：打开文件 / 所在文件夹 / 删除
+          // 历史记录操作：同一行图标按钮（打开文件 / 文件夹 / 删除）
           if (history && isTerminal) ...[
             if (path != null && path.isNotEmpty) ...[
               const SizedBox(height: 4),
@@ -2688,41 +2688,36 @@ class _HomePageState extends State<HomePage> with WindowListener {
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(fontSize: 11, color: Colors.grey)),
-              Row(
-                children: [
-                  TextButton.icon(
-                    style: TextButton.styleFrom(
-                      visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                    ),
-                    icon: const Icon(Icons.open_in_new, size: 14),
-                    label: const Text('打开文件'),
+            ],
+            const SizedBox(height: 2),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                if (path != null && path.isNotEmpty) ...[
+                  IconButton(
+                    tooltip: '打开文件',
+                    visualDensity: VisualDensity.compact,
+                    iconSize: 18,
+                    icon: const Icon(Icons.open_in_new),
                     onPressed: () => openFile(path),
                   ),
-                  TextButton.icon(
-                    style: TextButton.styleFrom(
-                      visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                    ),
-                    icon: const Icon(Icons.folder_open, size: 14),
-                    label: const Text('所在文件夹'),
+                  IconButton(
+                    tooltip: '所在文件夹',
+                    visualDensity: VisualDensity.compact,
+                    iconSize: 18,
+                    icon: const Icon(Icons.folder_open),
                     onPressed: () => revealInFileManager(path),
                   ),
                 ],
-              ),
-            ],
-            Align(
-              alignment: Alignment.centerRight,
-              child: TextButton.icon(
-                style: TextButton.styleFrom(
+                IconButton(
+                  tooltip: '删除记录',
                   visualDensity: VisualDensity.compact,
-                  padding: const EdgeInsets.symmetric(horizontal: 8),
-                  foregroundColor: Colors.red[700],
+                  iconSize: 18,
+                  color: Colors.red[700],
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: () => _confirmDeleteTransferRecord(p),
                 ),
-                icon: const Icon(Icons.delete_outline, size: 16),
-                label: const Text('删除记录'),
-                onPressed: () => _confirmDeleteTransferRecord(p),
-              ),
+              ],
             ),
           ],
         ],
