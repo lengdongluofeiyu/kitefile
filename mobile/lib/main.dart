@@ -100,6 +100,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// 首页传输记录折叠态：接收/发送列表默认收起，完成的任务不再占用进度区
   bool _recvOpen = false;
   bool _sendOpen = false;
+  /// 配对请求弹窗是否打开（WS 之外轮询 pending 时避免重复弹窗）
+  bool _pairDialogOpen = false;
+  Timer? _pairPendingPoll;
   /// 待决定的传入请求（incoming_id → entry）
   final Map<String, IncomingEntry> _incoming = {};
   /// 攒批—决策—迟到沿用状态机（工作流 C：共享实现，双端仅此一份）
@@ -116,6 +119,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // WS 之外兜底：每 2s 轮询配对 pending，防 WS 丢 pair_request 事件
+    _pairPendingPoll = Timer.periodic(const Duration(seconds: 2), (_) async {
+      if (!mounted || _pairDialogOpen || !_daemonOnline) return;
+      try {
+        final r = await httpGet('$_httpBase/api/pair/pending');
+        final j = jsonDecode(r) as Map<String, dynamic>;
+        final pend = j['pending'] as Map<String, dynamic>?;
+        if (pend != null && pend['session'] is String) {
+          _pairDialogOpen = true;
+          try {
+            await _showPairRequestDialog(pend);
+          } finally {
+            _pairDialogOpen = false;
+          }
+        }
+      } catch (_) {}
+    });
     _batchDecider = BatchDecider(
       onShowSingle: (entry) {
         if (mounted) _showIncomingDialog(entry);
@@ -175,6 +195,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void dispose() {
     _batchDecider.dispose();
+    _pairPendingPoll?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _ws?.close();
     _refreshTimer?.cancel();
@@ -331,6 +352,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return d.name;
   }
 
+  /// 配对发起失败文案：限频 / 未开配对模式 / 其它
+  String _pairStartErrorText(Object e, String base) {
+    final s = e.toString();
+    if (s.contains('请求过于频繁') || s.contains('429')) {
+      return '请求过于频繁，请约 10 秒后再试';
+    }
+    if (s.contains('未开启配对模式') || s.contains('403')) {
+      return '对方未开启配对模式，请对方也打开「添加设备」页';
+    }
+    if (s.contains('已配对') || s.contains('409')) {
+      return '配对冲突或已有请求进行中，请稍后重试';
+    }
+    return '发起配对失败: $e ($base)';
+  }
+
   /// 仅改本机显示名（POST /api/peers/:id/rename）
   Future<void> _renamePeer(
       String deviceId, String currentName, {VoidCallback? onDone}) async {
@@ -427,13 +463,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  /// 对端配对请求弹窗：两屏比对确认码，确认 → POST /api/pair/decide
+  /// 对端配对请求弹窗：展示确认码；发起方输入码并通过后才能点「确认配对」。
+  /// WS 之外每秒轮询 pending，防 WS 丢事件导致永远收不到请求。
   Future<void> _showPairRequestDialog(Map<String, dynamic> j) async {
     final session = j['session'] as String? ?? '';
     final name = j['name'] as String? ?? '未知设备';
     final ip = j['ip'] as String? ?? '';
     final platform = j['platform'] as String? ?? '';
-    final code = j['code'] as String? ?? '';
+    var code = j['code'] as String? ?? '';
+    var codeVerified = j['code_verified'] == true;
     if (session.isEmpty || !mounted) return;
 
     Future<void> decide(bool accept) async {
@@ -458,72 +496,114 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
     }
 
+    var closed = false;
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Row(
-          children: [
-            Icon(Icons.link_rounded, size: 24),
-            SizedBox(width: 8),
-            Text('配对请求'),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('$name 请求与本机配对'),
-            const SizedBox(height: 4),
-            Text('$platform · $ip',
-                style: const TextStyle(fontSize: 12, color: Colors.grey)),
-            const SizedBox(height: 16),
-            const Text('确认码（请与对方屏幕核对）',
-                style: TextStyle(fontSize: 12, color: Colors.grey)),
-            const SizedBox(height: 8),
-            Center(
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-                decoration: BoxDecoration(
-                  color: Theme.of(ctx).colorScheme.primaryContainer,
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Text(
-                  code,
-                  style: const TextStyle(
-                      fontSize: 36,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 6),
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setDialogState) {
+        // 轮询 pending：门禁状态变化 / 会话过期 / 对方取消
+        Future.delayed(const Duration(seconds: 1), () async {
+          if (closed || !ctx.mounted) return;
+          try {
+            final r = await httpGet('$_httpBase/api/pair/pending');
+            final j2 = jsonDecode(r) as Map<String, dynamic>;
+            final pend = j2['pending'] as Map<String, dynamic>?;
+            if (pend == null || pend['session'] != session) {
+              closed = true;
+              if (ctx.mounted) Navigator.pop(ctx);
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('配对会话已结束或对方已取消')),
+                );
+              }
+              return;
+            }
+            final verified = pend['code_verified'] == true;
+            final newCode = pend['code'] as String? ?? code;
+            if (verified != codeVerified || newCode != code) {
+              setDialogState(() {
+                codeVerified = verified;
+                code = newCode;
+              });
+            }
+          } catch (_) {/* 下一轮再试 */}
+        });
+        return AlertDialog(
+          title: const Row(
+            children: [
+              Icon(Icons.link_rounded, size: 24),
+              SizedBox(width: 8),
+              Text('配对请求'),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('$name 请求与本机配对'),
+              const SizedBox(height: 4),
+              Text('$platform · $ip',
+                  style: const TextStyle(fontSize: 12, color: Colors.grey)),
+              const SizedBox(height: 16),
+              Text(
+                codeVerified ? '确认码（对方已输入）' : '确认码（请让对方看清并输入）',
+                style: const TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+              const SizedBox(height: 8),
+              Center(
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: Theme.of(ctx).colorScheme.primaryContainer,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    code,
+                    style: const TextStyle(
+                        fontSize: 36,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 6),
+                  ),
                 ),
               ),
+              const SizedBox(height: 8),
+              Text(
+                codeVerified
+                    ? '对方已输入正确确认码。请确认设备无误后点「确认配对」。'
+                    : '请把此确认码念给对方，或让对方看清；由对方在发起配对的设备上输入。'
+                        '对方输入正确后，本页「确认配对」才会解锁。',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: codeVerified ? Colors.green[700] : Colors.orange,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                closed = true;
+                Navigator.pop(ctx);
+                decide(false);
+              },
+              child: const Text('拒绝'),
             ),
-            const SizedBox(height: 8),
-            const Text(
-              '请把此确认码念给对方，或让对方看清；由对方在发起配对的设备上输入。'
-              '输入一致后，再由你点「确认配对」。',
-              style: TextStyle(fontSize: 12, color: Colors.orange),
+            FilledButton(
+              onPressed: codeVerified
+                  ? () {
+                      closed = true;
+                      Navigator.pop(ctx);
+                      decide(true);
+                    }
+                  : null,
+              child: Text(codeVerified ? '确认配对' : '等待对方输入确认码…'),
             ),
           ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.pop(ctx);
-              decide(false);
-            },
-            child: const Text('拒绝'),
-          ),
-          FilledButton(
-            onPressed: () {
-              Navigator.pop(ctx);
-              decide(true);
-            },
-            child: const Text('确认配对'),
-          ),
-        ],
-      ),
+        );
+      }),
     );
+    closed = true;
   }
 
   /// 添加设备（P2 入口改版）：打开即开启配对模式，页内完成
@@ -567,12 +647,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     String? waitId;
     String? waitName;
     String? waitCode; // pair/start 返回的本机侧确认码（与对方屏上应一致）
-    var codeOk = false; // 发起方已输入正确确认码
+    var codeOk = false; // 发起方已输入正确确认码并已转发给对方
+    var codeSubmitting = false;
     final codeCtrl = TextEditingController();
     var expired = false; // 倒计时到点后的结束态（等「重试」重新开启）
     var refreshTick = 0; // 搜索期每 15s 触发一次 pair 标志同步（/api/pair/refresh）
     Timer? ticker;
     var stopped = false;
+    StateSetter? waitSetState;
+    Future<void> cancelSession() async {
+      final sid = waitId;
+      waitId = null;
+      codeOk = false;
+      codeSubmitting = false;
+      codeCtrl.clear();
+      waitSetState?.call(() {});
+      if (sid != null) {
+        try {
+          await httpPost('$_httpBase/api/pair/cancel',
+              body: jsonEncode({'session': sid}));
+        } catch (_) {/* TTL 兜底 */}
+      }
+    }
+
     Future<void> shutdown() async {
       stopped = true;
       ticker?.cancel();
@@ -588,6 +685,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       context: context,
       barrierDismissible: true,
       builder: (ctx) => StatefulBuilder(builder: (ctx, setDialogState) {
+        waitSetState = setDialogState;
         ticker ??= Timer.periodic(const Duration(seconds: 1), (t) async {
           if (stopped) {
             t.cancel();
@@ -610,6 +708,25 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 return;
               }
             } catch (_) {/* 轮询失败下一轮再试 */}
+            // 会话过期检测：out_pending 消失且尚未确认成功 → 提示重试
+            if (codeOk) {
+              try {
+                final r =
+                    await httpGet('$_httpBase/api/pair/out-pending');
+                final j = jsonDecode(r) as Map<String, dynamic>;
+                if (j['active'] != true && waitId != null) {
+                  waitId = null;
+                  codeOk = false;
+                  if (ctx.mounted) {
+                    setDialogState(() {});
+                    ScaffoldMessenger.of(ctx).showSnackBar(
+                      const SnackBar(
+                          content: Text('配对会话已过期，请重新发起配对')),
+                    );
+                  }
+                }
+              } catch (_) {}
+            }
             // 倒计时照走：到点即关（confirm 不依赖配对模式，等待不受影响）
             if (!expired) {
               ttl -= 1;
@@ -718,36 +835,67 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                         const SizedBox(height: 8),
                         TextButton.icon(
                           icon: const Icon(Icons.check, size: 18),
-                          label: const Text('输入完成 · 校验'),
-                          onPressed: () async {
-                            final input =
-                                codeCtrl.text.replaceAll(RegExp(r'\s'), '');
-                            if (input.length != 6) {
-                              if (ctx.mounted) {
-                                ScaffoldMessenger.of(ctx).showSnackBar(
-                                  const SnackBar(
-                                      content: Text('请输入对方屏幕上的 6 位数字')),
-                                );
-                              }
-                              return;
-                            }
-                            if (input != waitCode) {
-                              if (ctx.mounted) {
-                                ScaffoldMessenger.of(ctx).showSnackBar(
-                                  const SnackBar(
-                                    content: Text(
-                                        '确认码不一致：请核对对方屏幕上的数字，可能有人在中间拦截'),
-                                  ),
-                                );
-                              }
-                              return;
-                            }
-                            setDialogState(() => codeOk = true);
-                          },
+                          label: Text(codeSubmitting ? '提交中…' : '输入完成 · 校验'),
+                          onPressed: codeSubmitting
+                              ? null
+                              : () async {
+                                  final input = codeCtrl.text
+                                      .replaceAll(RegExp(r'\s'), '');
+                                  if (input.length != 6) {
+                                    if (ctx.mounted) {
+                                      ScaffoldMessenger.of(ctx).showSnackBar(
+                                        const SnackBar(
+                                            content: Text(
+                                                '请输入对方屏幕上的 6 位数字')),
+                                      );
+                                    }
+                                    return;
+                                  }
+                                  if (input != waitCode) {
+                                    if (ctx.mounted) {
+                                      ScaffoldMessenger.of(ctx).showSnackBar(
+                                        const SnackBar(
+                                          content: Text(
+                                              '确认码不一致：请核对对方屏幕上的数字，可能有人在中间拦截'),
+                                        ),
+                                      );
+                                    }
+                                    return;
+                                  }
+                                  // 校验通过 → 提交给对方，解锁其「确认配对」
+                                  setDialogState(() => codeSubmitting = true);
+                                  try {
+                                    final sid = waitId;
+                                    final r = await httpPost(
+                                      '$_httpBase/api/pair/verify-forward',
+                                      body: jsonEncode(
+                                          {'session': sid, 'code': input}),
+                                    );
+                                    final j =
+                                        jsonDecode(r) as Map<String, dynamic>;
+                                    if (j['ok'] == true) {
+                                      setDialogState(() {
+                                        codeOk = true;
+                                        codeSubmitting = false;
+                                      });
+                                    } else {
+                                      setDialogState(
+                                          () => codeSubmitting = false);
+                                    }
+                                  } catch (e) {
+                                    setDialogState(
+                                        () => codeSubmitting = false);
+                                    if (ctx.mounted) {
+                                      ScaffoldMessenger.of(ctx).showSnackBar(
+                                        SnackBar(content: Text('提交确认码失败: $e')),
+                                      );
+                                    }
+                                  }
+                                },
                         ),
                         const Text(
                           '码必须与对方屏幕一致；不一致请取消重来。'
-                          '输入正确后仍需由对方点「确认配对」。',
+                          '提交成功后，对方屏幕上「确认配对」才会解锁。',
                           textAlign: TextAlign.center,
                           style: TextStyle(fontSize: 11, color: Colors.orange),
                         ),
@@ -763,19 +911,28 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                         ),
                         const SizedBox(height: 8),
                         const Text(
-                          '确认码正确。请对方在其屏幕上点「确认配对」；'
+                          '确认码已提交。请对方在其屏幕上点「确认配对」；'
                           '60 秒未确认将过期。',
                           textAlign: TextAlign.center,
                           style: TextStyle(fontSize: 12, color: Colors.grey),
                         ),
                       ],
-                      TextButton(
-                        onPressed: () => setDialogState(() {
-                          waitId = null;
-                          codeOk = false;
-                          codeCtrl.clear();
-                        }),
-                        child: const Text('返回设备列表'),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          TextButton(
+                            onPressed: () async {
+                              await cancelSession();
+                            },
+                            child: const Text('取消配对'),
+                          ),
+                          TextButton(
+                            onPressed: () async {
+                              await cancelSession();
+                            },
+                            child: const Text('返回设备列表'),
+                          ),
+                        ],
                       ),
                     ],
                   )
@@ -901,7 +1058,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                                               ScaffoldMessenger.of(ctx)
                                                   .showSnackBar(SnackBar(
                                                       content: Text(
-                                                          '重新配对失败: $e ($_httpBase)')));
+                                                          '重新配对失败: ${_pairStartErrorText(e, _httpBase)}')));
                                             }
                                           }
                                         },
@@ -990,7 +1147,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                                     if (ctx.mounted) {
                                       ScaffoldMessenger.of(ctx).showSnackBar(
                                         SnackBar(
-                                            content: Text('发起配对失败: $e ($_httpBase)')),
+                                            content: Text(
+                                                _pairStartErrorText(e, _httpBase))),
                                       );
                                     }
                                   }

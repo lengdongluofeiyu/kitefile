@@ -58,6 +58,9 @@ pub struct InPending {
     /// A 的 LAN TLS 端口（confirm 目标端口，来自 hello body）
     pub peer_gateway_port: u16,
     pub created: Instant,
+    /// 发起方是否已提交正确的确认码。为 false 时 B 的「确认配对」必须禁用——
+    /// 交互定案：发起方输入对方屏上的码是配对门禁之一，接收方不得抢先确认。
+    pub code_verified: bool,
 }
 
 /// A 侧 pending：主动发起 hello 后，等待 B 推 confirm（设计 §6 两阶段写）
@@ -70,6 +73,10 @@ pub struct OutPending {
     pub peer_name: String,
     pub peer_platform: String,
     pub created: Instant,
+    /// B 的 LAN TLS 端口（取消时通知 B 清理 pending 用）
+    pub peer_gateway_port: u16,
+    /// B 的 IP（提交确认码 / 取消通知用）
+    pub peer_ip: String,
 }
 
 #[derive(Debug)]
@@ -178,6 +185,35 @@ impl PairingState {
             return None;
         }
         slot.clone()
+    }
+
+    /// 标记发起方已提交正确确认码（B 侧门禁）。
+    pub fn mark_code_verified(&self, session: &str) -> bool {
+        let mut slot = self.in_pending.write();
+        let ok = slot
+            .as_ref()
+            .map(|x| x.session == session && !now_expired(x.created))
+            .unwrap_or(false);
+        if ok {
+            if let Some(p) = slot.as_mut() {
+                p.code_verified = true;
+            }
+        }
+        ok
+    }
+
+    /// A 侧是否存在未过期的发起会话（UI 轮询用）
+    pub fn out_pending_active(&self) -> Option<String> {
+        let slot = self.out_pending.read();
+        let ok = slot
+            .as_ref()
+            .map(|x| !now_expired(x.created))
+            .unwrap_or(false);
+        if ok {
+            slot.as_ref().map(|x| x.session.clone())
+        } else {
+            None
+        }
     }
 
     /// 按 session 取走 B 侧 pending（decide 成功后调用）；过期 / 不匹配 → None
@@ -346,6 +382,7 @@ mod tests {
             peer_ip: "10.0.0.1".into(),
             peer_gateway_port: 7880,
             created: Instant::now(),
+            code_verified: false,
         };
         p.begin_in_pending(mk("s1")).unwrap();
         assert!(
@@ -353,6 +390,12 @@ mod tests {
             "单 pending：未过期时第二个 hello 必须 busy"
         );
         assert_eq!(p.in_pending().unwrap().session, "s1");
+        assert!(
+            !p.in_pending().unwrap().code_verified,
+            "门禁：默认禁止接收方抢先确认"
+        );
+        assert!(p.mark_code_verified("s1"));
+        assert!(p.in_pending().unwrap().code_verified);
 
         // session 不匹配取不走
         assert!(p.take_in_pending("nope").is_none());
@@ -377,11 +420,15 @@ mod tests {
             peer_name: "B".into(),
             peer_platform: "windows".into(),
             created: Instant::now(),
+            peer_gateway_port: 7880,
+            peer_ip: "10.0.0.2".into(),
         });
         assert!(p.check_out_session("s-out").is_some());
+        assert_eq!(p.out_pending_active().as_deref(), Some("s-out"));
         assert!(p.check_out_session("wrong").is_none());
         tokio::time::sleep(PAIR_SESSION_TTL + Duration::from_secs(1)).await;
         assert!(p.check_out_session("s-out").is_none(), "过期会话必须失效");
+        assert!(p.out_pending_active().is_none());
         p.clear_out_pending();
         assert!(p.check_out_session("s-out").is_none());
     }

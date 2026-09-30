@@ -248,6 +248,21 @@ pub struct PairPendingView {
     pub ip: String,
     pub platform: String,
     pub code: String,
+    /// 发起方是否已提交正确确认码；false 时接收方 UI 必须禁用「确认配对」
+    pub code_verified: bool,
+}
+
+/// POST /api/pair/submit-code：发起方输入对方屏幕上的确认码后提交
+#[derive(Debug, Deserialize)]
+pub struct PairSubmitCodeRequest {
+    pub session: String,
+    pub code: String,
+}
+
+/// POST /api/pair/cancel：发起方中止本机会话（并尽力通知对端清理 pending）
+#[derive(Debug, Deserialize)]
+pub struct PairCancelRequest {
+    pub session: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,6 +317,8 @@ async fn pair_hello(
             peer_ip: ip.clone(),
             peer_gateway_port: req.gateway_port,
             created: tokio::time::Instant::now(),
+            // 门禁：发起方尚未输入确认码前，B 的「确认配对」必须禁用
+            code_verified: false,
         })
         .map_err(|_| (StatusCode::CONFLICT, "已有配对请求待处理".into()))?;
 
@@ -364,6 +381,8 @@ async fn pair_start(
             peer_name: req.name.clone(),
             peer_platform: req.platform.clone(),
             created: tokio::time::Instant::now(),
+            peer_gateway_port: req.gateway_port,
+            peer_ip: req.ip.clone(),
         },
     );
     Ok(Json(PairStartResponse {
@@ -394,6 +413,13 @@ async fn pair_decide(
             ok: true,
             error: None,
         }));
+    }
+    // 门禁：发起方必须已提交正确确认码，接收方才能点「确认配对」
+    if !pending.code_verified {
+        return Err((
+            StatusCode::CONFLICT,
+            "对方尚未输入确认码，请等待对方在本机输入正确后再确认".into(),
+        ));
     }
 
     // 两阶段写：先让 A 落库（200），B 收到 200 后才落库——
@@ -468,7 +494,7 @@ async fn pair_confirm(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-/// 本机 UI 轮询：当前待确认的配对请求（含确认码）
+/// 本机 UI 轮询：当前待确认的配对请求（含确认码与门禁状态）
 async fn get_pair_pending(State(state): State<AppState>) -> Json<PairPendingResponse> {
     let Some(p) = state.discovery.pairing().in_pending() else {
         return Json(PairPendingResponse { pending: None });
@@ -481,8 +507,146 @@ async fn get_pair_pending(State(state): State<AppState>) -> Json<PairPendingResp
             ip: p.peer_ip,
             platform: p.peer_platform,
             code,
+            code_verified: p.code_verified,
         }),
     })
+}
+
+/// 发起方提交确认码（Remote，免配对鉴权；合法性由 session + 码比对保证）
+async fn pair_submit_code(
+    State(state): State<AppState>,
+    Json(req): Json<PairSubmitCodeRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pairing = state.discovery.pairing();
+    let Some(p) = pairing.in_pending() else {
+        return Err((StatusCode::NOT_FOUND, "配对会话不存在或已过期".into()));
+    };
+    if p.session != req.session {
+        return Err((StatusCode::NOT_FOUND, "配对会话不匹配".into()));
+    }
+    let expect = crate::pairing::confirm_code(&p.peer_fp, state.identity().fp());
+    let got = req.code.trim();
+    if got != expect {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "确认码不一致：请核对对方屏幕上的数字".into(),
+        ));
+    }
+    if !pairing.mark_code_verified(&req.session) {
+        return Err((StatusCode::NOT_FOUND, "配对会话不存在或已过期".into()));
+    }
+    info!(session = %req.session, "pairing code submitted and verified");
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 发起方中止本机会话；尽力通知对端清理 pending
+async fn pair_cancel(
+    State(state): State<AppState>,
+    Json(req): Json<PairCancelRequest>,
+) -> Json<serde_json::Value> {
+    let pairing = state.discovery.pairing();
+    let Some(p) = pairing.check_out_session(&req.session) else {
+        return Json(serde_json::json!({ "ok": true, "had_pending": false }));
+    };
+    pairing.clear_out_pending();
+    // 通知 B 清理 in_pending（失败靠 60s TTL 兜底）
+    let receive_dir = state.config.receive_dir.clone();
+    let ip = {
+        let map = state.discovery.devices_handle();
+        let guard = map.read();
+        guard
+            .values()
+            .find(|d| d.id == p.peer_device_id)
+            .map(|d| d.ip.clone())
+    };
+    if let Some(ip) = ip {
+        let peer_port = p.peer_gateway_port;
+        let session = req.session.clone();
+        tokio::spawn(async move {
+            let body = serde_json::json!({ "session": session }).to_string();
+            if let Err(e) = crate::httpc::http_post_json_tls(
+                &ip,
+                peer_port,
+                "/api/pair/cancel-in",
+                &body,
+                &receive_dir,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "notify peer cancel failed");
+            }
+        });
+    }
+    Json(serde_json::json!({ "ok": true, "had_pending": true }))
+}
+
+/// 发起方中止后，接收方清理 pending（Remote，免配对鉴权）
+async fn pair_cancel_in(
+    State(state): State<AppState>,
+    Json(req): Json<PairCancelRequest>,
+) -> Json<serde_json::Value> {
+    let pairing = state.discovery.pairing();
+    let cleared = pairing
+        .in_pending()
+        .map(|p| p.session == req.session)
+        .unwrap_or(false);
+    if cleared {
+        pairing.clear_in_pending();
+    }
+    Json(serde_json::json!({ "ok": true }))
+}
+
+/// 发起方轮询：本机 out_pending 是否仍在（会话过期检测）
+async fn get_out_pending(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let session = state.discovery.pairing().out_pending_active();
+    Json(serde_json::json!({ "active": session.is_some(), "session": session }))
+}
+
+/// 发起方本机校验确认码并转发给对端（Dart 只打本机回环口）
+#[derive(Debug, Deserialize)]
+pub struct PairVerifyForwardRequest {
+    pub session: String,
+    pub code: String,
+}
+
+async fn pair_verify_forward(
+    State(state): State<AppState>,
+    Json(req): Json<PairVerifyForwardRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pairing = state.discovery.pairing();
+    let Some(p) = pairing.check_out_session(&req.session) else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "无此配对会话或已过期（请重新发起配对）".into(),
+        ));
+    };
+    let expect = crate::pairing::confirm_code(state.identity().fp(), &p.peer_fp);
+    let got = req.code.trim();
+    if got != expect {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "确认码不一致：请核对对方屏幕上的数字，可能有人在中间拦截".into(),
+        ));
+    }
+    let body = serde_json::json!({ "session": req.session, "code": got }).to_string();
+    crate::httpc::http_post_json_tls(
+        &p.peer_ip,
+        p.peer_gateway_port,
+        "/api/pair/submit-code",
+        &body,
+        &state.config.receive_dir,
+    )
+    .await
+    .map_err(|e| {
+        let hint = if e.kind() == std::io::ErrorKind::InvalidData {
+            format!("对方拒绝了确认码提交：{e}")
+        } else {
+            format!("提交确认码失败：{e}")
+        };
+        (StatusCode::BAD_GATEWAY, hint)
+    })?;
+    info!(session = %req.session, "pairing code forwarded to peer");
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// 已配对设备列表（含在线状态，拼设备表）
@@ -767,6 +931,11 @@ fn build_app(state: AppState, advertised_gateway_port: u16) -> Router {
         .route("/api/pair/start", post(pair_start))
         .route("/api/pair/decide", post(pair_decide))
         .route("/api/pair/pending", get(get_pair_pending))
+        .route("/api/pair/out-pending", get(get_out_pending))
+        .route("/api/pair/submit-code", post(pair_submit_code))
+        .route("/api/pair/verify-forward", post(pair_verify_forward))
+        .route("/api/pair/cancel", post(pair_cancel))
+        .route("/api/pair/cancel-in", post(pair_cancel_in))
         .route("/api/peers", get(list_peers))
         .route(
             "/api/peers/:device_id",
@@ -913,6 +1082,11 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
         (Method::POST, "/api/pair/start", LocalOnly),
         (Method::POST, "/api/pair/decide", LocalOnly),
         (Method::GET, "/api/pair/pending", LocalOnly),
+        (Method::GET, "/api/pair/out-pending", LocalOnly),
+        (Method::POST, "/api/pair/submit-code", Remote),
+        (Method::POST, "/api/pair/verify-forward", LocalOnly),
+        (Method::POST, "/api/pair/cancel", LocalOnly),
+        (Method::POST, "/api/pair/cancel-in", Remote),
         (Method::GET, "/api/peers", LocalOnly),
         (Method::POST, "/api/peers/:device_id/rename", LocalOnly),
         (Method::DELETE, "/api/peers/:device_id", LocalOnly),
@@ -965,7 +1139,11 @@ async fn auth_guard(State(state): State<AppState>, req: Request, next: Next) -> 
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let exempt = (method == Method::GET && path == "/api/whoami")
-        || (method == Method::POST && (path == "/api/pair/hello" || path == "/api/pair/confirm"));
+        || (method == Method::POST
+            && (path == "/api/pair/hello"
+                || path == "/api/pair/confirm"
+                || path == "/api/pair/submit-code"
+                || path == "/api/pair/cancel-in"));
     if exempt {
         return next.run(req).await;
     }

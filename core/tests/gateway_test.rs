@@ -1583,6 +1583,31 @@ async fn test_pairing_flow_end_to_end() {
     );
     assert_eq!(p["ip"].as_str(), Some("127.0.0.1"));
     assert!(p["name"].as_str().is_some(), "应携带发起方展示名");
+    assert_eq!(
+        p["code_verified"].as_bool(),
+        Some(false),
+        "默认门禁：发起方未提交码前 B 不得确认"
+    );
+
+    // 4b) 未提交码时 B 点确认必须被拒
+    let decide_early = format!(r#"{{"session":"{session}","accept":true}}"#);
+    let (st, resp) = http(18083, "POST", "/api/pair/decide", Some(&decide_early)).await;
+    assert_eq!(
+        st, 409,
+        "未提交确认码时 decide accept 必须 409: {}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    // 4c) A 校验并提交确认码 → B 解锁
+    let vf = format!(r#"{{"session":"{session}","code":"{code_a}"}}"#);
+    let (st, resp) = http(18082, "POST", "/api/pair/verify-forward", Some(&vf)).await;
+    assert_eq!(st, 200, "verify-forward: {}", String::from_utf8_lossy(&resp));
+    let v = http_json(18083, "GET", "/api/pair/pending", None).await;
+    assert_eq!(
+        v["pending"]["code_verified"].as_bool(),
+        Some(true),
+        "提交码后 B 的 pending 应标记 code_verified"
+    );
 
     // 5) B 确认 → B 推 confirm 给 A → A 先落库 → B 落库
     let decide_body = format!(r#"{{"session":"{session}","accept":true}}"#);
@@ -1816,6 +1841,10 @@ async fn test_repair_allows_hello_when_both_paired() {
     assert_eq!(st, 200, "first pair: {}", String::from_utf8_lossy(&body));
     let v: Value = serde_json::from_slice(&body).unwrap();
     let session = v["pairing_session"].as_str().unwrap().to_string();
+    let code = v["code"].as_str().unwrap().to_string();
+    let vf = format!(r#"{{"session":"{session}","code":"{code}"}}"#);
+    let (st, resp) = http(18084, "POST", "/api/pair/verify-forward", Some(&vf)).await;
+    assert_eq!(st, 200, "first verify-forward: {}", String::from_utf8_lossy(&resp));
     let (st, _) = http(
         18085,
         "POST",
@@ -1841,6 +1870,10 @@ async fn test_repair_allows_hello_when_both_paired() {
     );
     let v: Value = serde_json::from_slice(&body).unwrap();
     let session2 = v["pairing_session"].as_str().unwrap().to_string();
+    let code2 = v["code"].as_str().unwrap().to_string();
+    let vf2 = format!(r#"{{"session":"{session2}","code":"{code2}"}}"#);
+    let (st, resp) = http(18084, "POST", "/api/pair/verify-forward", Some(&vf2)).await;
+    assert_eq!(st, 200, "re-pair verify-forward: {}", String::from_utf8_lossy(&resp));
     let (st, resp) = http(
         18085,
         "POST",
