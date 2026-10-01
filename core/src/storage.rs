@@ -99,6 +99,11 @@ pub struct ReceiveSlot {
     pub await_sha256: bool,
     pub temp_path: PathBuf,
     pub final_path: PathBuf,
+    /// 每条流已确认落盘的字节数（字节级续传，2026-10-02）：
+    /// `stream_bytes[i]` = 流 i 已写入 .part 的字节数（≤ segments[i].1）。
+    /// 发送方续传时按它从断点字节继续，而不是重发整段。
+    #[serde(default)]
+    pub stream_bytes: Vec<u64>,
 }
 
 impl ReceiveSlot {
@@ -196,6 +201,7 @@ impl StorageManager {
             let _ = file.set_len(file_size);
         }
 
+        let stream_bytes = vec![0; segments.len()];
         let slot = ReceiveSlot {
             file_id: file_id.clone(),
             file_name,
@@ -208,6 +214,7 @@ impl StorageManager {
             await_sha256,
             temp_path,
             final_path,
+            stream_bytes,
         };
 
         self.slots.lock().await.insert(file_id, slot);
@@ -280,6 +287,28 @@ impl StorageManager {
     pub async fn add_bytes(&self, file_id: &str, n: u64) {
         if let Some(slot) = self.slots.lock().await.get_mut(file_id) {
             slot.bytes_received = slot.bytes_received.saturating_add(n);
+        }
+    }
+
+    /// 字节级续传记账（2026-10-02）：上报流 `stream_id` 已确认落盘的字节数
+    /// （相对段起点的偏移）。取 max——重发连接可能与旧连接的在途字节重叠，
+    /// 同字节重写无害，但计数只进不退。`bytes_received` 同步重算为各流之和，
+    /// 保证接收端进度条不因重发双计。
+    pub async fn set_stream_bytes(&self, file_id: &str, stream_id: usize, received: u64) {
+        let mut slots = self.slots.lock().await;
+        let Some(slot) = slots.get_mut(file_id) else {
+            return;
+        };
+        // 旧槽位（本字段引入前创建）懒补齐
+        if slot.stream_bytes.len() != slot.streams_done.len() {
+            slot.stream_bytes = vec![0; slot.streams_done.len()];
+        }
+        if stream_id >= slot.stream_bytes.len() {
+            return;
+        }
+        if received > slot.stream_bytes[stream_id] {
+            slot.stream_bytes[stream_id] = received;
+            slot.bytes_received = slot.stream_bytes.iter().sum();
         }
     }
 

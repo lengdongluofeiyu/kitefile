@@ -1004,9 +1004,16 @@ impl TransferEngine {
                 header.stream_id, slot.stream_count
             )));
         };
-        if header.start_offset != seg_start || header.data_len != seg_len {
+        // 范围校验（2026-10-02 字节级续传）：头必须落在本段区间内，且
+        // 从声明起点一直发到段尾。整段重发（start==seg_start）与断点续发
+        // （start > seg_start）都被接受；越界 / 缺尾一律协议违例。
+        let seg_end = seg_start + seg_len;
+        if header.start_offset < seg_start
+            || header.start_offset > seg_end
+            || header.start_offset + header.data_len != seg_end
+        {
             return Err(TransferFailure::protocol(format!(
-                "stream {} layout mismatch: header=({}, {}) expected=({}, {})",
+                "stream {} range mismatch: header=({}, {}) segment=({}, {})",
                 header.stream_id, header.start_offset, header.data_len, seg_start, seg_len
             )));
         }
@@ -1029,6 +1036,9 @@ impl TransferEngine {
                 .checked_sub(PROGRESS_PUSH_INTERVAL)
                 .unwrap_or_else(Instant::now);
             let mut resumed = false;
+            // 本连接从段内相对偏移 (start_offset - seg_start) 开始写
+            let seg_rel_start = header.start_offset - seg_start;
+            let mut written: u64 = 0;
             while remaining > 0 {
                 let want = std::cmp::min(remaining as usize, buf.len());
                 let n = read_full(stream, &mut buf[..want], Phase::Recv, idle).await?;
@@ -1047,7 +1057,12 @@ impl TransferEngine {
                     .await
                     .map_err(|e| from_io(&e, Phase::DiskWrite))?;
                 remaining -= n as u64;
-                self.storage.add_bytes(file_id, n as u64).await;
+                written += n as u64;
+                // 字节级续传记账（替代 add_bytes）：按流记录已收偏移，
+                // bytes_received 重算为各流之和，重发不双计
+                self.storage
+                    .set_stream_bytes(file_id, header.stream_id as usize, seg_rel_start + written)
+                    .await;
 
                 // 数据面活性恢复：**收到第一批字节**就清中断标记回「传输中」。
                 // 不能等 finish_stream——大段重发（真机 2.63GB 单段）要分钟级，
@@ -1187,16 +1202,21 @@ impl TransferEngine {
     /// 对端已续传（发送方 resume 或本机续传信号回执）：清中断标记，
     /// 进度回到「传输中」（§3.5：点继续后 → 传输中）。
     ///
-    /// 返回**本机是否还持有该任务的接收槽位**——发送方续传前用它探测：
-    /// 接收方进程重启过（内存槽位丢失）→ false → 发送方直接 Failed，
-    /// 不空烧数据面（A3.2「resume 时槽位丢失 → Failed，禁止无限续」）。
-    pub async fn on_peer_resumed(&self, file_id: &str) -> bool {
+    /// 发送方续传前的探测（2026-10-02 起携带字节级续传信息）。
+    ///
+    /// 返回 `None` = 本机已无该任务的接收槽位（对端 app 重启过，内存槽位
+    /// 丢失）→ 发送方直接 Failed，不空烧数据面、不进入「继续→又中断」
+    /// 死循环（A3.2）。返回 `Some(stream_bytes)` = 每条流已确认落盘的
+    /// 字节数（相对段起点），发送方据此从断点字节继续而非重发整段。
+    pub async fn on_peer_resumed(&self, file_id: &str) -> Option<Vec<u64>> {
         self.recv_interrupted.lock().remove(file_id);
-        let slot_exists = self.storage.get_slot(file_id).await.is_some();
-        if slot_exists {
-            self.publish_recv_progress(file_id).await;
+        match self.storage.get_slot(file_id).await {
+            Some(slot) => {
+                self.publish_recv_progress(file_id).await;
+                Some(slot.stream_bytes)
+            }
+            None => None,
         }
-        slot_exists
     }
 
     /// sha256 补发保险丝（A3.8）：绑定任务生命周期——
@@ -1707,6 +1727,7 @@ impl TransferEngine {
                 streams_done: s.streams_done.clone(),
                 progress_tx: s.progress_tx.clone(),
                 cancel_rx: s.cancel_tx.subscribe(),
+                resume_offsets: Vec::new(),
             }
         };
 
@@ -1752,14 +1773,23 @@ impl TransferEngine {
                         .await;
                         return;
                     }
+                    // 字节级续传（2026-10-02）：接收方汇报每段已确认收到的
+                    // 字节数。旧对端无此字段 → 空 vec，退回整段重发（兼容）。
+                    snap.resume_offsets = parse_stream_bytes(&body);
                 }
                 Err(e) => {
                     warn!(error = %e, "notify receiver resume failed; continue via data plane");
                 }
             }
             // 探测通过（或未知）→ 回「传输中」（§3.5：点继续后 → 传输中）
-            let (chunks_done, bytes) =
+            let layout = stream_layout(snap.file_size, snap.stream_count);
+            let (chunks_done, _) =
                 done_stats(&snap.streams_done, snap.file_size, snap.stream_count);
+            let bytes = delivered_bytes(
+                &snap.streams_done,
+                &layout,
+                &snap.resume_offsets,
+            );
             push_progress(
                 &snap.progress_tx,
                 TransferProgress { time: None,
@@ -1792,6 +1822,7 @@ impl TransferEngine {
                 snap.file_size,
                 snap.stream_count,
                 snap.streams_done.clone(),
+                snap.resume_offsets.clone(),
                 snap.cancel_rx.clone(),
                 snap.progress_tx.clone(),
             )
@@ -2063,6 +2094,7 @@ impl TransferEngine {
         file_size: u64,
         stream_count: u32,
         streams_done: Arc<Mutex<Vec<bool>>>,
+        resume_offsets: Vec<u64>,
         cancel_rx: watch::Receiver<bool>,
         progress_tx: mpsc::Sender<TransferProgress>,
     ) -> SendOutcome {
@@ -2084,9 +2116,21 @@ impl TransferEngine {
             }
         };
 
-        // 续传基数：已完成段的字节/计数直接入账，未完成段从 0 开始累计
-        let (base_chunks, base_bytes) =
+        // 续传基数：已完成段 + 未完成段中接收方已确认收到的字节直接入账，
+        // 未确认部分从 0 开始累计（字节级续传，进度条不回退）
+        let (base_chunks, mut base_bytes) =
             done_stats(&streams_done, file_size, stream_count);
+        {
+            let done = streams_done.lock();
+            for (i, &rel) in resume_offsets.iter().enumerate() {
+                if done.get(i).copied().unwrap_or(false) {
+                    continue;
+                }
+                if let Some(&(_, seg_len)) = layout.get(i) {
+                    base_bytes = base_bytes.saturating_add(rel.min(seg_len));
+                }
+            }
+        }
         let bytes_done = Arc::new(AtomicU64::new(base_bytes));
         let chunks_done_counter = Arc::new(AtomicU64::new(base_chunks));
         let last_push = Arc::new(TokioMutex::new(Instant::now()
@@ -2117,6 +2161,7 @@ impl TransferEngine {
             };
             let file_id_prefix = file_id_prefix;
             let client_cfg = client_cfg.clone();
+            let resume_offsets = resume_offsets.clone();
 
             handles.push(tokio::spawn(async move {
                 let stream_id_u32 = stream_id as u32;
@@ -2124,8 +2169,17 @@ impl TransferEngine {
                 if streams_done.lock().get(stream_id).copied().unwrap_or(false) {
                     return WorkerResult::Done;
                 }
-                // 空段（空文件）：直接算完成
-                if seg_len == 0 {
+                // 字节级续传（2026-10-02）：从接收方确认的字节偏移继续，
+                // 只发段内未收到的尾部。整段已确认或空段 → 只标记完成，
+                // 不建连不发数据——杜绝「一次中断、整段重发」的体感回退。
+                let resume_rel = resume_offsets
+                    .get(stream_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(seg_len);
+                let eff_start = start_offset + resume_rel;
+                let eff_len = seg_len - resume_rel;
+                if eff_len == 0 {
                     streams_done.lock()[stream_id] = true;
                     pctx.streams_done.fetch_add(1, Ordering::Relaxed);
                     pctx.maybe_push().await;
@@ -2168,8 +2222,8 @@ impl TransferEngine {
                         &target_ip,
                         target_port,
                         &file_path,
-                        start_offset,
-                        seg_len,
+                        eff_start,
+                        eff_len,
                         stream_id_u32,
                         file_id_prefix,
                         &mut cancel_rx,
@@ -2312,6 +2366,9 @@ struct SessionSnap {
     streams_done: Arc<Mutex<Vec<bool>>>,
     progress_tx: mpsc::Sender<TransferProgress>,
     cancel_rx: watch::Receiver<bool>,
+    /// 字节级续传（2026-10-02）：每条流接收方已确认收到的字节数
+    /// （相对段起点）。空 = 无该信息（旧对端 / 首次发送），按整段处理。
+    resume_offsets: Vec<u64>,
 }
 
 /// 由完成位图计算 (chunks_done, bytes_done)——已完成段的真实进度。
@@ -2699,6 +2756,39 @@ fn parse_slot_flag(body: &str) -> Option<bool> {
         .ok()?
         .get("slot")?
         .as_bool()
+}
+
+/// 解析 /api/peer-resumed 响应里的字节级续传信息：
+/// 每条流接收方已确认落盘的字节数（相对段起点）。
+/// 旧对端不携带该字段 → 空 vec（发送方退回整段重发，兼容）。
+fn parse_stream_bytes(body: &str) -> Vec<u64> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("stream_bytes")
+                .and_then(|s| s.as_array())
+                .map(|a| a.iter().map(|x| x.as_u64().unwrap_or(0)).collect::<Vec<_>>())
+        })
+        .unwrap_or_default()
+}
+
+/// 已确认送达字节：已完成段按整段计；未完成段按接收方确认的字节偏移计
+/// （字节级续传）。进度条与真实送达进度一致，续传时不回退。
+fn delivered_bytes(
+    streams_done: &Mutex<Vec<bool>>,
+    layout: &[(u64, u64)],
+    resume_offsets: &[u64],
+) -> u64 {
+    let done = streams_done.lock();
+    let mut bytes = 0u64;
+    for (i, &(_, seg_len)) in layout.iter().enumerate() {
+        if done.get(i).copied().unwrap_or(false) {
+            bytes += seg_len;
+        } else {
+            bytes += resume_offsets.get(i).copied().unwrap_or(0).min(seg_len);
+        }
+    }
+    bytes
 }
 
 /// 单次补发校验值的结果。
@@ -3442,6 +3532,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(&src_dir);
     }
 
+    /// 字节级续传（2026-10-02）：段 1 只收到 2/5 字节后中断，恢复后
+    /// 发送方必须**只补发剩余 3 字节**（从偏移 7 起），已收字节原样保留。
+    /// 旧实现按整段重发（一次中断重传几十上百 MB，体感「从头开始」）。
+    #[tokio::test]
+    async fn resume_sends_only_remaining_bytes_of_partial_stream() {
+        let recv_dir = tmp_dir("resume-byte");
+        let src_dir = tmp_dir("resume-byte-src");
+        let port = free_port();
+
+        let recv = Arc::new(TransferEngine::new(port, 4, recv_dir.clone()));
+        recv.clone().spawn_receiver().await.unwrap();
+
+        // 源文件：10 字节 = 2 段（5+5），内容 AAAAA|BBBBB
+        let src = src_dir.join("out.bin");
+        std::fs::write(&src, b"AAAAABBBBB").unwrap();
+        let file_id = "resume-byte-fid";
+
+        // 接收槽：段 0 完成（哨兵 ZZZZZ）；段 1 部分收到 2 字节 "XX"
+        recv.storage
+            .create_slot(file_id.into(), "out.bin".into(), 10, 2, None, false)
+            .await
+            .unwrap();
+        recv.storage.write_at(file_id, 0, b"ZZZZZ").await.unwrap();
+        recv.storage.write_at(file_id, 5, b"XX").await.unwrap();
+        recv.storage.finish_stream(file_id, 0).await.unwrap();
+        recv.storage.set_stream_bytes(file_id, 0, 5).await;
+        recv.storage.set_stream_bytes(file_id, 1, 2).await;
+        assert_eq!(
+            recv.storage.get_slot(file_id).await.unwrap().bytes_received,
+            7,
+            "已确认送达 = 段0 整段 5 + 段1 已收 2"
+        );
+        recv.prefix_to_file_id
+            .lock()
+            .await
+            .insert(file_id_prefix_u64(file_id), file_id.to_string());
+
+        // 发送会话：位图 [true, false]；脚本化响应依次应答
+        // ① /api/peer-resumed（报 stream_bytes=[5,2]）② /api/verify（finalized）
+        let sender = Arc::new(TransferEngine::new(0, 4, src_dir.clone()));
+        let (gw_port, _hits) = spawn_scripted_http(vec![
+            ("200 OK", r#"{"slot":true,"stream_bytes":[5,2]}"#),
+            ("200 OK", r#"{"result":"finalized","chunks_done":null}"#),
+        ])
+        .await;
+        let (mut rx, _cancel) = insert_session(
+            &sender,
+            file_id,
+            "out.bin",
+            src,
+            10,
+            2,
+            "127.0.0.1",
+            port,
+            gw_port,
+            vec![true, false],
+        )
+        .await;
+
+        sender
+            .clone()
+            .run_transfer(file_id.to_string(), true)
+            .await;
+
+        // 续传基线帧：7 字节（5+2），不从 0 起跳
+        let mut frames = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            frames.push(p);
+        }
+        assert_eq!(
+            frames.first().map(|p| p.bytes_transferred),
+            Some(7),
+            "续传基线应含已确认的 7 字节"
+        );
+        assert_eq!(frames.last().map(|p| p.status), Some(TransferStatus::Completed));
+
+        // 最终文件：段 0 哨兵 + 段 1 已收 2 字节 + 补发 3 字节
+        let final_path = recv_dir.join("out.bin");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !final_path.exists() {
+            assert!(Instant::now() < deadline, "接收方未 finalize");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let got = std::fs::read(&final_path).unwrap();
+        assert_eq!(
+            got,
+            b"ZZZZZXXBBB",
+            "只允许补发段 1 未收到的 3 字节（偏移 7 起），前 2 字节原样保留"
+        );
+
+        let _ = std::fs::remove_dir_all(&recv_dir);
+        let _ = std::fs::remove_dir_all(&src_dir);
+    }
+
     /// A3.3：瞬时故障（首次连不上）→ 自动重试第 2 次成功 → Completed，
     /// 期间出现「第 2/3 次重试」提示帧。
     #[tokio::test]
@@ -3605,8 +3789,8 @@ mod tests {
 
         // 续传信号 → 回「传输中」
         assert!(
-            recv.on_peer_resumed(file_id).await,
-            "本机持有槽位应上报 true"
+            recv.on_peer_resumed(file_id).await.is_some(),
+            "本机持有槽位应上报 Some（槽位存在）"
         );
         let frame = recv
             .list_transfers()
@@ -3685,19 +3869,35 @@ mod tests {
         let dir = tmp_dir("resume-slot");
         let engine = TransferEngine::new(0, 2, dir.clone());
         assert!(
-            !engine.on_peer_resumed("nope").await,
-            "无槽位应返回 false"
+            engine.on_peer_resumed("nope").await.is_none(),
+            "无槽位应返回 None"
         );
         engine
             .storage
             .create_slot("fid-rs".into(), "f.bin".into(), 4, 1, None, false)
             .await
             .unwrap();
+        let stream_bytes = engine.on_peer_resumed("fid-rs").await;
         assert!(
-            engine.on_peer_resumed("fid-rs").await,
-            "有槽位应返回 true"
+            stream_bytes.is_some(),
+            "有槽位应返回 Some（携带各段已收字节数）"
         );
+        assert_eq!(stream_bytes.unwrap(), vec![0], "新槽位各段已收 0 字节");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// parse_stream_bytes：兼容旧对端（无字段）/ 坏值。
+    #[test]
+    fn parse_stream_bytes_variants() {
+        assert_eq!(
+            parse_stream_bytes(r#"{"slot":true,"stream_bytes":[5,2]}"#),
+            vec![5, 2]
+        );
+        assert_eq!(parse_stream_bytes(r#"{"slot":true}"#), Vec::<u64>::new());
+        assert_eq!(parse_stream_bytes(r#"{"slot":false}"#), Vec::<u64>::new());
+        assert_eq!(parse_stream_bytes("not json"), Vec::<u64>::new());
+        // 元素坏值降级 0，不 panic
+        assert_eq!(parse_stream_bytes(r#"{"stream_bytes":["x",3]}"#), vec![0, 3]);
     }
 
     /// 测试用服务端 TLS 配置（接受任意客户端证书；进程内每个测试目录

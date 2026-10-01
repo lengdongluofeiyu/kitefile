@@ -1390,14 +1390,19 @@ async fn peer_resume(
 
 /// POST /api/peer-resumed/:file_id —— 发送方已续传，接收方清中断态回「传输中」（Remote）。
 ///
-/// 响应体 `{"slot": bool}`：本机是否还持有接收槽位。发送方据此在续传前
-/// 探测（slot=false → 对端已无此任务 → 直接 Failed，防空烧，A3.2）。
+/// 响应体 `{"slot": bool, "stream_bytes": [u64…]|null}`：本机是否还持有接收
+/// 槽位；持有时报每条流已确认落盘的字节数（相对段起点），发送方据此做
+/// **字节级续传**——只发每段未收到的尾部字节，不重发整段（2026-10-02）。
 async fn peer_resumed(
     State(state): State<AppState>,
     Path(file_id): Path<String>,
 ) -> Json<serde_json::Value> {
-    let slot = state.transfer.on_peer_resumed(&file_id).await;
-    Json(serde_json::json!({ "slot": slot }))
+    match state.transfer.on_peer_resumed(&file_id).await {
+        Some(stream_bytes) => Json(
+            serde_json::json!({ "slot": true, "stream_bytes": stream_bytes }),
+        ),
+        None => Json(serde_json::json!({ "slot": false })),
+    }
 }
 
 /// POST /api/verify/:file_id —— 发送方在**全部数据流发送完成后**补发整文件 sha256。
