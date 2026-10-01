@@ -971,6 +971,9 @@ fn build_app(state: AppState, advertised_gateway_port: u16) -> Router {
         .route("/api/config", get(get_config))
         .route("/api/config/receive-dir", post(set_receive_dir))
         .route("/api/config/device-name", post(set_device_name))
+        // 优雅退出：本机 UI「完全退出」先打这个接口，daemon 广播 mDNS
+        // goodbye 后进程退出（见 shutdown_daemon）
+        .route("/api/shutdown", post(shutdown_daemon))
         .route("/ws/progress", get(ws_progress))
         .route("/", get(root_handler))
         .route_layer(middleware::from_fn_with_state(
@@ -1130,6 +1133,8 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
         (Method::GET, "/api/config", LocalOnly),
         (Method::POST, "/api/config/receive-dir", LocalOnly),
         (Method::POST, "/api/config/device-name", LocalOnly),
+        // 关掉本机 daemon 属于本机操作；远程触发一律 403（fail-closed）
+        (Method::POST, "/api/shutdown", LocalOnly),
         // 没有远程调用方，收归本机（N4）；遥控场景由 --remote-admin 整体放开
         (Method::GET, "/api/devices", LocalOnly),
         (Method::GET, "/ws/progress", LocalOnly),
@@ -1232,6 +1237,23 @@ async fn access_guard(req: Request, next: Next, allow_remote_admin: bool) -> Res
 
 async fn root_handler() -> impl IntoResponse {
     "kitefile gateway is running. See /api/* for endpoints."
+}
+
+/// POST /api/shutdown —— 优雅退出：先广播 mDNS 下线（goodbye），再进程退出。
+///
+/// 桌面 UI「完全退出」先打这个接口再 kill 兜底。为什么必须有这一步：
+/// Windows 上 `Process.kill` 是 TerminateProcess，进程没有机会发任何
+/// 下线通告——旧路径下对端只能靠 60s×3 探测把本机摘掉（约 3 分钟）。
+async fn shutdown_daemon(State(state): State<AppState>) -> &'static str {
+    state.discovery.shutdown();
+    info!("shutdown requested via /api/shutdown; exiting after response");
+    // 让响应先冲出去，再给 goodbye 留一点缓冲，然后硬退。
+    // 「完全退出」是用户显式动作，不做传输等待——语义就是立刻下线。
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        std::process::exit(0);
+    });
+    "ok"
 }
 
 /// 广告端口来自 Extension（回环口报 7878、TLS 口报 7880，见 [`build_app`]）

@@ -239,8 +239,27 @@ class DaemonManager {
     debugPrint('[DaemonManager] daemon failed to become ready within 8s');
   }
 
-  /// 关闭 daemon（应用退出时调用）
+  /// 关闭 daemon（应用退出时调用）。
+  ///
+  /// 优先**优雅关闭**：POST /api/shutdown 让 daemon 自己广播 mDNS 下线
+  /// （goodbye）后退出——对端设备列表立刻摘掉本机；否则 Windows 的
+  /// Process.kill 是 TerminateProcess，什么通告都发不出去，对端只能等
+  /// 60s×3 探测超时（约 3 分钟）才显示离线。接口失败时再 kill 兜底。
   Future<void> stop() async {
+    if (_isReady || _process != null) {
+      try {
+        await httpPost('$kDaemonHttp/api/shutdown')
+            .timeout(const Duration(milliseconds: 800));
+        debugPrint('[DaemonManager] graceful shutdown requested');
+        // 轮询等 daemon 真正退出（最多 2s），避免 kill 抢在 goodbye 之前
+        for (var i = 0; i < 10; i++) {
+          await Future.delayed(const Duration(milliseconds: 200));
+          if (!await _isAlive()) break;
+        }
+      } catch (e) {
+        debugPrint('[DaemonManager] graceful shutdown failed: $e');
+      }
+    }
     if (_process != null && _spawned) {
       try {
         _process!.kill(ProcessSignal.sigterm);

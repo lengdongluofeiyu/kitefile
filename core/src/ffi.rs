@@ -428,6 +428,10 @@ pub unsafe extern "C" fn kitefile_send_file(
 pub unsafe extern "C" fn kitefile_shutdown() {
     let ctx = lock(&CONTEXT).take();
     if let Some(ctx) = ctx {
+        // 退出前广播 mDNS 下线（goodbye）：让对端设备表**立即**摘掉本机，
+        // 不必等对端 60s×3 探测超时。必须在 runtime 停止之前做——
+        // ServiceDaemon 线程独立于 tokio runtime，此刻还能发包。
+        ctx.discovery.shutdown();
         // 尽量走 shutdown_background：不等待 spawn_blocking（如哈希计算）
         // 收尾，立即释放端口。失败（仍有并发 FFI 调用持有引用）时
         // 随最后一个 Arc 丢弃触发 Runtime::drop，语义一致只是可能多等一会儿。

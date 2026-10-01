@@ -1322,6 +1322,12 @@ fn test_classify_covers_all_routes() {
             "/api/config/device-name",
             AccessPolicy::LocalOnly,
         ),
+        // 优雅退出（桌面 UI「完全退出」入口）：关停本机 daemon 属本机操作
+        (
+            axum::http::Method::POST,
+            "/api/shutdown",
+            AccessPolicy::LocalOnly,
+        ),
         (
             axum::http::Method::GET,
             "/api/devices",
@@ -1359,8 +1365,19 @@ fn test_classify_distinguishes_method_on_same_path() {
 #[test]
 fn test_classify_unknown_is_none() {
     assert_eq!(classify(&axum::http::Method::PUT, "/api/send"), None);
-    assert_eq!(classify(&axum::http::Method::DELETE, "/api/files/x"), None);
+    // DELETE /api/transfers/:file_id 未登记（历史删除是
+    // /api/transfers/:file_id/history）；:name 匹配只按段数逐段比对
+    assert_eq!(
+        classify(&axum::http::Method::DELETE, "/api/transfers/x"),
+        None
+    );
     assert_eq!(classify(&axum::http::Method::GET, "/api/not-exist"), None);
+    // 回归（曾经误判为「未登记」）：DELETE /api/files/:name 已登记 LocalOnly，
+    // 不能因为新加了登记就把这条语义又弄丢
+    assert_eq!(
+        classify(&axum::http::Method::DELETE, "/api/files/x"),
+        Some(AccessPolicy::LocalOnly)
+    );
 }
 
 #[test]

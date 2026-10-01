@@ -206,6 +206,33 @@ impl DiscoveryService {
         Ok(())
     }
 
+    /// 退出前广播下线（mDNS goodbye）：unregister 服务实例。
+    ///
+    /// mdns-sd 的 unregister 会向所有接口发 TTL=0 的 goodbye 包，
+    /// 对端事件循环收到 `ServiceRemoved` 后**立即**从设备表移除本机
+    /// （见 spawn_event_loop 的 ServiceRemoved 分支），不用再等对端
+    /// 60s×3 探测超时（旧路径：桌面端完全退出后手机端仍显示在线 ~3 分钟）。
+    ///
+    /// 等 unregister 回执最多 1s：回执送达即 goodbye 包已出网卡
+    /// （mdns-sd service_daemon.rs:2152 先发包再回 OK）。
+    /// 超时（组播栈异常）不阻塞退出流程；离线模式（无 daemon）为 no-op。
+    pub fn shutdown(&self) {
+        let Some(daemon) = &self.daemon else {
+            return;
+        };
+        // fullname = instance + '.' + service type，与 register 时一致
+        let fullname = format!("{}.{}", self.self_id, SERVICE_TYPE);
+        match daemon.unregister(&fullname) {
+            Ok(rx) => {
+                match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(_) => info!(%fullname, "mDNS goodbye sent (service unregistered)"),
+                    Err(e) => warn!(%fullname, error = %e, "mDNS unregister ack timeout"),
+                }
+            }
+            Err(e) => warn!(%fullname, error = %e, "mDNS unregister failed on shutdown"),
+        }
+    }
+
     /// identity 标记路径 → receive_dir（TLS 身份与标记同目录）
     fn receive_dir_from(identity_path: Option<&Path>) -> Option<PathBuf> {
         identity_path.and_then(|p| p.parent()).map(|p| p.to_path_buf())
