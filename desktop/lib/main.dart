@@ -248,7 +248,7 @@ class DaemonManager {
   Future<void> stop() async {
     if (_isReady || _process != null) {
       try {
-        await httpPost('$kDaemonHttp/api/shutdown')
+        await httpPost('$kDaemonHttp/api/shutdown', body: '{}')
             .timeout(const Duration(milliseconds: 800));
         debugPrint('[DaemonManager] graceful shutdown requested');
         // 轮询等 daemon 真正退出（最多 2s），避免 kill 抢在 goodbye 之前

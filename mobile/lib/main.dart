@@ -1551,48 +1551,83 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('KiteFile'),
-        actions: [
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: Center(
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                decoration: BoxDecoration(
-                  color: _daemonOnline
-                      ? Colors.green.withValues(alpha: 0.2)
-                      : Colors.orange.withValues(alpha: 0.2),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  _daemonOnline ? '已连接' : '未连接',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: _daemonOnline ? Colors.green : Colors.orange,
+    // 返回键在首页 = 退出应用：必须二次确认，防止误触直接下线。
+    // 确认退出时先 shutdown 内嵌 daemon——广播 mDNS goodbye，电脑端
+    // 立刻看到本机离线——再退出 Flutter Activity。
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) async {
+        if (didPop) return;
+        final ok = await _confirmExit();
+        if (!ok || !mounted) return;
+        await shutdownFtcoreDaemon();
+        await SystemNavigator.pop();
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('KiteFile'),
+          actions: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: _daemonOnline
+                        ? Colors.green.withValues(alpha: 0.2)
+                        : Colors.orange.withValues(alpha: 0.2),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    _daemonOnline ? '已连接' : '未连接',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: _daemonOnline ? Colors.green : Colors.orange,
+                    ),
                   ),
                 ),
               ),
             ),
-          ),
-          IconButton(
-            icon: const Icon(Icons.settings),
-            onPressed: () => _showSettingsDialog(),
-          ),
-        ],
+            IconButton(
+              icon: const Icon(Icons.settings),
+              onPressed: () => _showSettingsDialog(),
+            ),
+          ],
+        ),
+        body: ListView(
+          padding: const EdgeInsets.all(12),
+          children: [
+            _meSection(),
+            const SizedBox(height: 12),
+            _devicesSection(),
+            const SizedBox(height: 12),
+            _transfersSection(),
+          ],
+        ),
       ),
-      body: ListView(
-        padding: const EdgeInsets.all(12),
-        children: [
-          _meSection(),
-          const SizedBox(height: 12),
-          _devicesSection(),
-          const SizedBox(height: 12),
-          _transfersSection(),
+    );
+  }
+
+  /// 退出二次确认弹窗。返回 true = 用户确认退出。
+  Future<bool> _confirmExit() async {
+    final r = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('退出 KiteFile'),
+        content: const Text('退出后将无法接收其他设备发来的文件，确定退出吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('退出'),
+          ),
         ],
       ),
     );
+    return r == true;
   }
 
   Widget _meSection() {
