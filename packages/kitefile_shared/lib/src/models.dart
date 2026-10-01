@@ -133,6 +133,8 @@ class TransferProgress {
   final bool incoming;
   final String? filePath;
   final String? retryNote;
+  /// 传输时间（unix 秒）：终态记录由 Rust 侧盖章；旧记录/进行中为 null。
+  final int? time;
   const TransferProgress({
     required this.fileId,
     required this.fileName,
@@ -146,6 +148,7 @@ class TransferProgress {
     this.incoming = false,
     this.filePath,
     this.retryNote,
+    this.time,
   });
 
   /// 安全解析（工作流 B）：缺字段/错类型一律降级为安全默认。
@@ -162,6 +165,7 @@ class TransferProgress {
         incoming: j['incoming'] == true,
         filePath: jsonStrOrNull(j['file_path']),
         retryNote: jsonStrOrNull(j['retry_note']),
+        time: jsonIntOrNull(j['time']),
       );
 }
 

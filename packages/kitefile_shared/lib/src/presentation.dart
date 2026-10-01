@@ -19,6 +19,14 @@ String formatBytes(int bytes) {
 /// 速率格式化
 String formatSpeed(int bps) => '${formatBytes(bps)}/s';
 
+/// 传输记录时间格式化（unix 秒 → 「MM-dd HH:mm」；无时间戳返回空串）
+String formatRecordTime(int? time) {
+  if (time == null || time <= 0) return '';
+  final dt = DateTime.fromMillisecondsSinceEpoch(time * 1000);
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${two(dt.month)}-${two(dt.day)} ${two(dt.hour)}:${two(dt.minute)}';
+}
+
 /// 是否处于自动重试中（角标显示「重试中」的条件）
 bool isRetrying(TransferProgress p) =>
     p.status == TransferStatus.inProgress && p.retryNote != null;
@@ -71,13 +79,16 @@ Color statusBadgeColor(TransferProgress p) {
 String transferSubtitle(TransferProgress p, {bool showDirection = false}) {
   final dir = showDirection ? '${p.incoming ? '接收' : '发送'} · ' : '';
   final pct = p.fileSize > 0 ? (p.bytesTransferred / p.fileSize * 100).round() : 0;
+  // 终态记录带「传输时间」（进行中/已中断无时间戳 → 空串不显示）
+  final when = formatRecordTime(p.time);
+  final timeSuffix = when.isNotEmpty ? ' · $when' : '';
   switch (p.status) {
     case TransferStatus.interrupted:
       return '$dir${p.error ?? '传输中断'} · 已完成 $pct% · 未完成部分将重新发送';
     case TransferStatus.canceled:
-      return '$dir${p.error ?? '已放弃本次传输'}';
+      return '$dir${p.error ?? '已放弃本次传输'}$timeSuffix';
     case TransferStatus.failed:
-      return '$dir${p.error ?? '传输失败'}';
+      return '$dir${p.error ?? '传输失败'}$timeSuffix';
     case TransferStatus.inProgress:
       // 接收方字节已收满但仍在等发送方 verify 回执/保险丝窗口（A3.8）：
       // 这期间状态确为 InProgress，但显示「传输中 · 0 B/s」会让人以为卡死，
@@ -91,6 +102,6 @@ String transferSubtitle(TransferProgress p, {bool showDirection = false}) {
           '${p.retryNote != null ? ' · ${p.retryNote}' : ''}';
     default:
       return '$dir${formatBytes(p.bytesTransferred)} / ${formatBytes(p.fileSize)}'
-          '${p.error != null ? ' · ${p.error}' : ''}';
+          '${p.error != null ? ' · ${p.error}' : ''}$timeSuffix';
   }
 }

@@ -33,7 +33,7 @@ fn test_stream_header_too_short() {
 
 #[test]
 fn test_ws_event_progress_flatten() {
-    let p = kitefile::transfer::TransferProgress {
+    let p = kitefile::transfer::TransferProgress { time: None,
         file_id: "fid".into(),
         file_name: "a.bin".into(),
         file_size: 10,
@@ -123,7 +123,7 @@ fn status_wire_strings_match_dart_contract() {
 /// 新增进度字段 → 这里补一行 + 双端模型各加一个可选字段（可选即不破坏旧端）。
 #[test]
 fn progress_json_keys_match_dart_contract() {
-    let p = TransferProgress {
+    let p = TransferProgress { time: None,
         file_id: "fid".into(),
         file_name: "a.bin".into(),
         file_size: 10,

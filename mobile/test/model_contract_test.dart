@@ -24,6 +24,7 @@ void main() {
         'incoming': true,
         'file_path': null,
         'retry_note': '第 2/3 次重试流 2…',
+        'time': 1727788800,
       });
       expect(p.fileId, 'fid');
       expect(p.fileSize, 10);
@@ -31,6 +32,7 @@ void main() {
       expect(p.error, '流 2/2 失败（连接超时）');
       expect(p.incoming, isTrue);
       expect(p.retryNote, '第 2/3 次重试流 2…');
+      expect(p.time, 1727788800);
     });
 
     test('缺全部字段：降级默认值，不抛异常', () {
@@ -42,6 +44,7 @@ void main() {
       expect(p.incoming, isFalse);
       expect(p.error, isNull);
       expect(p.retryNote, isNull);
+      expect(p.time, isNull);
     });
 
     test('错类型：数字冒充字符串 / 字符串冒充数字 / 非法状态', () {

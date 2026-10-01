@@ -86,6 +86,10 @@ pub struct TransferProgress {
     /// 非空时 UI 显示「重试中」角标；正常帧为 None。
     #[serde(default)]
     pub retry_note: Option<String>,
+    /// 传输时间（unix 秒）：终态（Completed/Failed/Canceled）落库时盖章，
+    /// UI 在传输记录里展示。旧历史无该字段 → None（serde default，兼容）。
+    #[serde(default)]
+    pub time: Option<u64>,
 }
 
 /// 单个传输的进度通道容量。
@@ -179,6 +183,14 @@ fn is_terminal(s: &TransferStatus) -> bool {
         s,
         TransferStatus::Completed | TransferStatus::Failed | TransferStatus::Canceled
     )
+}
+
+/// 当前 unix 时间戳（秒）。时钟倒挂（系统时间早于 1970）返回 None，保持无时间戳。
+fn now_unix_secs() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 /// 历史文件最多保留条数（防无限膨胀）
@@ -641,9 +653,13 @@ impl TransferEngine {
     }
 
     /// 发布一条进度：写入全量快照 + 广播给订阅方；终态同步写入持久化历史
-    pub async fn publish_progress(&self, p: TransferProgress) {
-        self.progress_cache.lock().insert(p.clone());
+    pub async fn publish_progress(&self, mut p: TransferProgress) {
+        // 终态盖章「传输时间」（unix 秒）：传输记录展示用。
+        // 唯一入口在这里——发送/接收/取消各路径落终态都经过 publish_progress。
         if is_terminal(&p.status) {
+            if p.time.is_none() {
+                p.time = now_unix_secs();
+            }
             let path = history_file_path(&self.receive_dir);
             let mut hist = self.history.lock();
             if let Some(slot) = hist.iter_mut().find(|x| x.file_id == p.file_id) {
@@ -657,6 +673,7 @@ impl TransferEngine {
             }
             save_transfer_history(&path, &hist);
         }
+        self.progress_cache.lock().insert(p.clone());
         self.broadcast_progress(p).await;
     }
 
@@ -748,7 +765,7 @@ impl TransferEngine {
             };
             push_progress(
                 &session.progress_tx,
-                TransferProgress {
+                TransferProgress { time: None,
                     file_id: file_id.to_string(),
                     file_name: session.file_name.clone(),
                     file_size: session.file_size,
@@ -805,7 +822,7 @@ impl TransferEngine {
                     }
                 });
             }
-            self.publish_progress(TransferProgress {
+            self.publish_progress(TransferProgress { time: None,
                 file_id: file_id.to_string(),
                 file_name: slot.file_name.clone(),
                 file_size: slot.file_size,
@@ -1149,7 +1166,7 @@ impl TransferEngine {
         self.incoming_endpoints.lock().await.remove(file_id);
         self.recv_speed_state.lock().await.remove(file_id);
         if let Some(slot) = slot {
-            self.publish_progress(TransferProgress {
+            self.publish_progress(TransferProgress { time: None,
                 file_id: file_id.to_string(),
                 file_name: slot.file_name.clone(),
                 file_size: slot.file_size,
@@ -1233,7 +1250,7 @@ impl TransferEngine {
             Some(reason) => (TransferStatus::Interrupted, Some(reason.clone())),
             None => (TransferStatus::InProgress, None),
         };
-        self.publish_progress(TransferProgress {
+        self.publish_progress(TransferProgress { time: None,
             file_id: file_id.to_string(),
             file_name: slot.file_name.clone(),
             file_size: slot.file_size,
@@ -1273,7 +1290,7 @@ impl TransferEngine {
             Ok(_) => Some(slot.final_path.to_string_lossy().into_owned()),
             Err(_) => None,
         };
-        self.publish_progress(TransferProgress {
+        self.publish_progress(TransferProgress { time: None,
             file_id: file_id.to_string(),
             file_name: slot.file_name.clone(),
             file_size: slot.file_size,
@@ -1453,7 +1470,7 @@ impl TransferEngine {
             },
         );
 
-        let initial = TransferProgress {
+        let initial = TransferProgress { time: None,
             file_id: file_id.clone(),
             file_name: file_name.clone(),
             file_size,
@@ -1498,7 +1515,7 @@ impl TransferEngine {
             let offer_json = match serde_json::to_string(&offer) {
                 Ok(s) => s,
                 Err(e) => {
-                    push_progress(&progress_for_task, TransferProgress {
+                    push_progress(&progress_for_task, TransferProgress { time: None,
                         file_id: file_id_for_spawn.clone(),
                         file_name: file_name_for_err.clone(),
                         file_size,
@@ -1535,7 +1552,7 @@ impl TransferEngine {
             };
 
             if let Err(e) = post_result {
-                push_progress(&progress_for_task, TransferProgress {
+                push_progress(&progress_for_task, TransferProgress { time: None,
                     file_id: file_id_for_spawn.clone(),
                     file_name: file_name_for_err.clone(),
                     file_size,
@@ -1564,7 +1581,7 @@ impl TransferEngine {
             };
 
             if !resp.accepted {
-                push_progress(&progress_for_task, TransferProgress {
+                push_progress(&progress_for_task, TransferProgress { time: None,
                     file_id: file_id_for_spawn.clone(),
                     file_name: file_name_for_err.clone(),
                     file_size,
@@ -1617,7 +1634,7 @@ impl TransferEngine {
         let (chunks, bytes) = done_stats(&snap.streams_done, snap.file_size, snap.stream_count);
         push_progress(
             &snap.progress_tx,
-            TransferProgress {
+            TransferProgress { time: None,
                 file_id: file_id.to_string(),
                 file_name: snap.file_name.clone(),
                 file_size: snap.file_size,
@@ -1641,7 +1658,7 @@ impl TransferEngine {
         let (chunks, bytes) = done_stats(&snap.streams_done, snap.file_size, snap.stream_count);
         push_progress(
             &snap.progress_tx,
-            TransferProgress {
+            TransferProgress { time: None,
                 file_id: file_id.to_string(),
                 file_name: snap.file_name.clone(),
                 file_size: snap.file_size,
@@ -1717,7 +1734,7 @@ impl TransferEngine {
                         self.cleanup_send_final(&file_id).await;
                         push_progress(
                             &snap.progress_tx,
-                            TransferProgress {
+                            TransferProgress { time: None,
                                 file_id: file_id.clone(),
                                 file_name: snap.file_name.clone(),
                                 file_size: snap.file_size,
@@ -1745,7 +1762,7 @@ impl TransferEngine {
                 done_stats(&snap.streams_done, snap.file_size, snap.stream_count);
             push_progress(
                 &snap.progress_tx,
-                TransferProgress {
+                TransferProgress { time: None,
                     file_id: file_id.clone(),
                     file_name: snap.file_name.clone(),
                     file_size: snap.file_size,
@@ -1889,7 +1906,7 @@ impl TransferEngine {
                 self.cleanup_send_final(&file_id).await;
                 push_progress(
                     &snap.progress_tx,
-                    TransferProgress {
+                    TransferProgress { time: None,
                         file_id: file_id.clone(),
                         file_name: snap.file_name.clone(),
                         file_size: snap.file_size,
@@ -1912,7 +1929,7 @@ impl TransferEngine {
                 self.cleanup_send_final(&file_id).await;
                 push_progress(
                     &snap.progress_tx,
-                    TransferProgress {
+                    TransferProgress { time: None,
                         file_id: file_id.clone(),
                         file_name: snap.file_name.clone(),
                         file_size: snap.file_size,
@@ -2008,7 +2025,7 @@ impl TransferEngine {
             self.incoming_endpoints.lock().await.remove(file_id);
             self.recv_speed_state.lock().await.remove(file_id);
             if let Some(slot) = slot {
-                self.publish_progress(TransferProgress {
+                self.publish_progress(TransferProgress { time: None,
                     file_id: file_id.to_string(),
                     file_name: slot.file_name.clone(),
                     file_size: slot.file_size,
@@ -2388,7 +2405,7 @@ impl SendProgress {
         );
         push_progress(
             &self.progress_tx,
-            TransferProgress {
+            TransferProgress { time: None,
                 file_id: self.file_id.clone(),
                 file_name: self.file_name.clone(),
                 file_size: self.file_size,
@@ -2428,7 +2445,7 @@ impl SendProgress {
                 s.2
             }
         };
-        push_progress(&self.progress_tx, TransferProgress {
+        push_progress(&self.progress_tx, TransferProgress { time: None,
             file_id: self.file_id.clone(),
             file_name: self.file_name.clone(),
             file_size: self.file_size,
@@ -2913,7 +2930,7 @@ mod tests {
     fn cache_keeps_everything_below_cap() {
         let mut c = ProgressCache::new(3);
         for i in 0..3 {
-            c.insert(TransferProgress {
+            c.insert(TransferProgress { time: None,
                 file_id: format!("f{i}"),
                 file_name: String::new(),
                 file_size: 0,
@@ -2935,7 +2952,7 @@ mod tests {
     fn cache_trims_to_cap_and_keeps_newest() {
         let mut c = ProgressCache::new(2);
         for i in 0..4 {
-            c.insert(TransferProgress {
+            c.insert(TransferProgress { time: None,
                 file_id: format!("f{i}"),
                 file_name: String::new(),
                 file_size: 0,
@@ -2958,7 +2975,7 @@ mod tests {
     #[test]
     fn cache_prefers_evicting_terminal_entries() {
         let mut c = ProgressCache::new(2);
-        c.insert(TransferProgress {
+        c.insert(TransferProgress { time: None,
             file_id: "old-done".into(),
             file_name: String::new(),
             file_size: 0,
@@ -2972,7 +2989,7 @@ mod tests {
             file_path: None,
             retry_note: None,
         });
-        c.insert(TransferProgress {
+        c.insert(TransferProgress { time: None,
             file_id: "live".into(),
             file_name: String::new(),
             file_size: 0,
@@ -2986,7 +3003,7 @@ mod tests {
             file_path: None,
             retry_note: None,
         });
-        c.insert(TransferProgress {
+        c.insert(TransferProgress { time: None,
             file_id: "newer".into(),
             file_name: String::new(),
             file_size: 0,
@@ -3010,7 +3027,7 @@ mod tests {
     fn cache_falls_back_to_oldest_when_nothing_is_terminal() {
         let mut c = ProgressCache::new(2);
         for name in ["a", "b", "c"] {
-            c.insert(TransferProgress {
+            c.insert(TransferProgress { time: None,
                 file_id: name.into(),
                 file_name: String::new(),
                 file_size: 0,
@@ -3034,7 +3051,7 @@ mod tests {
     fn cache_repeated_file_id_is_not_requeued() {
         let mut c = ProgressCache::new(2);
         for _ in 0..3 {
-            c.insert(TransferProgress {
+            c.insert(TransferProgress { time: None,
                 file_id: "same".into(),
                 file_name: String::new(),
                 file_size: 0,
@@ -3049,7 +3066,7 @@ mod tests {
                 retry_note: None,
             });
         }
-        c.insert(TransferProgress {
+        c.insert(TransferProgress { time: None,
             file_id: "other".into(),
             file_name: String::new(),
             file_size: 0,
