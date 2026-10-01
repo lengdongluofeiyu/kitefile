@@ -175,6 +175,15 @@ impl ProgressCache {
     fn snapshot(&self) -> Vec<TransferProgress> {
         self.map.values().cloned().collect()
     }
+
+    /// 删除一条快照（2026-10-02 修复「删除记录后复现」）：
+    /// 终态记录同时存在于内存快照与持久化历史，删除只清历史的话，
+    /// 下次 GET /api/transfers 会把内存快照里的旧记录再吐给 UI，
+    /// 表现为「删除成功几秒后记录自己回来了」。
+    fn remove(&mut self, file_id: &str) -> bool {
+        self.order.retain(|id| id != file_id);
+        self.map.remove(file_id).is_some()
+    }
 }
 
 /// 终态：不会再发生变化的进度
@@ -692,13 +701,19 @@ impl TransferEngine {
         all
     }
 
-    /// 从持久化历史删除一条记录（UI「删除记录」）
+    /// 从持久化历史删除一条记录（UI「删除记录」）。
+    ///
+    /// 必须同时清内存进度快照：终态记录在快照与历史里各有一份，
+    /// 只删历史的话 GET /api/transfers 会把快照里那份再吐回来，
+    /// UI 上表现为「删除不成功、几秒后记录自己回来」（2026-10-02 实测）。
     pub fn remove_history(&self, file_id: &str) -> bool {
         let path = history_file_path(&self.receive_dir);
         let mut hist = self.history.lock();
         let before = hist.len();
         hist.retain(|p| p.file_id != file_id);
         let removed = hist.len() != before;
+        // 内存快照同删（幂等：不在快照里也无妨）
+        self.progress_cache.lock().remove(file_id);
         if removed {
             save_transfer_history(&path, &hist);
         }
@@ -3367,6 +3382,38 @@ mod tests {
             },
         );
         (progress_rx, cancel_tx)
+    }
+
+    /// 删除历史必须同时清内存快照（2026-10-02 回归）：
+    /// 终态记录在快照与历史各一份，只删历史的话 list_transfers
+    /// 仍会返回另一份，UI 上表现为「删除不成功、记录自己回来」。
+    #[tokio::test]
+    async fn remove_history_also_clears_progress_cache() {
+        let dir = tmp_dir("rm-history");
+        let engine = TransferEngine::new(0, 2, dir.clone());
+        engine
+            .publish_progress(TransferProgress { time: None,
+                file_id: "rm-fid".into(),
+                file_name: "a.bin".into(),
+                file_size: 10,
+                bytes_transferred: 10,
+                chunks_done: 1,
+                chunks_total: 1,
+                speed_bps: 0,
+                status: TransferStatus::Completed,
+                error: None,
+                incoming: false,
+                file_path: None,
+                retry_note: None,
+            })
+            .await;
+        assert!(engine.list_transfers().iter().any(|p| p.file_id == "rm-fid"));
+        assert!(engine.remove_history("rm-fid"));
+        assert!(
+            !engine.list_transfers().iter().any(|p| p.file_id == "rm-fid"),
+            "删除后 list_transfers 不得再返回该记录（快照必须同清）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A验收 2：连不上对端 → 自动重试耗尽 → Interrupted；
