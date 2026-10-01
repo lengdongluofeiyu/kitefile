@@ -25,6 +25,7 @@ use crate::protocol::{
 use crate::storage::StorageManager;
 use crate::timeouts::with_idle_timeout;
 use crate::Result;
+use std::collections::HashSet;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -547,6 +548,10 @@ pub struct TransferEngine {
     /// 用户暂停标志（2026-10-02）：file_id → 标志。置位后各发送流在
     /// 下一个检查点（分块写 / 退避 / 重试前）优雅停止，会话保留可续。
     pause_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// 接收方视角的「对方已暂停」（2026-10-02）：发送方暂停会断开连接，
+    /// 接收端本只能看到 EOF 按网络故障报「已中断」；发送方在暂停时
+    /// 广播 /api/peer-pause，本机据此显示「对方已暂停」而非误报中断。
+    recv_peer_paused: Arc<Mutex<HashSet<String>>>,
     /// 进度广播 bus（gateway 注入；None 时 send_file 仍能用，只是不广播）
     progress_bus: TokioMutex<Option<Arc<broadcast::Sender<TransferProgress>>>>,
     /// 全量进度快照：file_id → 最近一条进度（GET /api/transfers 用）
@@ -605,6 +610,7 @@ impl TransferEngine {
             recv_active_conn: Arc::new(Mutex::new(HashMap::new())),
             recv_conn_seq: AtomicU64::new(1),
             pause_flags: Arc::new(Mutex::new(HashMap::new())),
+            recv_peer_paused: Arc::new(Mutex::new(HashSet::new())),
             progress_bus: TokioMutex::new(None),
             progress_cache: Arc::new(Mutex::new(ProgressCache::new(PROGRESS_CACHE_CAP))),
             history: Arc::new(Mutex::new(load_transfer_history(
@@ -1097,6 +1103,7 @@ impl TransferEngine {
                 //（真机踩过：发送方 17MB/s 重发中、接收方却显示已中断）。
                 if !resumed {
                     resumed = true;
+                    self.clear_peer_paused(file_id);
                     if self.recv_interrupted.lock().remove(file_id).is_some() {
                         self.publish_recv_progress(file_id).await;
                     }
@@ -1120,9 +1127,10 @@ impl TransferEngine {
             .await
             .ok_or_else(|| TransferFailure::protocol("slot vanished during stream"))?;
         // 任一段成功落盘 = 数据面已恢复（发送方段级重试成功后重发）：
-        // 立即清中断标记回「传输中」。只在整任务收齐才清的话，会出现
-        // 「字节一直在涨、状态却卡在已中断」的谎报（真机踩过）。
+        // 立即清中断标记与「对方已暂停」标记回「传输中」。只在整任务收齐
+        // 才清的话，会出现「字节一直在涨、状态却卡在已中断」的谎报（真机踩过）。
         self.recv_interrupted.lock().remove(file_id);
+        self.clear_peer_paused(file_id);
         self.publish_recv_progress(file_id).await;
 
         // 全部流收齐后的收尾
@@ -1237,6 +1245,7 @@ impl TransferEngine {
     /// 字节数（相对段起点），发送方据此从断点字节继续而非重发整段。
     pub async fn on_peer_resumed(&self, file_id: &str) -> Option<Vec<u64>> {
         self.recv_interrupted.lock().remove(file_id);
+        self.clear_peer_paused(file_id);
         match self.storage.get_slot(file_id).await {
             Some(slot) => {
                 self.publish_recv_progress(file_id).await;
@@ -1290,12 +1299,17 @@ impl TransferEngine {
                 ent.2
             }
         };
-        // 中断标记存在时状态保持「已中断」（其余段可能仍在收尾，
-        // 不能翻回「传输中」谎报；续传信号到达才清除）
+        // 状态优先级：本机中断 > 对方已暂停 > 传输中。
+        // 「对方已暂停」不是失败，也不该报成中断（2026-10-02 用户实测）。
         let interrupted = self.recv_interrupted.lock().get(file_id).cloned();
-        let (status, error) = match &interrupted {
-            Some(reason) => (TransferStatus::Interrupted, Some(reason.clone())),
-            None => (TransferStatus::InProgress, None),
+        let peer_paused = self.recv_peer_paused.lock().contains(file_id);
+        let (status, error) = match (&interrupted, peer_paused) {
+            (Some(reason), _) => (TransferStatus::Interrupted, Some(reason.clone())),
+            (None, true) => (
+                TransferStatus::Paused,
+                Some("对方已暂停".to_string()),
+            ),
+            (None, false) => (TransferStatus::InProgress, None),
         };
         self.publish_progress(TransferProgress { time: None,
             file_id: file_id.to_string(),
@@ -2063,6 +2077,28 @@ impl TransferEngine {
                     "已暂停，可继续传输",
                 )
                 .await;
+                // 通知接收方进入「对方已暂停」态（fire-and-forget）：不通知的话
+                // 接收端只能看到连接被断开，会把暂停误报成「已中断」
+                let engine = self.clone();
+                let fid = file_id.clone();
+                let ip = snap.target_ip.clone();
+                let gp = snap.target_gateway_port;
+                let rd = self.receive_dir.clone();
+                let pin = self.out_pin(&snap.target_ip);
+                tokio::spawn(async move {
+                    if let Err(e) = http_post_json_tls_pinned(
+                        &ip,
+                        gp,
+                        &format!("/api/peer-pause/{}", fid),
+                        "{}",
+                        &rd,
+                        pin.as_deref(),
+                    )
+                    .await
+                    {
+                        warn!(error = %e, "notify receiver pause failed");
+                    }
+                });
             }
             SendOutcome::Canceled => unreachable!("canceled handled above"),
         }
@@ -2175,6 +2211,36 @@ impl TransferEngine {
             return true;
         }
         false
+    }
+
+    /// 接收方视角的暂停通知（发送方暂停时广播 /api/peer-pause）。
+    ///
+    /// 双视角按 file_id 天然区分（一台机器可以同时是 A 传输的接收方和
+    /// B 传输的发送方）：
+    /// - 本机是发送方（有暂停标志）→ 接收方请求本机暂停，置标志；
+    /// - 本机是接收方（有槽位）→ 发送方广播了暂停：清除可能先到的
+    ///   EOF 误报（「已中断」），显示「对方已暂停」。
+    pub async fn on_peer_pause(&self, file_id: &str) -> bool {
+        if let Some(flag) = self.pause_flags.lock().get(file_id).cloned() {
+            flag.store(true, Ordering::SeqCst);
+            return true;
+        }
+        match self.storage.get_slot(file_id).await {
+            Some(_) => {
+                self.recv_interrupted.lock().remove(file_id);
+                self.recv_peer_paused
+                    .lock()
+                    .insert(file_id.to_string());
+                self.publish_recv_progress(file_id).await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 清除接收方的「对方已暂停」标记（数据恢复流动 / 对端继续时调用）。
+    fn clear_peer_paused(&self, file_id: &str) {
+        self.recv_peer_paused.lock().remove(file_id);
     }
 
     /// 启动 N 条流，每条顺序发送一个字节区间（A3.2 / A3.3）。

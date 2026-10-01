@@ -191,12 +191,60 @@ class MainActivity : FlutterActivity() {
                     "name" to name,
                     "size" to size,
                     "path" to "/proc/self/fd/${pfd.fd}",
+                    // 真实路径（尽力解析）：/proc/self/fd 是进程内临时句柄，
+                    // 传完即失效——传输历史里拿它打开文件/文件夹必然失败。
+                    // 能解析出真实路径时优先用真实路径读写（需已授所有文件访问）。
+                    "realPath" to resolveRealPath(uri),
                 ))
             }
             result.success(picks)
         } catch (e: Exception) {
             result.error("PICK_FAILED", e.message, null)
         }
+    }
+
+    /// 尽力从 SAF Uri 解析真实文件路径（2026-10-02）：
+    /// - externalstorage.documents（系统文件选择器最常见）：docId =
+    ///   "primary:DCIM/Camera/x.mp4" → /storage/emulated/0/DCIM/Camera/x.mp4
+    /// - media（MediaStore）：查 DATA 列（部分系统返回真实路径）
+    /// 解析不出返回 null（调用方退回 /proc/self/fd 直读）。
+    private fun resolveRealPath(uri: Uri): String? {
+        try {
+            if (uri.authority == "com.android.externalstorage.documents") {
+                val docId = uri.lastPathSegment ?: return null
+                val sep = docId.indexOf(':')
+                if (sep > 0) {
+                    val volume = docId.substring(0, sep)
+                    val rel = docId.substring(sep + 1)
+                    if (volume == "primary") {
+                        val abs = "/storage/emulated/0/$rel"
+                        // 必须可读才返回真实路径：否则引擎按真实路径读会失败，
+                        // 退回 /proc/self/fd 直读（fd 一定可读）
+                        if (File(abs).exists() && File(abs).canRead()) return abs
+                    }
+                }
+                return null
+            }
+            if (uri.authority?.startsWith("com.android.providers.media") == true ||
+                uri.authority?.startsWith("media") == true
+            ) {
+                contentResolver.query(
+                    uri, arrayOf(android.provider.MediaStore.MediaColumns.DATA),
+                    null, null, null,
+                )?.use { c ->
+                    if (c.moveToFirst()) {
+                        val idx = c.getColumnIndex(android.provider.MediaStore.MediaColumns.DATA)
+                        if (idx >= 0) {
+                        val p = c.getString(idx)
+                        if (!p.isNullOrEmpty() && File(p).canRead()) return p
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            // 尽力而为：解析失败不阻断选择流程
+        }
+        return null
     }
 
     /// 查询 SAF 文件的显示名（无法查询时返回 null）

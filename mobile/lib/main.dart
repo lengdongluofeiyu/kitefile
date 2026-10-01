@@ -2050,7 +2050,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               ],
             ),
           if (history && isTerminal) ...[
-            if (path != null && path.isNotEmpty) ...[
+            // /proc/self/fd/N 是选文件时的进程内临时句柄（旧记录），
+            // 传完即失效——不显示打开按钮，也把占位路径藏起来
+            if (path != null && path.isNotEmpty && !path.startsWith('/proc/')) ...[
               const SizedBox(height: 4),
               Text('路径: $path',
                   maxLines: 2,
@@ -2665,13 +2667,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               if (picks.length > 1) {
                 final batchId = 'b-${DateTime.now().microsecondsSinceEpoch}';
                 for (var i = 0; i < picks.length; i++) {
-                  _sendFile(d, picks[i].path,
+                  _sendFile(d, picks[i].transferPath,
                       fileName: picks[i].name,
                       batch: SendBatch(
                           batchId: batchId, index: i, total: picks.length));
                 }
               } else {
-                _sendFile(d, picks.first.path, fileName: picks.first.name);
+                _sendFile(d, picks.first.transferPath,
+                    fileName: picks.first.name);
               }
             },
             child: Text('发送 (${picks.length})'),
@@ -2721,12 +2724,27 @@ class PickedFileLite {
   final String name;
   final int size;
   final String path;
-  const PickedFileLite({required this.name, required this.size, required this.path});
+  /// SAF 解析出的真实路径（尽力而为，可能为 null）：
+  /// /proc/self/fd/N 是进程内临时句柄，传完失效，不能进传输历史。
+  final String realPath;
+  const PickedFileLite({
+    required this.name,
+    required this.size,
+    required this.path,
+    this.realPath,
+  });
+
+  /// 传输用路径：优先真实路径（历史记录可打开文件/文件夹），
+  /// 解析不出再退回 /proc/self/fd 直读。
+  String get transferPath => (realPath != null && realPath!.isNotEmpty)
+      ? realPath!
+      : path;
 
   factory PickedFileLite.fromMap(Map<String, dynamic> j) => PickedFileLite(
         name: (j['name'] as String?) ?? 'file',
         size: ((j['size'] as num?) ?? 0).toInt(),
         path: j['path'] as String? ?? '',
+        realPath: j['realPath'] as String?,
       );
 }
 

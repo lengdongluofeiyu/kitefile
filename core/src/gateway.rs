@@ -1382,14 +1382,16 @@ async fn pause_transfer(
     }
 }
 
-/// POST /api/peer-pause/:file_id —— 接收方请求发送方暂停（Remote）。
+/// POST /api/peer-pause/:file_id —— 暂停的对端通知（Remote）。
+///
+/// 双视角：到达发送方 = 接收方请求暂停（置暂停标志）；
+/// 到达接收方 = 发送方广播了暂停（显示「对方已暂停」而非误报中断）。
 async fn peer_pause(
     State(state): State<AppState>,
     Path(file_id): Path<String>,
 ) -> impl IntoResponse {
     info!(%file_id, "peer-pause received");
-    // 到达发送方：只需置暂停标志（接收会话分支不会命中）
-    match state.transfer.pause_transfer(&file_id).await {
+    match state.transfer.on_peer_pause(&file_id).await {
         true => StatusCode::OK,
         false => StatusCode::NOT_FOUND,
     }
