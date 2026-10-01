@@ -935,6 +935,9 @@ fn build_app(state: AppState, advertised_gateway_port: u16) -> Router {
             delete(delete_transfer_history),
         )
         .route("/api/cancel/:file_id", post(cancel_transfer))
+        // 用户暂停（2026-10-02）：本机入口 / 接收方通知发送方
+        .route("/api/pause/:file_id", post(pause_transfer))
+        .route("/api/peer-pause/:file_id", post(peer_pause))
         // 续传（A3.2）：本机 UI 入口 / 对端 daemon 互相触发
         .route("/api/transfers/:file_id/resume", post(resume_transfer))
         .route("/api/peer-resume/:file_id", post(peer_resume))
@@ -1097,6 +1100,9 @@ pub fn classify(method: &Method, path: &str) -> Option<AccessPolicy> {
         (Method::POST, "/api/incoming-resp", Remote),
         (Method::POST, "/api/verify/:file_id", Remote),
         (Method::POST, "/api/cancel/:file_id", Remote),
+        // 暂停：本机 UI 入口（LocalOnly）/ 接收方通知发送方（Remote）
+        (Method::POST, "/api/pause/:file_id", LocalOnly),
+        (Method::POST, "/api/peer-pause/:file_id", Remote),
         // 对端触发的续传信号（A3.2）：接收方请求发送方继续 / 发送方通知接收方恢复
         (Method::POST, "/api/peer-resume/:file_id", Remote),
         (Method::POST, "/api/peer-resumed/:file_id", Remote),
@@ -1358,6 +1364,32 @@ async fn cancel_transfer(
 ) -> impl IntoResponse {
     info!(%file_id, "cancel requested");
     match state.transfer.cancel(&file_id).await {
+        true => StatusCode::OK,
+        false => StatusCode::NOT_FOUND,
+    }
+}
+
+/// POST /api/pause/:file_id —— 用户暂停（2026-10-02）。
+/// 本机是发送方 → 置暂停标志优雅停止；本机是接收方 → 通知发送方 peer-pause。
+async fn pause_transfer(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+) -> impl IntoResponse {
+    info!(%file_id, "pause requested");
+    match state.transfer.pause_transfer(&file_id).await {
+        true => StatusCode::OK,
+        false => StatusCode::NOT_FOUND,
+    }
+}
+
+/// POST /api/peer-pause/:file_id —— 接收方请求发送方暂停（Remote）。
+async fn peer_pause(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+) -> impl IntoResponse {
+    info!(%file_id, "peer-pause received");
+    // 到达发送方：只需置暂停标志（接收会话分支不会命中）
+    match state.transfer.pause_transfer(&file_id).await {
         true => StatusCode::OK,
         false => StatusCode::NOT_FOUND,
     }

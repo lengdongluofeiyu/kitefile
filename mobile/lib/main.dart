@@ -1549,6 +1549,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  /// 「暂停」：各流在检查点优雅停止，断点保留（2026-10-02）。
+  /// 本机是发送方或接收方均由 daemon 路由（接收方 → 通知发送方 peer-pause）。
+  Future<void> _pause(String fileId) async {
+    try {
+      await httpPost('$_httpBase/api/pause/$fileId', body: '{}');
+    } catch (e) {
+      debugPrint('[kitefile] pause failed: $e');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     // 返回键在首页 = 退出应用：必须二次确认，防止误触直接下线。
@@ -1823,6 +1833,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   static bool _isTransferActive(TransferProgress p) =>
       p.status == TransferStatus.pending ||
       p.status == TransferStatus.inProgress ||
+      p.status == TransferStatus.paused ||
       p.status == TransferStatus.interrupted;
 
   /// 传输终态（进入接收/发送记录，不占进度区）
@@ -1990,13 +2001,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 child: Text(statusText,
                     style: TextStyle(color: statusColor, fontSize: 11)),
               ),
-              if (p.status == TransferStatus.inProgress)
+              if (p.status == TransferStatus.inProgress) ...[
+                IconButton(
+                  icon: const Icon(Icons.pause, size: 16),
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(),
+                  tooltip: '暂停',
+                  onPressed: () => _pause(p.fileId),
+                ),
+                const SizedBox(width: 8),
                 IconButton(
                   icon: const Icon(Icons.close, size: 16),
                   padding: EdgeInsets.zero,
                   constraints: const BoxConstraints(),
                   onPressed: () => _cancel(p.fileId),
                 ),
+              ],
             ],
           ),
           const SizedBox(height: 4),
@@ -2006,7 +2026,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             subtitle,
             style: const TextStyle(fontSize: 11, color: Colors.grey),
           ),
-          if (p.status == TransferStatus.interrupted)
+          if (p.status == TransferStatus.paused ||
+              p.status == TransferStatus.interrupted)
             Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [

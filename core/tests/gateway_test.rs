@@ -1266,6 +1266,17 @@ fn test_classify_covers_all_routes() {
             "/api/cancel/:file_id",
             AccessPolicy::Remote,
         ),
+        // 暂停：本机 UI 入口（LocalOnly）/ 接收方通知发送方（Remote）
+        (
+            axum::http::Method::POST,
+            "/api/pause/:file_id",
+            AccessPolicy::LocalOnly,
+        ),
+        (
+            axum::http::Method::POST,
+            "/api/peer-pause/:file_id",
+            AccessPolicy::Remote,
+        ),
         // 对端续传信号（A3.2）
         (
             axum::http::Method::POST,

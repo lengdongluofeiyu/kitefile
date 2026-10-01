@@ -97,7 +97,16 @@ class WhoAmI {
 
 /// 传输状态（与 Rust `TransferStatus` 一一对应，契约测试锁定）。
 /// `interrupted` = 已中断（可「继续传输」），**不等于** failed/canceled（§3.5）。
-enum TransferStatus { pending, inProgress, completed, failed, canceled, interrupted }
+/// `paused` = 用户暂停（可「继续传输」，从断点字节继续）。
+enum TransferStatus {
+  pending,
+  inProgress,
+  completed,
+  failed,
+  canceled,
+  paused,
+  interrupted,
+}
 
 /// 状态 wire 字符串 → 枚举（与 core 序列化契约对应，未知值降级 pending）。
 TransferStatus parseTransferStatus(String s) {
@@ -112,6 +121,8 @@ TransferStatus parseTransferStatus(String s) {
       return TransferStatus.failed;
     case 'Canceled':
       return TransferStatus.canceled;
+    case 'Paused':
+      return TransferStatus.paused;
     case 'Interrupted':
       return TransferStatus.interrupted;
     default:

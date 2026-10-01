@@ -79,6 +79,8 @@ pub enum FailureKind {
     Sha256Mismatch,
     /// 用户决策 60s 超时（非传输故障，不进自动重试）
     DecisionTimeout,
+    /// 用户暂停（非故障：会话保留，从断点继续）
+    Paused,
     /// 用户取消
     Canceled,
     /// 其余本地/内部错误
@@ -136,6 +138,7 @@ impl TransferFailure {
             PeerRejected => "对端拒绝",
             Sha256Mismatch => "校验失败",
             DecisionTimeout => "等待对方确认超时",
+            Paused => "已暂停",
             Canceled => "已取消",
             Internal => "内部错误",
         };

@@ -29,7 +29,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -44,9 +44,12 @@ use tracing::{debug, error, info, warn};
 /// InProgress ──流失败(可重试,自动重试耗尽)──► Interrupted
 /// InProgress ──流失败(不可重试)────────────► Failed
 /// InProgress ──全段完成+sha256─────────────► Completed
+/// InProgress ──用户暂停────────────────────► Paused
 /// InProgress ──用户取消────────────────────► Canceled
 /// Interrupted ──用户「继续传输」───────────► InProgress（只传未完成段）
+/// Paused ──────用户「继续传输」───────────► InProgress（只传未完成段）
 /// Interrupted ──用户「取消」───────────────► Canceled
+/// Paused ──────用户「取消」───────────────► Canceled
 /// Interrupted ──resume 时槽位丢失等────────► Failed
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +59,10 @@ pub enum TransferStatus {
     Completed,
     Failed,
     Canceled,
+    /// 已暂停：用户主动暂停（2026-10-02）。会话与断点字节保留，
+    /// 「继续传输」从断点继续（同 Interrupted 的恢复路径）。
+    /// 注意：这不是「中断」——没有失败语义，UI 角标区分显示。
+    Paused,
     /// 已中断：可重试错误自动重试耗尽。**保留**已写入段与槽位，
     /// 其余流已暂停，用户可「继续传输」（只重发未完成段）。
     /// 注意：这不是「失败」——UI 文案见修复方案 §3.5。
@@ -537,6 +544,9 @@ pub struct TransferEngine {
     recv_active_conn: Arc<Mutex<HashMap<String, u64>>>,
     /// 接收连接序号发号器
     recv_conn_seq: AtomicU64,
+    /// 用户暂停标志（2026-10-02）：file_id → 标志。置位后各发送流在
+    /// 下一个检查点（分块写 / 退避 / 重试前）优雅停止，会话保留可续。
+    pause_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// 进度广播 bus（gateway 注入；None 时 send_file 仍能用，只是不广播）
     progress_bus: TokioMutex<Option<Arc<broadcast::Sender<TransferProgress>>>>,
     /// 全量进度快照：file_id → 最近一条进度（GET /api/transfers 用）
@@ -594,6 +604,7 @@ impl TransferEngine {
             recv_interrupted: Arc::new(Mutex::new(HashMap::new())),
             recv_active_conn: Arc::new(Mutex::new(HashMap::new())),
             recv_conn_seq: AtomicU64::new(1),
+            pause_flags: Arc::new(Mutex::new(HashMap::new())),
             progress_bus: TokioMutex::new(None),
             progress_cache: Arc::new(Mutex::new(ProgressCache::new(PROGRESS_CACHE_CAP))),
             history: Arc::new(Mutex::new(load_transfer_history(
@@ -867,6 +878,7 @@ impl TransferEngine {
     /// Interrupted 保留会话与注册项，供「继续传输」与后续取消使用。
     async fn cleanup_send_final(&self, file_id: &str) {
         self.inflight.lock().remove(file_id);
+        self.pause_flags.lock().remove(file_id);
         self.outgoing_offers.lock().await.remove(file_id);
         self.outgoing_endpoints.lock().await.remove(file_id);
         self.send_sessions.lock().await.remove(file_id);
@@ -1480,6 +1492,10 @@ impl TransferEngine {
         self.inflight
             .lock()
             .insert(file_id.clone(), cancel_tx.clone());
+        // 用户暂停标志（默认未暂停），随会话生命周期建删
+        self.pause_flags
+            .lock()
+            .insert(file_id.clone(), Arc::new(AtomicBool::new(false)));
 
         let (resp_tx, resp_rx) = oneshot::channel::<HttpIncomingResponse>();
         self.outgoing_offers
@@ -1687,10 +1703,22 @@ impl TransferEngine {
         .await;
     }
 
-    /// 推 Interrupted 帧并落 running（会话与注册项保留，供「继续传输」）。
-    /// 先推帧后落 running：反过来会让并发 resume 的 InProgress 帧被覆盖回已中断。
-    async fn interrupt_send_session(&self, file_id: &str, snap: &SessionSnap, error: &str) {
-        let (chunks, bytes) = done_stats(&snap.streams_done, snap.file_size, snap.stream_count);
+    /// 推挂起帧（Interrupted / Paused）并落 running（会话与注册项保留，
+    /// 供「继续传输」）。先推帧后落 running：反过来会让并发 resume 的
+    /// InProgress 帧被覆盖回挂起态。
+    async fn suspend_send_session(
+        &self,
+        file_id: &str,
+        snap: &SessionSnap,
+        status: TransferStatus,
+        error: &str,
+    ) {
+        let layout = stream_layout(snap.file_size, snap.stream_count);
+        let chunks = {
+            let done = snap.streams_done.lock();
+            done.iter().filter(|b| **b).count() as u64
+        };
+        let bytes = delivered_bytes(&snap.streams_done, &layout, &snap.resume_offsets);
         push_progress(
             &snap.progress_tx,
             TransferProgress { time: None,
@@ -1701,7 +1729,7 @@ impl TransferEngine {
                 chunks_done: chunks,
                 chunks_total: snap.stream_count as u64,
                 speed_bps: 0,
-                status: TransferStatus::Interrupted,
+                status,
                 error: Some(error.to_string()),
                 incoming: false,
                 file_path: Some(snap.file_path.to_string_lossy().into_owned()),
@@ -1719,8 +1747,21 @@ impl TransferEngine {
     ///
     /// 首次（Accept 后，`is_resume=false`）与用户「继续传输」共用。
     /// offer/决策阶段不在此。终态（Completed/Failed/Canceled）先清理会话再推帧，
-    /// 避免与 `cancel()` 竞态双写；`Interrupted` 保留会话（先推帧后落 running）。
+    /// 避免与 `cancel()` 竞态双写；`Interrupted`/`Paused` 保留会话（先推帧后落 running）。
     async fn run_transfer(self: Arc<Self>, file_id: String, is_resume: bool) {
+        // 取本任务的暂停标志。注意：只在 resume 时复位——上一轮暂停留下的
+        // true 若不清掉，「继续传输」会在第一个检查点又被暂停住；
+        // 首次运行时标志为 true 是合法语义（用户在等决策期就要求暂停）。
+        let user_pause = self
+            .pause_flags
+            .lock()
+            .get(&file_id)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        if is_resume {
+            user_pause.store(false, Ordering::SeqCst);
+        }
+
         // ---- 快照会话并互斥置 running ----
         let mut snap = {
             let mut sessions = self.send_sessions.lock().await;
@@ -1837,6 +1878,7 @@ impl TransferEngine {
                 snap.file_size,
                 snap.stream_count,
                 snap.streams_done.clone(),
+                user_pause.clone(),
                 snap.resume_offsets.clone(),
                 snap.cancel_rx.clone(),
                 snap.progress_tx.clone(),
@@ -1927,9 +1969,10 @@ impl TransferEngine {
                             %file_id,
                             "receiver still pending after negotiation → Interrupted (bitmap rolled back)"
                         );
-                        self.interrupt_send_session(
+                        self.suspend_send_session(
                             &file_id,
                             &snap,
+                            TransferStatus::Interrupted,
                             "接收方尚未收齐，数据未确认送达",
                         )
                         .await;
@@ -1939,9 +1982,10 @@ impl TransferEngine {
                         // 全程没拿到回执（网络不通）：没有信息就不动位图，
                         // 会话保留、点继续重新协商（自愈闭环）
                         warn!(%file_id, "verify receipt not received → Interrupted (keep bitmap)");
-                        self.interrupt_send_session(
+                        self.suspend_send_session(
                             &file_id,
                             &snap,
+                            TransferStatus::Interrupted,
                             "校验回执未达，可继续传输",
                         )
                         .await;
@@ -2007,7 +2051,18 @@ impl TransferEngine {
                     snap.stream_count,
                     failure.describe()
                 );
-                self.interrupt_send_session(&file_id, &snap, &reason).await;
+                self.suspend_send_session(&file_id, &snap, TransferStatus::Interrupted, &reason).await;
+            }
+            SendOutcome::Paused => {
+                // 用户暂停：会话与断点字节保留，「继续传输」从断点继续
+                warn!(%file_id, "paused by user → Paused (segments kept)");
+                self.suspend_send_session(
+                    &file_id,
+                    &snap,
+                    TransferStatus::Paused,
+                    "已暂停，可继续传输",
+                )
+                .await;
             }
             SendOutcome::Canceled => unreachable!("canceled handled above"),
         }
@@ -2091,6 +2146,37 @@ impl TransferEngine {
         true
     }
 
+    /// 用户暂停（2026-10-02）：
+    /// - 本机是发送方 → 置暂停标志，各流在下一个检查点优雅停止；
+    ///   会话、位图与断点字节全部保留，「继续传输」从断点继续。
+    /// - 本机是接收方 → 通知发送方 `POST /api/peer-pause`。
+    /// 返回 false = 无可暂停对象 / 发送方不可达。
+    pub async fn pause_transfer(&self, file_id: &str) -> bool {
+        if let Some(flag) = self.pause_flags.lock().get(file_id).cloned() {
+            flag.store(true, Ordering::SeqCst);
+            return true;
+        }
+        if let Some((peer_ip, peer_port)) =
+            self.incoming_endpoints.lock().await.get(file_id).cloned()
+        {
+            let res = http_post_json_tls_pinned(
+                &peer_ip,
+                peer_port,
+                &format!("/api/peer-pause/{}", file_id),
+                "{}",
+                &self.receive_dir,
+                self.out_pin(&peer_ip).as_deref(),
+            )
+            .await;
+            if let Err(e) = res {
+                warn!(%file_id, error = %e, "notify sender pause failed");
+                return false;
+            }
+            return true;
+        }
+        false
+    }
+
     /// 启动 N 条流，每条顺序发送一个字节区间（A3.2 / A3.3）。
     ///
     /// - **段级自动重试**：可重试错误最多再试 2 次（0.5s / 1.5s 退避），
@@ -2109,6 +2195,7 @@ impl TransferEngine {
         file_size: u64,
         stream_count: u32,
         streams_done: Arc<Mutex<Vec<bool>>>,
+        user_pause: Arc<AtomicBool>,
         resume_offsets: Vec<u64>,
         cancel_rx: watch::Receiver<bool>,
         progress_tx: mpsc::Sender<TransferProgress>,
@@ -2177,6 +2264,7 @@ impl TransferEngine {
             let file_id_prefix = file_id_prefix;
             let client_cfg = client_cfg.clone();
             let resume_offsets = resume_offsets.clone();
+            let user_pause = user_pause.clone();
 
             handles.push(tokio::spawn(async move {
                 let stream_id_u32 = stream_id as u32;
@@ -2204,6 +2292,10 @@ impl TransferEngine {
                 let mut last_retryable: Option<TransferFailure> = None;
                 for attempt in 0..crate::timeouts::STREAM_RETRY_ATTEMPTS {
                     if pause.load(Ordering::SeqCst) {
+                        return WorkerResult::Paused;
+                    }
+                    // 用户暂停检查点：段间 / 退避后立即响应
+                    if user_pause.load(Ordering::SeqCst) {
                         return WorkerResult::Paused;
                     }
                     if *cancel_rx.borrow() {
@@ -2245,6 +2337,7 @@ impl TransferEngine {
                         &pctx,
                         timeouts,
                         &client_cfg,
+                        &user_pause,
                     )
                     .await
                     {
@@ -2253,6 +2346,11 @@ impl TransferEngine {
                             pctx.streams_done.fetch_add(1, Ordering::Relaxed);
                             pctx.maybe_push().await;
                             return WorkerResult::Done;
+                        }
+                        // 用户暂停（send_stream_body 分块检查点）：非失败，
+                        // 会话与断点保留，段不标完成
+                        Err(f) if f.kind == FailureKind::Paused => {
+                            return WorkerResult::Paused;
                         }
                         Err(f) if f.kind == FailureKind::Canceled => {
                             return WorkerResult::Canceled;
@@ -2326,6 +2424,10 @@ impl TransferEngine {
         if let Some((stream_id, failure)) = exhausted {
             return SendOutcome::Interrupted { stream_id, failure };
         }
+        // 用户暂停（无失败）：优雅挂起，会话与断点保留
+        if user_pause.load(Ordering::SeqCst) {
+            return SendOutcome::Paused;
+        }
         let all_done = {
             let done = streams_done.lock();
             layout.iter().enumerate().all(|(i, _)| done.get(i).copied().unwrap_or(false))
@@ -2350,6 +2452,8 @@ impl TransferEngine {
 enum SendOutcome {
     Completed,
     Canceled,
+    /// 用户暂停（2026-10-02）：会话保留，可「继续传输」/「取消」
+    Paused,
     /// 不可重试错误 → Failed（会话移除）
     Failed(TransferFailure),
     /// 可重试错误且自动重试耗尽 → Interrupted（会话保留，可「继续传输」）
@@ -2402,7 +2506,8 @@ fn done_stats(streams_done: &Mutex<Vec<bool>>, file_size: u64, stream_count: u32
 }
 
 /// 单条流的一次完整尝试：connect → 帧头 → 段体 → shutdown。
-/// 错误按阶段分类（A3.4）；取消映射为 `FailureKind::Canceled`。
+/// 错误按阶段分类（A3.4）；取消映射为 `FailureKind::Canceled`；
+/// 用户暂停映射为 `FailureKind::Paused`（段保持未完成）。
 #[allow(clippy::too_many_arguments)]
 async fn send_one_stream(
     target_ip: &str,
@@ -2416,6 +2521,7 @@ async fn send_one_stream(
     pctx: &SendProgress,
     timeouts: crate::timeouts::Timeouts,
     client_cfg: &Arc<rustls::ClientConfig>,
+    user_pause: &AtomicBool,
 ) -> std::result::Result<(), TransferFailure> {
     // 连接 + TLS 握手一体（握手失败与连接失败同路径重试）
     let mut conn = connect_with_retry(target_ip, target_port, cancel_rx, timeouts.connect, client_cfg).await?;
@@ -2438,6 +2544,7 @@ async fn send_one_stream(
         cancel_rx,
         pctx,
         timeouts.idle,
+        user_pause,
     )
     .await?;
 
@@ -2632,6 +2739,7 @@ async fn send_stream_body<S>(
     cancel_rx: &mut watch::Receiver<bool>,
     pctx: &SendProgress,
     idle: Duration,
+    user_pause: &AtomicBool,
 ) -> std::result::Result<(), TransferFailure>
 where
     S: tokio::io::AsyncWrite + Unpin,
@@ -2649,6 +2757,15 @@ where
     while remaining > 0 {
         if *cancel_rx.borrow() {
             return Err(TransferFailure::canceled("canceled"));
+        }
+        // 用户暂停检查点（分块级）：立刻断开连接、段保持未完成；
+        // 已发到对端的字节由字节级续传记账，恢复后从断点继续
+        if user_pause.load(Ordering::SeqCst) {
+            return Err(TransferFailure::new(
+                FailureKind::Paused,
+                Phase::Send,
+                "paused by user",
+            ));
         }
         let want = std::cmp::min(remaining as usize, buf.len());
         let n = {
@@ -3414,6 +3531,100 @@ mod tests {
             "删除后 list_transfers 不得再返回该记录（快照必须同清）"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 用户暂停（2026-10-02）：暂停标志置位 → 各流在检查点优雅停止 →
+    /// Paused 状态、会话与位图保留；清除标志后 resume_send 从断点继续至完成。
+    #[tokio::test]
+    async fn pause_transfer_then_resume_completes() {
+        let recv_dir = tmp_dir("pause-resume");
+        let src_dir = tmp_dir("pause-src");
+        let port = free_port();
+
+        let recv = Arc::new(TransferEngine::new(port, 4, recv_dir.clone()));
+        recv.clone().spawn_receiver().await.unwrap();
+
+        let src = src_dir.join("out.bin");
+        std::fs::write(&src, b"AAAAABBBBB").unwrap();
+        let file_id = "pause-fid";
+        recv.storage
+            .create_slot(file_id.into(), "out.bin".into(), 10, 2, None, false)
+            .await
+            .unwrap();
+        recv.prefix_to_file_id
+            .lock()
+            .await
+            .insert(file_id_prefix_u64(file_id), file_id.to_string());
+
+        // 脚本化响应：① peer-resumed（slot 存在）② verify（finalized）
+        let sender = Arc::new(TransferEngine::new(0, 4, src_dir.clone()));
+        let (gw_port, _hits) = spawn_scripted_http(vec![
+            ("200 OK", r#"{"slot":true,"stream_bytes":[0,0]}"#),
+            ("200 OK", r#"{"result":"finalized","chunks_done":null}"#),
+        ])
+        .await;
+        let (mut rx, _cancel) = insert_session(
+            &sender,
+            file_id,
+            "out.bin",
+            src,
+            10,
+            2,
+            "127.0.0.1",
+            port,
+            gw_port,
+            vec![false, false],
+        )
+        .await;
+
+        // ---- 预置暂停标志（生产路径由 send_file 登记并置 false）→ 运行即暂停 ----
+        let pause_flag = Arc::new(AtomicBool::new(true));
+        sender
+            .pause_flags
+            .lock()
+            .insert(file_id.to_string(), pause_flag.clone());
+        sender
+            .clone()
+            .run_transfer(file_id.to_string(), false)
+            .await;
+
+        let mut frames = Vec::new();
+        while let Ok(p) = rx.try_recv() {
+            frames.push(p);
+        }
+        assert_eq!(
+            frames.last().map(|p| p.status),
+            Some(TransferStatus::Paused),
+            "暂停标志置位时应收敛为 Paused"
+        );
+        assert!(
+            sender.send_sessions.lock().await.contains_key(file_id),
+            "暂停必须保留会话"
+        );
+
+        // ---- 清除标志 → resume_send 从断点继续至完成 ----
+        sender
+            .resume_send(file_id)
+            .await;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let final_path = recv_dir.join("out.bin");
+        while !final_path.exists() {
+            assert!(Instant::now() < deadline, "接收方未 finalize");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            b"AAAAABBBBB",
+            "续传后文件内容必须完整"
+        );
+        assert!(
+            frames.iter().all(|p| p.status != TransferStatus::Failed),
+            "暂停路径不得谎报失败"
+        );
+
+        let _ = std::fs::remove_dir_all(&recv_dir);
+        let _ = std::fs::remove_dir_all(&src_dir);
     }
 
     /// A验收 2：连不上对端 → 自动重试耗尽 → Interrupted；

@@ -46,6 +46,8 @@ String statusBadgeLabel(TransferProgress p) {
       return '传输失败';
     case TransferStatus.canceled:
       return '已取消';
+    case TransferStatus.paused:
+      return '已暂停';
     case TransferStatus.interrupted:
       return '已中断';
   }
@@ -64,6 +66,8 @@ Color statusBadgeColor(TransferProgress p) {
       return Colors.red;
     case TransferStatus.canceled:
       return Colors.orange;
+    case TransferStatus.paused:
+      return Colors.deepPurple;
     case TransferStatus.interrupted:
       return Colors.amber.shade800;
   }
@@ -85,6 +89,8 @@ String transferSubtitle(TransferProgress p, {bool showDirection = false}) {
   switch (p.status) {
     case TransferStatus.interrupted:
       return '$dir${p.error ?? '传输中断'} · 已完成 $pct% · 未完成部分将重新发送';
+    case TransferStatus.paused:
+      return '$dir${formatBytes(p.bytesTransferred)} / ${formatBytes(p.fileSize)} · 已暂停，可继续';
     case TransferStatus.canceled:
       return '$dir${p.error ?? '已放弃本次传输'}$timeSuffix';
     case TransferStatus.failed:

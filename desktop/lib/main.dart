@@ -2523,6 +2523,7 @@ class _HomePageState extends State<HomePage> with WindowListener {
   static bool _isTransferActive(TransferProgress p) =>
       p.status == TransferStatus.pending ||
       p.status == TransferStatus.inProgress ||
+      p.status == TransferStatus.paused ||
       p.status == TransferStatus.interrupted;
 
   /// 传输终态（进入接收/发送记录，不占进度区）
@@ -2687,11 +2688,17 @@ class _HomePageState extends State<HomePage> with WindowListener {
                 child: Text(statusText,
                     style: TextStyle(color: statusColor, fontSize: 12)),
               ),
-              if (p.status == TransferStatus.inProgress)
+              if (p.status == TransferStatus.inProgress) ...[
+                IconButton(
+                  icon: const Icon(Icons.pause, size: 16),
+                  tooltip: '暂停',
+                  onPressed: () => _pause(p.fileId),
+                ),
                 IconButton(
                   icon: const Icon(Icons.close, size: 16),
                   onPressed: () => _cancel(p.fileId),
                 ),
+              ],
             ],
           ),
           const SizedBox(height: 4),
@@ -2701,7 +2708,8 @@ class _HomePageState extends State<HomePage> with WindowListener {
             subtitle,
             style: const TextStyle(fontSize: 12, color: Colors.grey),
           ),
-          if (p.status == TransferStatus.interrupted)
+          if (p.status == TransferStatus.paused ||
+              p.status == TransferStatus.interrupted)
             Row(
               children: [
                 TextButton.icon(
@@ -2845,6 +2853,16 @@ class _HomePageState extends State<HomePage> with WindowListener {
     } catch (e) {
       // 不静默吞：至少留日志（A3.6 精神）
       debugPrint('[kitefile] resume failed: $e');
+    }
+  }
+
+  /// 「暂停」：各流在检查点优雅停止，断点保留（2026-10-02）。
+  /// 本机是发送方或接收方均由 daemon 路由（接收方 → 通知发送方 peer-pause）。
+  Future<void> _pause(String fileId) async {
+    try {
+      await httpPost('$kDaemonHttp/api/pause/$fileId', body: '{}');
+    } catch (e) {
+      debugPrint('[kitefile] pause failed: $e');
     }
   }
 

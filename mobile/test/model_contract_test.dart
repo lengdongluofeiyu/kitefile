@@ -80,6 +80,7 @@ void main() {
         'Completed': TransferStatus.completed,
         'Failed': TransferStatus.failed,
         'Canceled': TransferStatus.canceled,
+        'Paused': TransferStatus.paused,
         'Interrupted': TransferStatus.interrupted,
       };
       cases.forEach((wire, want) {
