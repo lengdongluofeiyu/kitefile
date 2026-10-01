@@ -28,8 +28,7 @@ core/       Rust 核心（mDNS 发现、配对/mTLS、TLS 网关、流式传输�
 desktop/    Flutter 桌面端（Windows / macOS 骨架）
 mobile/     Flutter 移动端（Android 可用，iOS 预留）
 web/        Web 前端（实验）
-docs/       协议与阶段设计文档（历史设计，以代码为准；
-            对标分析见 docs/localsend-comparison.md）
+docs/       协议与阶段设计文档（历史设计，以代码为准）
 scripts/    构建脚本
 ```
 
