@@ -304,7 +304,25 @@ class MainActivity : FlutterActivity() {
                 else -> abs
             }
 
-            // 1) 系统文件管理器（显式包名）+ EXTRA_INITIAL_URI 直达目录：
+            // 1) 小米文件管理器专用深链（真机 Xiaomi 14 / HyperOS）：
+            //    FileActivity + setData(目录路径) 可直达指定目录。
+            //    类名是 FileActivity（FileExplorerActivity 在 HyperOS 上不存在）。
+            try {
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setClassName(
+                        "com.android.fileexplorer",
+                        "com.android.fileexplorer.activity.FileActivity",
+                    )
+                    setData(Uri.parse(abs))
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(intent)
+                result.success(true)
+                return
+            } catch (_: Exception) {
+            }
+
+            // 2) 系统文件管理器（显式包名）+ EXTRA_INITIAL_URI 直达目录：
             //    不带包名的 ACTION_VIEW 会被第三方 App 抢占（真机：解压专家
             //    cache 里的 0 字节假文件）；只给文档 URI 不带 INITIAL_URI 时
             //    部分 ROM 只开根页不跳转（用户要求按保存路径直达）。
@@ -346,7 +364,7 @@ class MainActivity : FlutterActivity() {
             } catch (_: Exception) {
             }
 
-            // 3) 小米文件管理器按类名直开（folder:// 约定的类名变体）
+            // 3) 小米文件管理器类名变体（旧 ROM：FileExplorerActivity + folder://）
             try {
                 val intent = Intent(Intent.ACTION_VIEW).apply {
                     setClassName(
