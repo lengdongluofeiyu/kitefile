@@ -1182,6 +1182,17 @@ impl TransferEngine {
                 return;
             }
         }
+        // 对端已暂停（2026-10-02）：暂停通知（HTTP）总是先于被断开连接的
+        // EOF 到达——此刻的流失败是**暂停的直接后果**，不是网络故障。
+        // 不丢弃的话，EOF 会立刻把「对方已暂停」覆盖回「已中断」（真机实测）。
+        if self.recv_peer_paused.lock().contains(file_id) {
+            warn!(
+                %file_id,
+                kind = ?f.kind,
+                "receive stream closed because sender paused — keep Paused (not Interrupted)"
+            );
+            return;
+        }
         // UI 副文案（§3.5）：「流 3/8 失败（连接超时）」
         let compose = |total: u64| {
             format!(
@@ -3691,6 +3702,50 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&recv_dir);
         let _ = std::fs::remove_dir_all(&src_dir);
+    }
+
+    /// 对端暂停后，被断开连接的 EOF 不得覆盖「对方已暂停」（2026-10-02 回归）：
+    /// 暂停通知（HTTP）先到、EOF 后到，若无此抑制，状态机每轮都被打回「已中断」。
+    #[tokio::test]
+    async fn peer_pause_suppresses_recv_interrupted() {
+        let dir = tmp_dir("peer-pause-skip");
+        let engine = TransferEngine::new(0, 2, dir.clone());
+        engine
+            .storage
+            .create_slot("pp".into(), "a.bin".into(), 10, 2, None, false)
+            .await
+            .unwrap();
+        engine
+            .prefix_to_file_id
+            .lock()
+            .await
+            .insert(file_id_prefix_u64("pp"), "pp".to_string());
+        // ① 对端暂停通知先到 → 「对方已暂停」
+        assert!(engine.on_peer_pause("pp").await);
+        // ② 被断开的连接随后报 EOF：不得覆盖为 Interrupted
+        let conn = engine.recv_conn_seq.fetch_add(1, Ordering::Relaxed);
+        engine.recv_active_conn.lock().insert("pp".to_string(), conn);
+        engine
+            .on_recv_stream_failure(
+                "pp",
+                conn,
+                0,
+                &TransferFailure::new(
+                    FailureKind::UnexpectedEof,
+                    Phase::Recv,
+                    "peer closed connection",
+                ),
+            )
+            .await;
+        assert!(engine.recv_peer_paused.lock().contains("pp"));
+        assert!(!engine.recv_interrupted.lock().contains_key("pp"));
+        let frame = engine
+            .list_transfers()
+            .into_iter()
+            .find(|p| p.file_id == "pp")
+            .unwrap();
+        assert_eq!(frame.status, TransferStatus::Paused);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A验收 2：连不上对端 → 自动重试耗尽 → Interrupted；
