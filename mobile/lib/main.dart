@@ -2904,9 +2904,11 @@ class _FolderBrowserPageState extends State<FolderBrowserPage> {
             },
           ),
           onTap: () async {
+            // async 前捕获 messenger：避免 async 后使用 BuildContext（analyzer）
+            final messenger = ScaffoldMessenger.of(context);
             final err = await openFileNative(e.path);
-            if (err != null && mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
+            if (err != null) {
+              messenger.showSnackBar(
                 SnackBar(content: Text('打开失败: $err')),
               );
             }
