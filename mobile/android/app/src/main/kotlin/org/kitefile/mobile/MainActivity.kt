@@ -304,11 +304,53 @@ class MainActivity : FlutterActivity() {
                 else -> abs
             }
 
-            // 1) DocumentsUI（系统文件管理器）
+            // 1) 系统文件管理器（显式包名）：不带包名的 ACTION_VIEW 会被
+            //    第三方 App 抢占——真机实测「解压专家」注册为默认处理器后，
+            //    把目录当压缩包解开，显示自己 cache 里的 0 字节假文件
+            //    （com.cjtec.uncompress/cache/tempopen，2026-10-02 用户截图）。
+            val documentsUri = Uri.parse(
+                "content://com.android.externalstorage.documents/document/$docId"
+            )
+            for (pkg in listOf(
+                "com.android.documentsui",
+                "com.google.android.documentsui",
+            )) {
+                try {
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        setPackage(pkg)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        data = documentsUri
+                    }
+                    startActivity(intent)
+                    result.success(true)
+                    return
+                } catch (_: Exception) {
+                }
+            }
+
+            // 2) 厂商文件管理器（如小米文件管理）：直接拉起应用根页，
+            //    用户按路径名自行进入（子目录无法直达，但绝不会打开错东西）
+            for (pkg in listOf(
+                "com.android.fileexplorer",
+                "com.coloros.filemanager",
+                "com.heytap.filemanager",
+            )) {
+                try {
+                    val launch = packageManager.getLaunchIntentForPackage(pkg)
+                    if (launch != null) {
+                        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(launch)
+                        result.success(true)
+                        return
+                    }
+                } catch (_: Exception) {
+                }
+            }
+
+            // 3) 不限包名的 ACTION_VIEW（最后手段：可能被第三方接管，
+            //    但总比打不开强——真机上 DocumentsUI 缺失时的兜底）
             try {
-                val documentsUri = Uri.parse(
-                    "content://com.android.externalstorage.documents/document/$docId"
-                )
                 val intent = Intent(Intent.ACTION_VIEW).apply {
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -320,7 +362,7 @@ class MainActivity : FlutterActivity() {
             } catch (_: Exception) {
             }
 
-            // 2) FileProvider 目录 URI
+            // 4) FileProvider 目录 URI
             try {
                 val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", dir)
                 val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -334,14 +376,9 @@ class MainActivity : FlutterActivity() {
             } catch (_: Exception) {
             }
 
-            // 3) 常见文件管理器
+            // 5) 常见文件管理器（兜底兜底）
             val managers = listOf(
-                "com.android.documentsui",
-                "com.google.android.documentsui",
-                "com.android.fileexplorer",
-                "com.coloros.filemanager",
                 "com.estrongs.android.pop",
-                "com.miui.globalpackageinstaller",
             )
             for (pkg in managers) {
                 try {
