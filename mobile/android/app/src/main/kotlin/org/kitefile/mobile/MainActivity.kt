@@ -304,10 +304,11 @@ class MainActivity : FlutterActivity() {
                 else -> abs
             }
 
-            // 1) 系统文件管理器（显式包名）：不带包名的 ACTION_VIEW 会被
-            //    第三方 App 抢占——真机实测「解压专家」注册为默认处理器后，
-            //    把目录当压缩包解开，显示自己 cache 里的 0 字节假文件
-            //    （com.cjtec.uncompress/cache/tempopen，2026-10-02 用户截图）。
+            // 1) 系统文件管理器（显式包名）+ EXTRA_INITIAL_URI 直达目录：
+            //    不带包名的 ACTION_VIEW 会被第三方 App 抢占（真机：解压专家
+            //    cache 里的 0 字节假文件）；只给文档 URI 不带 INITIAL_URI 时
+            //    部分 ROM 只开根页不跳转（用户要求按保存路径直达）。
+            //    INITIAL_URI 用字符串常量（符号常量 API 26+ 才有，minSdk 24）。
             val documentsUri = Uri.parse(
                 "content://com.android.externalstorage.documents/document/$docId"
             )
@@ -321,6 +322,7 @@ class MainActivity : FlutterActivity() {
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         data = documentsUri
+                        putExtra("android.provider.extra.INITIAL_URI", documentsUri)
                     }
                     startActivity(intent)
                     result.success(true)
@@ -329,27 +331,39 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
-            // 2) 厂商文件管理器（如小米文件管理）：直接拉起应用根页，
-            //    用户按路径名自行进入（子目录无法直达，但绝不会打开错东西）
-            for (pkg in listOf(
-                "com.android.fileexplorer",
-                "com.coloros.filemanager",
-                "com.heytap.filemanager",
-            )) {
-                try {
-                    val launch = packageManager.getLaunchIntentForPackage(pkg)
-                    if (launch != null) {
-                        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        startActivity(launch)
-                        result.success(true)
-                        return
-                    }
-                } catch (_: Exception) {
+            // 2) 厂商文件管理器的目录深链：folder://<path> + resource/folder
+            //    （小米/OPPO 等自带管理器支持该约定；不用 file:// —— API 24+
+            //    默认 StrictMode 会抛 FileUriExposedException）
+            try {
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    addCategory(Intent.CATEGORY_DEFAULT)
+                    setDataAndType(Uri.parse("folder://$abs"), "resource/folder")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
+                startActivity(intent)
+                result.success(true)
+                return
+            } catch (_: Exception) {
             }
 
-            // 3) 不限包名的 ACTION_VIEW（最后手段：可能被第三方接管，
-            //    但总比打不开强——真机上 DocumentsUI 缺失时的兜底）
+            // 3) 小米文件管理器按类名直开（folder:// 约定的类名变体）
+            try {
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setClassName(
+                        "com.android.fileexplorer",
+                        "com.android.fileexplorer.activity.FileExplorerActivity",
+                    )
+                    setDataAndType(Uri.parse("folder://$abs"), "resource/folder")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(intent)
+                result.success(true)
+                return
+            } catch (_: Exception) {
+            }
+
+            // 4) 不限包名的 ACTION_VIEW（最后手段：可能被第三方接管，
+            //    但总比打不开强——DocumentsUI 缺失时的兜底）
             try {
                 val intent = Intent(Intent.ACTION_VIEW).apply {
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -362,7 +376,7 @@ class MainActivity : FlutterActivity() {
             } catch (_: Exception) {
             }
 
-            // 4) FileProvider 目录 URI
+            // 5) FileProvider 目录 URI
             try {
                 val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", dir)
                 val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -376,8 +390,11 @@ class MainActivity : FlutterActivity() {
             } catch (_: Exception) {
             }
 
-            // 5) 常见文件管理器（兜底兜底）
+            // 6) 常见文件管理器（兜底兜底）：拉起根页，用户按路径自行进入
             val managers = listOf(
+                "com.android.fileexplorer",
+                "com.coloros.filemanager",
+                "com.heytap.filemanager",
                 "com.estrongs.android.pop",
             )
             for (pkg in managers) {
