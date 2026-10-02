@@ -2726,7 +2726,7 @@ class PickedFileLite {
   final String path;
   /// SAF 解析出的真实路径（尽力而为，可能为 null）：
   /// /proc/self/fd/N 是进程内临时句柄，传完失效，不能进传输历史。
-  final String realPath;
+  final String? realPath;
   const PickedFileLite({
     required this.name,
     required this.size,
