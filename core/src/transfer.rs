@@ -680,16 +680,25 @@ impl TransferEngine {
 
     /// 发布一条进度：写入全量快照 + 广播给订阅方；终态同步写入持久化历史
     pub async fn publish_progress(&self, mut p: TransferProgress) {
-        // 终态盖章「传输时间」（unix 秒）：传输记录展示用。
-        // 唯一入口在这里——发送/接收/取消各路径落终态都经过 publish_progress。
+        // 全帧盖章「最近活动时间」（unix 秒，2026-10-02）：记录列表按它
+        // 倒序排（最新在前）。此前只有终态盖章，进行中/暂停/中断的记录
+        // 无时间可排，只能按产生顺序沉在列表里。
+        // - 非终态帧每帧更新 time = 最近活动时刻（UI 刷新时自动置顶）
+        // - 终态帧首次盖章即完成时刻，之后不覆盖（历史里的时间不变）
+        if p.time.is_none() {
+            p.time = now_unix_secs();
+        }
         if is_terminal(&p.status) {
-            if p.time.is_none() {
-                p.time = now_unix_secs();
-            }
             let path = history_file_path(&self.receive_dir);
             let mut hist = self.history.lock();
             if let Some(slot) = hist.iter_mut().find(|x| x.file_id == p.file_id) {
+                // 终态更新（重放/重复确认）保留原完成时刻：
+                // 否则每次重放都会把旧记录的 time 刷成 now，跳到列表顶部
+                let original_time = slot.time;
                 *slot = p.clone();
+                if original_time.is_some() {
+                    slot.time = original_time;
+                }
             } else {
                 // 新记录追加到末尾；超出上限从最旧一端裁剪
                 hist.push(p.clone());
@@ -699,11 +708,25 @@ impl TransferEngine {
             }
             save_transfer_history(&path, &hist);
         }
-        self.progress_cache.lock().insert(p.clone());
+        // 终态时间只认第一次：重放/重复确认（verify 重发等）不得把
+        // 旧记录的 time 刷成 now，否则它会跳到「最新在前」的列表顶部。
+        // 内存快照与持久化历史都保留首次完成时刻。
+        if is_terminal(&p.status) {
+            let mut cache = self.progress_cache.lock();
+            if let Some(prev) = cache.map.get(&p.file_id) {
+                if let Some(t) = prev.time {
+                    p.time = Some(t);
+                }
+            }
+            cache.insert(p.clone());
+        } else {
+            self.progress_cache.lock().insert(p.clone());
+        }
         self.broadcast_progress(p).await;
     }
 
-    /// 当前所有传输的最近进度：内存快照 ∪ 持久化历史（重启后仍可见）
+    /// 当前所有传输的最近进度：内存快照 ∪ 持久化历史（重启后仍可见）。
+    /// 按 time 倒序（最新在前，2026-10-02）：进行中记录随每次活动自动置顶。
     pub fn list_transfers(&self) -> Vec<TransferProgress> {
         let mem = self.progress_cache.lock().snapshot();
         let hist = self.history.lock().clone();
@@ -715,6 +738,7 @@ impl TransferEngine {
                 all.push(h);
             }
         }
+        all.sort_by(|a, b| b.time.unwrap_or(0).cmp(&a.time.unwrap_or(0)));
         all
     }
 
@@ -3745,6 +3769,60 @@ mod tests {
             .find(|p| p.file_id == "pp")
             .unwrap();
         assert_eq!(frame.status, TransferStatus::Paused);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 记录列表按 time 倒序（2026-10-02）：
+    /// 全帧盖章（非终态也有最近活动时间）+ list_transfers 排序。
+    #[tokio::test]
+    async fn list_transfers_sorted_by_time_desc() {
+        let dir = tmp_dir("list-sort");
+        let engine = TransferEngine::new(0, 2, dir.clone());
+        let frame = |fid: &str, status: TransferStatus, time: Option<u64>| TransferProgress {
+            time,
+            file_id: fid.into(),
+            file_name: "a.bin".into(),
+            file_size: 10,
+            bytes_transferred: 0,
+            chunks_done: 0,
+            chunks_total: 1,
+            speed_bps: 0,
+            status,
+            error: None,
+            incoming: false,
+            file_path: None,
+            retry_note: None,
+        };
+        // 旧终态（显式 time=100）→ 进行中（time=200）→ 无 time 的暂停帧
+        engine
+            .publish_progress(frame("old", TransferStatus::Completed, Some(100)))
+            .await;
+        engine
+            .publish_progress(frame("act", TransferStatus::InProgress, Some(200)))
+            .await;
+        engine
+            .publish_progress(frame("pst", TransferStatus::Paused, None))
+            .await;
+
+        let list = engine.list_transfers();
+        let ids: Vec<&str> = list.iter().map(|p| p.file_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["pst", "act", "old"],
+            "无时间帧盖 now（最大）→ 200 → 100；倒序 = 最新在前"
+        );
+        // 非终态帧也被盖章（用于排序）
+        assert!(list[0].time.is_some());
+        // 终态时间不因重放而刷新
+        let mut replay = frame("old", TransferStatus::Completed, None);
+        replay.time = None;
+        engine.publish_progress(replay).await;
+        let old = engine
+            .list_transfers()
+            .into_iter()
+            .find(|p| p.file_id == "old")
+            .unwrap();
+        assert_eq!(old.time, Some(100), "终态重放保留原完成时刻");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

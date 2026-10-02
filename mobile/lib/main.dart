@@ -1842,15 +1842,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Widget _transfersSection() {
     final all = _progress.values.toList()
       ..sort((a, b) {
-        if (a.status == TransferStatus.inProgress &&
-            b.status != TransferStatus.inProgress) {
-          return -1;
-        }
-        if (b.status == TransferStatus.inProgress &&
-            a.status != TransferStatus.inProgress) {
-          return 1;
-        }
-        return 0;
+        // 进行中（含暂停/中断，有继续/取消操作）置顶；
+        // 其余按最近活动时间倒序——最新的传输记录在最前面（2026-10-02）
+        final aActive = _isTransferActive(a) ? 1 : 0;
+        final bActive = _isTransferActive(b) ? 1 : 0;
+        if (aActive != bActive) return bActive - aActive;
+        return (b.time ?? 0).compareTo(a.time ?? 0);
       });
     final active = all.where(_isTransferActive).toList();
     final recvHist = all
