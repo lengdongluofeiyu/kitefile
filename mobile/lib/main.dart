@@ -2097,13 +2097,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  /// 打开文件所在目录（原生 DocumentsUI / 文件管理器）。
+  /// 打开文件所在目录：**应用内文件夹浏览器**（2026-10-02 重做）。
+  /// 不再跳外部文件管理器——各厂商目录深链约定互不兼容（小米 HyperOS
+  /// 上 folder:// 与文档 URI 均无效），且第三方 App 会抢占默认打开方式。
+  /// App 已持有所有文件访问权限，dart:io 直接列目录最通用、最可控。
   Future<void> _openFolderForPath(String path) async {
     final dir = File(path).parent.path;
-    final err = await openFolderNative(dir);
-    if (err != null && mounted) {
-      _showTopToast('无法打开文件夹，请手动前往:\n$dir');
-    }
+    if (!mounted) return;
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => FolderBrowserPage(dir: dir)),
+    );
   }
 
   /// 删除传输记录；接收记录可选同时删除本地文件。
@@ -2743,6 +2746,175 @@ class PickedFileLite {
         path: j['path'] as String? ?? '',
         realPath: j['realPath'] as String?,
       );
+}
+
+/// 应用内文件夹浏览器（2026-10-02）：「打开文件夹」的落地页。
+///
+/// 各厂商文件管理器的目录深链互不兼容、第三方 App 还会抢占默认打开
+/// 方式（真机：解压专家 cache 里的 0 字节假文件）——App 已持有所有
+/// 文件访问权限，dart:io 直接列目录全安卓行为一致：
+/// 列目录（按修改时间倒序）→ 点文件用系统应用打开 → 子目录继续浏览。
+class FolderBrowserPage extends StatefulWidget {
+  final String dir;
+  const FolderBrowserPage({super.key, required this.dir});
+
+  @override
+  State<FolderBrowserPage> createState() => _FolderBrowserPageState();
+}
+
+class _FolderBrowserPageState extends State<FolderBrowserPage> {
+  bool _loading = true;
+  String? _error;
+  List<FileSystemEntity> _entries = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  Future<void> _refresh() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final items = await Directory(widget.dir).list().toList();
+      // 目录在前、文件在后，各组按修改时间倒序
+      final dirs = items.whereType<Directory>().toList()
+        ..sort((a, b) => b.path.compareTo(a.path));
+      final files = items.whereType<File>().toList();
+      final stats = await Future.wait(files.map((f) => f.stat()));
+      final paired = List<MapEntry<File, FileStat>>.generate(
+        files.length,
+        (i) => MapEntry(files[i], stats[i]),
+      )..sort((a, b) => b.value.modified.compareTo(a.value.modified));
+      if (!mounted) return;
+      setState(() {
+        _entries = [...dirs, ...paired.map((e) => e.key)];
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = '无法读取目录：$e\n（检查是否已授予「所有文件访问」权限）';
+      });
+    }
+  }
+
+  String _fmtTime(DateTime t) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(t.month)}-${two(t.day)} ${two(t.hour)}:${two(t.minute)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final dirName = widget.dir.split('/').where((s) => s.isNotEmpty).last;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(dirName, overflow: TextOverflow.ellipsis),
+        actions: [
+          IconButton(icon: const Icon(Icons.refresh), onPressed: _refresh),
+        ],
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(widget.dir,
+                  style: const TextStyle(fontSize: 11, color: Colors.grey)),
+            ),
+          ),
+          Expanded(
+            child: _loading
+                ? const Center(child: CircularProgressIndicator())
+                : _error != null
+                    ? _errorView()
+                    : _entries.isEmpty
+                        ? const Center(
+                            child: Text('目录为空',
+                                style: TextStyle(color: Colors.grey)))
+                        : RefreshIndicator(onRefresh: _refresh, child: _list()),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _errorView() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.folder_off, size: 40, color: Colors.grey),
+            const SizedBox(height: 12),
+            Text(_error ?? '',
+                style: const TextStyle(fontSize: 12, color: Colors.grey),
+                textAlign: TextAlign.center),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.settings, size: 16),
+              label: const Text('去授权存储权限'),
+              onPressed: () async {
+                try {
+                  await _nativeChannel.invokeMethod('requestManageStorage');
+                } catch (_) {}
+                await _refresh();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _list() {
+    return ListView.builder(
+      itemCount: _entries.length,
+      itemBuilder: (context, i) {
+        final e = _entries[i];
+        final name = e.path.split('/').where((s) => s.isNotEmpty).last;
+        if (e is Directory) {
+          return ListTile(
+            leading: const Icon(Icons.folder, color: Colors.amber),
+            title: Text(name, overflow: TextOverflow.ellipsis),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                  builder: (_) => FolderBrowserPage(dir: e.path)),
+            ),
+          );
+        }
+        return ListTile(
+          leading: const Icon(Icons.insert_drive_file, color: Colors.blue),
+          title: Text(name, overflow: TextOverflow.ellipsis),
+          subtitle: FutureBuilder<FileStat>(
+            future: (e as File).stat(),
+            builder: (context, snap) {
+              final s = snap.data;
+              final text = s == null
+                  ? ''
+                  : '${formatBytes(s.size)} · ${_fmtTime(s.modified)}';
+              return Text(text,
+                  style: const TextStyle(fontSize: 12, color: Colors.grey));
+            },
+          ),
+          onTap: () async {
+            final err = await openFileNative(e.path);
+            if (err != null && mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('打开失败: $err')),
+              );
+            }
+          },
+        );
+      },
+    );
+  }
 }
 
 /// formatBytes / formatSpeed 由共享包 kitefile_shared 提供（工作流 C）。
