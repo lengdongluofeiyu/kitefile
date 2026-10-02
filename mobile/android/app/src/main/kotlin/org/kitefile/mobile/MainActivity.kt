@@ -194,7 +194,8 @@ class MainActivity : FlutterActivity() {
                     // 真实路径（尽力解析）：/proc/self/fd 是进程内临时句柄，
                     // 传完即失效——传输历史里拿它打开文件/文件夹必然失败。
                     // 能解析出真实路径时优先用真实路径读写（需已授所有文件访问）。
-                    "realPath" to resolveRealPath(uri),
+                    // 解析失败给空串（保持 Map<String, Any> 推断，Kotlin 不收 null 值）
+                    "realPath" to (resolveRealPath(uri) ?: ""),
                 ))
             }
             result.success(picks)
