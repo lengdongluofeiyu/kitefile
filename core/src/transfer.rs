@@ -569,6 +569,14 @@ pub struct TransferEngine {
     /// 出站 offer 并发闸门：多文件批量发送时限制同时在途的 /api/incoming，
     /// 免得几个连接一起把手机网络栈打满（表现为 ETIMEDOUT）。
     offer_gate: Arc<tokio::sync::Semaphore>,
+    /// **数据面文件级闸门**（2026-10-09，目标 IP → 信号量）：
+    /// 同一目标同时只跑一个文件的数据阶段，其余排队（UI 保持「等待」）。
+    ///
+    /// 根因：批量发送时每个文件各开 N 路流（10MB 文件 = 3 路），23 个文件
+    /// 并发 ≈ 70 条 TLS 连接互抢带宽——单文件速度跌破 200KB/s、空闲超时
+    /// 与中断频发（真机录屏：23 个文件同时「传输中」，极不稳定）。
+    /// 串行后每个文件独占带宽，逐个稳定跑完；不同目标互不影响。
+    send_gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>>,
     /// 已配对设备表（**唯一实例**：gateway 经 [`TransferEngine::peers`] 复用同一
     /// Arc，撤销对两侧即时生效；文件 = receive_dir/peers.json）
     peers: Arc<crate::pairing::PeersStore>,
@@ -620,6 +628,7 @@ impl TransferEngine {
             incoming_endpoints: TokioMutex::new(HashMap::new()),
             outgoing_endpoints: TokioMutex::new(HashMap::new()),
             offer_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            send_gates: Arc::new(Mutex::new(HashMap::new())),
             peers,
             identity: std::sync::OnceLock::new(),
             trust: std::sync::OnceLock::new(),
@@ -1836,6 +1845,29 @@ impl TransferEngine {
             }
         };
 
+        // ---- 数据面文件级闸门（2026-10-09）：同目标串行，排队等带宽 ----
+        // 批量发送 23 个文件时若全部并发：每文件 3 路流 ≈ 70 条 TLS 连接
+        // 互抢带宽，单文件速度跌破 200KB/s、空闲超时/中断频发（真机录屏）。
+        // 排队文件保持 Pending（UI「等待」），轮到时独占带宽稳定跑完。
+        let gate = self.send_gate(&snap.target_ip);
+        let permit = {
+            // 排队期间可取消：select 等锁 vs 取消信号
+            let mut cancel_rx = snap.cancel_rx.clone();
+            tokio::select! {
+                p = gate.acquire_owned() => Some(p),
+                _ = cancel_rx.changed() => None,
+            }
+        };
+        let Some(_permit) = permit else {
+            self.finish_canceled(&file_id, &snap).await;
+            return;
+        };
+        if *snap.cancel_rx.borrow() {
+            // 兜底：changed 因其他原因唤醒（或置位早于订阅）
+            self.finish_canceled(&file_id, &snap).await;
+            return;
+        }
+
         // ---- 续传：先通知接收方清中断态，并**探测其槽位是否还在**（A3.2）----
         // 对方 app 重启过（内存槽位丢失）→ slot=false → 直接 Failed，
         // 不空烧数据面、不进入「继续→又中断」死循环；通知网络失败则继续，
@@ -2276,6 +2308,18 @@ impl TransferEngine {
     /// 清除接收方的「对方已暂停」标记（数据恢复流动 / 对端继续时调用）。
     fn clear_peer_paused(&self, file_id: &str) {
         self.recv_peer_paused.lock().remove(file_id);
+    }
+
+    /// 取（或创建）目标设备的数据面文件级闸门。
+    ///
+    /// 同一目标 = 一把锁（permits=1，串行）；不同目标互不影响。
+    /// 惰性创建：设备表有限，条目常驻可接受（进程生命周期）。
+    fn send_gate(&self, target_ip: &str) -> Arc<tokio::sync::Semaphore> {
+        self.send_gates
+            .lock()
+            .entry(target_ip.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone()
     }
 
     /// 启动 N 条流，每条顺序发送一个字节区间（A3.2 / A3.3）。
@@ -3823,6 +3867,37 @@ mod tests {
             .find(|p| p.file_id == "old")
             .unwrap();
         assert_eq!(old.time, Some(100), "终态重放保留原完成时刻");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 数据面文件级闸门（2026-10-09）：同目标复用同一把锁（串行）、
+    /// 不同目标互不影响；持锁期间第二个获取者必须排队等待。
+    #[tokio::test]
+    async fn send_gate_serializes_per_target() {
+        let dir = tmp_dir("send-gate");
+        let engine = TransferEngine::new(0, 2, dir.clone());
+        let g1 = engine.send_gate("10.0.0.1");
+        let g1_again = engine.send_gate("10.0.0.1");
+        let g2 = engine.send_gate("10.0.0.2");
+        assert!(Arc::ptr_eq(&g1, &g1_again), "同目标必须复用同一把闸门");
+        assert!(!Arc::ptr_eq(&g1, &g2), "不同目标互不影响");
+
+        let permit = g1.clone().acquire_owned().await.unwrap();
+        let acquired = Arc::new(AtomicBool::new(false));
+        let flag = acquired.clone();
+        let gg = g1.clone();
+        let waiter = tokio::spawn(async move {
+            let _p = gg.acquire_owned().await.unwrap();
+            flag.store(true, Ordering::SeqCst);
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "持锁期间第二个获取者必须排队（多文件不并发抢带宽）"
+        );
+        drop(permit);
+        let _ = waiter.await;
+        assert!(acquired.load(Ordering::SeqCst), "释放后立即获得");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
