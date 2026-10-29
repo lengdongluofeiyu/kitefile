@@ -43,6 +43,9 @@ scripts/    构建脚本
 
 ### 一键构建（Windows）
 
+> ⚠️ 先确保已配置环境变量（见下方「开发时环境变量」章节）。
+> 若 `scripts/local-env.ps1` 已存在，`build-all.ps1` 会自动加载它。
+
 ```powershell
 # 全量：Rust 测试闸门 + 桌面端 + Android APK → dist/
 .\scripts\build-all.ps1
@@ -57,6 +60,11 @@ scripts/    构建脚本
 - `dist/android/app-release.apk`
 
 ### 手动构建
+
+> 手动敲命令时**必须先加载环境**（`build-all.ps1` 的自动加载不适用于手动构建）：
+> ```powershell
+> . .\scripts\local-env.ps1
+> ```
 
 ```bash
 # Rust 核心
@@ -76,18 +84,90 @@ cd ../desktop && flutter pub get && flutter build windows --release
 cd ../mobile && flutter pub get && flutter build apk --release
 ```
 
-### 开发时环境变量（可选）
+### 开发时环境变量（**必需**，非可选）
 
-构建脚本会把缓存指到脚本里的 `DEPS_ROOT` / `CARGO_HOME` 等路径。
-换机器请改 `scripts/rust-env.sh`、`scripts/flutter-env.sh`、`scripts/build-all.ps1`，
-或参考下面的环境变量名自行覆盖：
+本项目把 Rust / Gradle / Dart / Android SDK 的缓存全部集中到 `E:\zheten2.0\.deps`，
+避免往 C 盘写。**这些变量不设置，构建会失败或把几 GB 缓存写回 C 盘。**
 
-| 变量 | 用途 |
-|------|------|
-| `ANDROID_NDK_HOME` / `ANDROID_HOME` | Android 交叉编译与 Gradle |
-| `JAVA_HOME` | Gradle 需要 JDK 17–21 |
-| `CARGO_HOME` / `RUSTUP_HOME` | Rust 工具链位置 |
-| `PUB_CACHE` | Flutter/Dart 包缓存 |
+#### 方式一：用 `local-env.ps1`（推荐，Windows）
+
+```powershell
+cd E:\zheten2.0\filetransfer
+. .\scripts\local-env.ps1     # 注意开头的点号，表示在当前会话生效
+.\scripts\build-all.ps1
+```
+
+`local-env.ps1` 是**本机配置文件，已被 `.gitignore` 排除，不在仓库里**。
+新机器克隆后请先复制模板：
+
+```powershell
+copy .\scripts\local-env.ps1.example .\scripts\local-env.ps1
+# 然后按实际路径修改
+```
+
+`build-all.ps1` 在检测到 `scripts/local-env.ps1` 时会**自动加载**它，
+但**手动构建**（直接敲 `cargo` / `flutter` / `gradle`）必须先手动 `.` 加载。
+
+#### 方式二：设为系统环境变量（一次配好，长期有效）
+
+如果不想每次都加载，可把下表变量设到用户级（重启终端后生效）：
+
+```powershell
+[Environment]::SetEnvironmentVariable('CARGO_HOME',  'E:\zheten2.0\.deps\cargo',       'User')
+[Environment]::SetEnvironmentVariable('RUSTUP_HOME', 'E:\zheten2.0\.deps\rustup',      'User')
+[Environment]::SetEnvironmentVariable('PUB_CACHE',   'E:\zheten2.0\.deps\pub-cache',   'User')
+[Environment]::SetEnvironmentVariable('ANDROID_HOME',  'E:\zheten2.0\.deps\android-sdk', 'User')
+[Environment]::SetEnvironmentVariable('ANDROID_SDK_ROOT','E:\zheten2.0\.deps\android-sdk','User')
+[Environment]::SetEnvironmentVariable('GRADLE_USER_HOME','E:\zheten2.0\.deps\gradle',   'User')
+[Environment]::SetEnvironmentVariable('FTCORE_DEPS_ROOT','E:\zheten2.0\.deps',          'User')
+[Environment]::SetEnvironmentVariable('FTCORE_TEST_TMP','E:\zheten2.0\.deps\tmp',       'User')
+[Environment]::SetEnvironmentVariable('JAVA_HOME',   'D:\jdk21\jdk-21.0.12.1+1',       'User')
+```
+
+> `JAVA_HOME` 是**全局变量**，改动会影响其他 Java 项目。若本机有其他项目依赖别的 JDK，
+> 请改用方式一（`local-env.ps1` 只对当前会话生效，不影响全局）。
+
+#### 变量清单
+
+| 变量 | 本项目取值 | 用途 / 不设的后果 |
+|------|-----------|------------------|
+| `FTCORE_DEPS_ROOT` | `E:\zheten2.0\.deps` | 所有工具链缓存的根目录 |
+| `CARGO_HOME` | `…\.deps\cargo` | Rust 工具链与 crate 缓存；不设则用 `~\.cargo`（C 盘） |
+| `RUSTUP_HOME` | `…\.deps\rustup` | Rust 工具链本体；不设则用 `~\.rustup` |
+| `PUB_CACHE` | `…\.deps\pub-cache` | Flutter/Dart 包缓存；不设则用 `~\.pub-cache` |
+| `ANDROID_HOME` | `…\.deps\android-sdk` | Android SDK 位置；不设则 Gradle 找不到 SDK，**构建直接失败** |
+| `ANDROID_SDK_ROOT` | 同上 | 旧版变量名，Gradle/Flutter 兼容用 |
+| `GRADLE_USER_HOME` | `…\.deps\gradle` | Gradle 缓存与 wrapper 发行包；不设则依赖重新下载到 C 盘 |
+| `FTCORE_TEST_TMP` | `…\.deps\tmp` | Rust 测试临时目录；不设则用系统 TEMP |
+| `JAVA_HOME` | `D:\jdk21\jdk-21.0.12.1+1` | Gradle 需要 **JDK 17–21**（项目编译目标为 Java 17，Gradle 9.1） |
+| `ANDROID_NDK_HOME` | 可留空 | 交叉编译用；`build-all.ps1` 会从 `ANDROID_HOME` 自动探测（当前 NDK `28.2.13676358`） |
+
+#### 两个常见坑
+
+1. **PowerShell 的变量不会传给子进程的「祖父」**。
+   在 PowerShell 里用 `cmd /c xxx` 或 `Start-Process` 启动的程序，
+   拿到的环境变量取决于启动时的快照，改完变量要**重开终端**才稳妥。
+2. **`JAVA_HOME` 指向不存在的路径时，报错很隐蔽**。
+   Gradle 只会说「找不到 Java 运行时」或直接卡住。配完后务必验证：
+   ```powershell
+   & "$env:JAVA_HOME\bin\java.exe" -version    # 应打印 21.0.x
+   ```
+
+#### 验证环境是否就绪
+
+```powershell
+cd E:\zheten2.0\filetransfer
+. .\scripts\local-env.ps1
+& "$env:JAVA_HOME\bin\java.exe" -version      # JDK 21
+& "$env:CARGO_HOME\bin\rustup.exe" toolchain list   # stable-x86_64-pc-windows-msvc
+flutter --version                              # Flutter 3.44.x
+Test-Path "$env:ANDROID_HOME\ndk"              # True
+```
+
+#### 首次构建较慢（正常现象）
+
+若清理过构建缓存，首次重建需要：Rust 全量编译（10–30 分钟）、
+Gradle 依赖重新下载（需联网）。之后增量构建会快很多。
 
 ## 使用
 
